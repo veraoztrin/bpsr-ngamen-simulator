@@ -234,6 +234,20 @@ class App(ctk.CTk):
         self.shift_hold_entry.insert(0, "10")
         self.shift_hold_entry.pack(side="left", padx=(4, 0))
 
+        # Row 4: automatic part categorization
+        row4 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        row4.pack(fill="x", padx=10, pady=(0, 8))
+        self.autosplit_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(row4, text="Auto-split parts", variable=self.autosplit_var,
+                        command=self.reconvert).pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(row4, text="into").pack(side="left")
+        self.autosplit_seg = ctk.CTkSegmentedButton(row4, values=["2", "3"],
+                                                    command=lambda _: self.reconvert())
+        self.autosplit_seg.set("2")
+        self.autosplit_seg.pack(side="left", padx=6)
+        ctk.CTkLabel(row4, text="channels by role (melody / accomp / bass)",
+                     text_color="gray").pack(side="left", padx=4)
+
         self.channel_frame = ctk.CTkScrollableFrame(self.tab_solo, label_text="Solo Active Channels")
         self.channel_frame.grid(row=3, column=0, padx=10, pady=10, sticky="nsew")
 
@@ -445,6 +459,8 @@ class App(ctk.CTk):
             melody_lock_mode='drop',
             duet_mode=self.conv_vars["duet_mode"].get(),
             duet_split_note=self._get_note(self.duet_split_entry, 60),
+            auto_split=self.autosplit_var.get(),
+            auto_split_parts=int(self.autosplit_seg.get()),
             range_low=self._get_note(self.range_low_entry, ABS_LOW),
             range_high=self._get_note(self.range_high_entry, ABS_HIGH),
         )
@@ -463,22 +479,52 @@ class App(ctk.CTk):
             self.player.simulator.shift_delay_ms = self._get_float(self.shift_delay_entry, 30)
             self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
 
-        self.build_solo_channel_ui(duet=settings.duet_mode)
+        self.build_solo_channel_ui(duet=settings.duet_mode,
+                                   auto=settings.auto_split,
+                                   parts=settings.auto_split_parts)
         self.player.load_events(self.events, self.channels)
 
         if self.network.room_code:
             self._update_lobby_ui(self.network.room_state)
 
-    def build_solo_channel_ui(self, duet=False):
+    def _channel_ranges(self):
+        """Lowest/highest MIDI note per channel in the converted events."""
+        ranges = {}
+        for ev in self.events:
+            if ev.get('type') == 'note_on' and 'channel' in ev:
+                lo, hi = ranges.get(ev['channel'], (999, -1))
+                ranges[ev['channel']] = (min(lo, ev['note']), max(hi, ev['note']))
+        return ranges
+
+    def build_solo_channel_ui(self, duet=False, auto=False, parts=2):
         for widget in self.channel_frame.winfo_children():
             widget.destroy()
         self.channel_vars = []
-        duet_names = {0: "Duet Low (bass part)", 1: "Duet High (melody part)"}
+        ranges = self._channel_ranges()
+
+        def name_for(ch):
+            if auto:
+                if parts >= 3:
+                    return {0: "Melody", 1: "Harmony", 2: "Bass"}.get(ch, f"Part {ch}")
+                return {0: "Melody", 1: "Accompaniment"}.get(ch, f"Part {ch}")
+            if duet:
+                return {0: "Duet Low (bass)", 1: "Duet High (melody)"}.get(ch, f"Channel {ch}")
+            return f"Channel {ch}"
+
         for ch in self.channels:
-            label = duet_names.get(ch, f"Channel {ch}") if duet else f"Channel {ch}"
+            row = ctk.CTkFrame(self.channel_frame, fg_color="transparent")
+            row.pack(fill="x", pady=3, padx=6)
+            if ch in ranges:
+                lo, hi = ranges[ch]
+                rng = f"{midi_to_note_name(lo)}–{midi_to_note_name(hi)}"
+            else:
+                rng = "—"
+            ctk.CTkLabel(row, text=rng, width=95, anchor="w",
+                         text_color="gray").pack(side="left")
             var = ctk.BooleanVar(value=True)
-            cb = ctk.CTkCheckBox(self.channel_frame, text=label, variable=var, command=self.update_solo_channels)
-            cb.pack(pady=5, anchor="w", padx=10)
+            cb = ctk.CTkCheckBox(row, text=name_for(ch), variable=var,
+                                 command=self.update_solo_channels)
+            cb.pack(side="left", padx=6)
             self.channel_vars.append((ch, var))
 
     def update_solo_channels(self):

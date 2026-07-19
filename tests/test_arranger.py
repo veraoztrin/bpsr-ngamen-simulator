@@ -251,6 +251,49 @@ def test_melody_lock_bass_plays_when_alone():
     kept = sorted(e['note'] for e in note_ons(out))
     check("both lone notes kept", kept == [40, 90], f"got {kept}")
 
+def chan_of(out):
+    return {e['note']: e['channel'] for e in out if e['type'] == 'note_on'}
+
+def test_auto_split_two():
+    print("[auto-split: melody vs accompaniment]")
+    # Chord C4/E4/G4 with a high melody C6 on top.
+    evs = [on(0.0, 60), on(0.0, 64), on(0.0, 67), on(0.0, 84),
+           off(1.0, 60), off(1.0, 64), off(1.0, 67), off(1.0, 84)]
+    out = convert(evs, ConversionSettings(auto_split=True, auto_split_parts=2), orig_bpm=120)
+    ch = chan_of(out)
+    check("melody (top) -> channel 0", ch[84] == 0, f"got {ch}")
+    check("accompaniment -> channel 1",
+          ch[60] == 1 and ch[64] == 1 and ch[67] == 1, f"got {ch}")
+    check("only two channels used", set(ch.values()) == {0, 1}, f"got {ch}")
+
+def test_auto_split_three():
+    print("[auto-split: melody / harmony / bass]")
+    evs = [on(0.0, 40), on(0.0, 60), on(0.0, 64), on(0.0, 84),
+           off(1.0, 40), off(1.0, 60), off(1.0, 64), off(1.0, 84)]
+    out = convert(evs, ConversionSettings(auto_split=True, auto_split_parts=3), orig_bpm=120)
+    ch = chan_of(out)
+    check("top -> melody ch0", ch[84] == 0, f"got {ch}")
+    check("bottom -> bass ch2", ch[40] == 2, f"got {ch}")
+    check("middle -> harmony ch1", ch[60] == 1 and ch[64] == 1, f"got {ch}")
+
+def test_auto_split_sustained_melody():
+    print("[auto-split: sustained melody keeps its role]")
+    # Melody 84 held across the whole bar; lower notes struck underneath later.
+    evs = [on(0.0, 84), off(2.0, 84),
+           on(0.5, 55), off(1.0, 55), on(0.5, 59), off(1.0, 59)]
+    out = convert(evs, ConversionSettings(auto_split=True, auto_split_parts=2), orig_bpm=120)
+    ch = chan_of(out)
+    check("held melody stays ch0", ch[84] == 0, f"got {ch}")
+    check("later lower notes -> ch1", ch[55] == 1 and ch[59] == 1, f"got {ch}")
+
+def test_auto_split_sustain_duplicated():
+    print("[auto-split: sustain reaches every part]")
+    evs = [on(0.0, 84), on(0.0, 48), off(1.0, 84), off(1.0, 48),
+           {'time': 0.5, 'type': 'sustain', 'value': True, 'channel': 0}]
+    out = convert(evs, ConversionSettings(auto_split=True, auto_split_parts=2), orig_bpm=120)
+    sus_ch = sorted(e['channel'] for e in out if e['type'] == 'sustain')
+    check("sustain copied to both parts", sus_ch == [0, 1], f"got {sus_ch}")
+
 def test_melody_lock_fold_mode():
     print("[melody lock: fold mode keeps notes]")
     evs = [on(0.0, 84), off(2.0, 84), on(0.5, 48), off(1.0, 48)]

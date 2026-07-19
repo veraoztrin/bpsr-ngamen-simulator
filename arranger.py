@@ -12,6 +12,7 @@
 # as an event list at the end.
 
 from dataclasses import dataclass
+from itertools import groupby
 
 # Playable zones for the BPSR 3-octave keyboard + octave modifiers.
 # zone 0  : no modifier    -> MIDI 48..83  (C3..B5)
@@ -38,6 +39,8 @@ class ConversionSettings:
     melody_lock_mode: str = 'drop'  # 'drop' | 'fold' | 'hybrid'
     duet_mode: bool = False         # split into Low/High parts (channels 0/1)
     duet_split_note: int = 60       # notes below this go to the Low part
+    auto_split: bool = False        # auto-assign channels by musical role
+    auto_split_parts: int = 2       # 2 = melody+accomp, 3 = melody+harmony+bass
     range_low: int = ABS_LOW        # allowed output range (folded into)
     range_high: int = ABS_HIGH
     chord_window: float = 0.030     # seconds; notes within this = one chord
@@ -408,6 +411,49 @@ def apply_melody_lock(notes, chord_window, mode='drop'):
     return zone_hints, kept
 
 
+def assign_auto_parts(notes, sustains, n_parts=2):
+    """Auto-categorize notes into channels by musical role (skyline split).
+
+        channel 0 = melody       (highest voice)
+        channel 1 = accompaniment / harmony
+        channel 2 = bass         (lowest voice) — only when n_parts >= 3
+
+    A note's role is decided at its onset by whether it is the highest / lowest
+    pitch *sounding* at that instant (counting notes still ringing from before),
+    so a sustained melody line keeps its role while lower notes come and go.
+
+    Returns the (possibly duplicated) sustain list; note channels are set
+    in place.
+    """
+    if not notes:
+        return sustains
+
+    ordered = sorted(notes, key=lambda n: n['start'])
+    active = []
+    for t, grp in groupby(ordered, key=lambda n: n['start']):
+        grp = list(grp)
+        active = [a for a in active if a['end'] > t]
+        active.extend(grp)
+        hi = max(a['note'] for a in active)
+        lo = min(a['note'] for a in active)
+        for n in grp:
+            if n['note'] == hi:
+                n['channel'] = 0                       # melody (top voice wins)
+            elif n_parts >= 3 and n['note'] == lo:
+                n['channel'] = 2                       # bass
+            else:
+                n['channel'] = 1                       # accompaniment / harmony
+
+    # Sustain pedal is global in-game: give every part a copy so whichever
+    # part a player selects still receives pedal events.
+    parts = sorted(set(n['channel'] for n in notes))
+    doubled = []
+    for s in sustains:
+        for ch in parts:
+            doubled.append({'time': s['time'], 'value': s['value'], 'channel': ch})
+    return doubled
+
+
 def split_duet(notes, sustains, split_note):
     """Split into Low (channel 0) / High (channel 1) parts."""
     for n in notes:
@@ -465,8 +511,10 @@ def convert(events, settings, orig_bpm=120.0):
     # 6. Final safety: everything must be physically reachable
     fold_into_range(notes, ABS_LOW, ABS_HIGH)
 
-    # 7. Duet split
-    if settings.duet_mode:
+    # 7. Channel assignment (auto-split by role supersedes the fixed duet split)
+    if settings.auto_split:
+        sustains = assign_auto_parts(notes, sustains, settings.auto_split_parts)
+    elif settings.duet_mode:
         sustains = split_duet(notes, sustains, settings.duet_split_note)
 
     return notes_to_events(notes, sustains, zone_hints)
