@@ -1,8 +1,11 @@
 # BPSR Midi Player - optimised by Carmen
 
+![Musician](images/musician.png)
+![Keyboard Interface](images/keyboard.png)
+
 A plug-and-play desktop application designed to read standard MIDI (`.mid`) files and automatically transcribe them into precise keyboard strokes for Blue Protocol Star Resonance (BPSR) instrument playback.
 
-> This project is a continuation of [saptia14/bpsr_midi_player]
+> This project is a continuation of [saptia14/bpsr_midi_player](https://github.com/saptia14/bpsr_midi_player), which is no longer maintained. All credit for the original player, input simulation, and multiplayer sync goes to the original author. This fork adds the conversion pipeline, global hotkeys, test suite, and ongoing maintenance.
 
 ## Features
 
@@ -13,6 +16,7 @@ A plug-and-play desktop application designed to read standard MIDI (`.mid`) file
 - **Modern GUI:** Built with `customtkinter` for a beautiful dark-mode interface.
 - **Channel Selector:** Mute or solo specific tracks inside a MIDI file (e.g., mute the drum track).
 - **Global Hotkeys:** `F9` = play / resume, `F10` = pause, `F11` = stop — they work even while the game window is focused, so no more alt-tab dance.
+- **Peer-to-peer clock sync:** In multiplayer, each client measures its clock offset directly against the host over the network (NTP-style ping/pong), instead of relying on an external time server that firewalls often block. The lobby shows a live "Synced ±X ms" accuracy readout, and **Ready** stays locked until the clock is aligned — so players start together, not seconds apart.
 
 ## Conversion Settings (v0.4)
 

@@ -29,7 +29,8 @@ class App(ctk.CTk):
             on_state_change=self.on_network_state,
             on_play_cmd=self.on_network_play,
             on_stop_cmd=self.on_network_stop,
-            on_midi_received=self.on_network_midi
+            on_midi_received=self.on_network_midi,
+            on_sync_update=self.on_network_sync
         )
         
         self.events = []
@@ -265,9 +266,13 @@ class App(ctk.CTk):
         self.join_btn = ctk.CTkButton(self.conn_frame, text="Join Room", command=self.join_room)
         self.join_btn.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
 
-        # Status
-        self.status_label = ctk.CTkLabel(self.tab_multi, text="Not Connected", text_color="gray")
-        self.status_label.grid(row=1, column=0, pady=5)
+        # Status + live clock-sync accuracy readout
+        self.status_frame = ctk.CTkFrame(self.tab_multi, fg_color="transparent")
+        self.status_frame.grid(row=1, column=0, pady=5)
+        self.status_label = ctk.CTkLabel(self.status_frame, text="Not Connected", text_color="gray")
+        self.status_label.pack(side="left", padx=8)
+        self.sync_label = ctk.CTkLabel(self.status_frame, text="", text_color="gray")
+        self.sync_label.pack(side="left", padx=8)
 
         # Lobby List
         self.lobby_frame = ctk.CTkScrollableFrame(self.tab_multi, label_text="Lobby Players (Host assigns channels here)")
@@ -478,6 +483,7 @@ class App(ctk.CTk):
         self.network.connect()
         self.network.host_room(room, nick)
         self.status_label.configure(text=f"Hosting Room: {room} | Waiting for players...", text_color="green")
+        self.sync_label.configure(text="🕐 Clock: host (reference)", text_color="gray")
         self.sync_play_btn.configure(state="normal")
         self.sync_stop_btn.configure(state="normal")
         self.host_btn.configure(state="disabled")
@@ -491,9 +497,12 @@ class App(ctk.CTk):
         self.network.connect()
         self.network.join_room(room, nick)
         self.status_label.configure(text=f"Joined Room: {room}", text_color="green")
+        self.sync_label.configure(text="🕐 Syncing clock…", text_color="orange")
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
-        self.ready_btn.configure(state="normal")
+        # Ready stays locked until the clock is synced with the host, so nobody
+        # can start a song before the timing is aligned.
+        self.ready_btn.configure(state="disabled", text="Syncing clock…")
         self.my_ready_status = False
 
     def toggle_ready(self):
@@ -523,6 +532,19 @@ class App(ctk.CTk):
 
     def on_network_stop(self):
         self.after(0, self.player.stop)
+
+    def on_network_sync(self, rtt, offset):
+        self.after(0, self._update_sync_label, rtt, offset)
+
+    def _update_sync_label(self, rtt, offset):
+        # Timing uncertainty is roughly half the round-trip delay.
+        acc_ms = (rtt * 1000.0) / 2.0
+        color = "green" if acc_ms < 30 else ("orange" if acc_ms < 80 else "red")
+        self.sync_label.configure(text=f"🕐 Synced ±{acc_ms:.0f} ms", text_color=color)
+        # Unlock Ready once we have a clock lock (only before the user readies up).
+        if (not self.network.is_host and not self.my_ready_status
+                and self.ready_btn.cget("state") == "disabled"):
+            self.ready_btn.configure(state="normal", text="I'm Ready!")
 
     def on_network_midi(self, filename, data):
         self.after(0, self._save_and_load_midi, filename, data)
@@ -590,6 +612,8 @@ class App(ctk.CTk):
 
     def _trigger_play(self, global_start_time, my_channels):
         delay = global_start_time - self.network.get_global_time()
+        if delay < 0:
+            delay = 0.0  # start immediately if the target moment already passed
         print(f"Network Play Triggered! Delaying start by {delay:.3f}s for Channels {my_channels}")
         self.player.stop()
         self.player.set_active_channels(my_channels)

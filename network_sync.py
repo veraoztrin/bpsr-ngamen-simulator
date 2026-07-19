@@ -10,25 +10,54 @@ BROKER = "broker.hivemq.com"
 PORT = 1883
 BASE_TOPIC = "bpsr_bard/room"
 
+
+def compute_offset(t0, t1, t2, t3):
+    """NTP-style clock offset between a client and the host, measured over a
+    single ping/pong round trip. All times are seconds.
+
+      t0 = client's local time when it sent the ping
+      t1 = host's local time when it received the ping
+      t2 = host's local time when it sent the pong
+      t3 = client's local time when it received the pong
+
+    Returns (round_trip_delay, offset) where
+      offset = how far the HOST clock is ahead of the CLIENT clock, i.e.
+               host_time  ~=  client_time + offset.
+    """
+    rtt = (t3 - t0) - (t2 - t1)
+    offset = ((t1 - t0) + (t2 - t3)) / 2.0
+    return rtt, offset
+
+
 class NetworkManager:
-    def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None, on_midi_received=None):
+    def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None,
+                 on_midi_received=None, on_sync_update=None):
         self.client_id = str(uuid.uuid4())
         self.nickname = "Player"
         self.room_code = None
         self.is_host = False
-        
-        self.ntp_offset = 0.0
-        self._sync_ntp()
-        
+
+        # Peer-to-peer clock sync (replaces the old one-shot external NTP).
+        # A client measures its offset directly against the host over MQTT,
+        # so it no longer depends on pool.ntp.org being reachable.
+        self.ntp_offset = 0.0          # kept for backward compat; unused in scheduling
+        self.host_offset = 0.0         # host_time ~= local_time + host_offset
+        self.sync_rtt = None           # best round-trip delay seen (seconds)
+        self.is_synced = False
+        self._sync_samples = []        # list of (local_ts, rtt, offset)
+        self._sync_id = 0
+        self.sync_thread = None
+
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id)
         self.client.on_connect = self._on_connect
         self.client.on_message = self._on_message
-        
+
         # Callbacks to UI
         self.on_state_change = on_state_change
         self.on_play_cmd = on_play_cmd
         self.on_stop_cmd = on_stop_cmd
         self.on_midi_received = on_midi_received
+        self.on_sync_update = on_sync_update
         
         # Room State (Host maintains this)
         self.room_state = {
@@ -50,16 +79,47 @@ class NetworkManager:
             self.ntp_offset = 0.0
 
     def get_global_time(self):
-        return time.time() + self.ntp_offset
+        # The shared reference frame IS the host's clock.
+        # Host: its own clock. Client: local clock corrected by measured offset.
+        if self.is_host:
+            return time.time()
+        return time.time() + self.host_offset
 
     def connect(self):
         self.running = True
         self.client.connect(BROKER, PORT, 60)
         self.client.loop_start()
-        
+
         # Start heartbeat loop
         self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
         self.heartbeat_thread.start()
+
+        # Start peer clock-sync loop (only pings while joined as a client)
+        self.sync_thread = threading.Thread(target=self._client_sync_loop, daemon=True)
+        self.sync_thread.start()
+
+    def _client_sync_loop(self):
+        """Continuously measure this client's clock offset against the host.
+        A quick burst on join for a fast initial lock, then steady refreshes
+        so drift never accumulates before a SYNC PLAY."""
+        while self.running:
+            if self.room_code and not self.is_host:
+                # Burst until we have a few samples, then a steady trickle.
+                n = 10 if len(self._sync_samples) < 5 else 1
+                for _ in range(n):
+                    if not (self.running and self.room_code and not self.is_host):
+                        break
+                    self._send_sync_ping()
+                    time.sleep(0.12)
+                time.sleep(2.0)
+            else:
+                time.sleep(0.5)
+
+    def _send_sync_ping(self):
+        self._sync_id += 1
+        # Capture t0 as close to publish as possible.
+        self._publish({"type": "sync_ping", "from": self.client_id,
+                       "id": self._sync_id, "t0": time.time()})
 
     def disconnect(self):
         self.running = False
@@ -188,6 +248,34 @@ class NetworkManager:
         try:
             payload = json.loads(msg.payload.decode('utf-8'))
             msg_type = payload.get("type")
+
+            # --- Peer clock sync handshake (handled before everything else) ---
+            if msg_type == "sync_ping":
+                if self.is_host:
+                    t1 = time.time()
+                    self._publish({"type": "sync_pong", "to": payload["from"],
+                                   "id": payload["id"], "t0": payload["t0"],
+                                   "t1": t1, "t2": time.time()})
+                return
+            if msg_type == "sync_pong":
+                if (not self.is_host) and payload.get("to") == self.client_id:
+                    t3 = time.time()
+                    rtt, offset = compute_offset(payload["t0"], payload["t1"],
+                                                 payload["t2"], t3)
+                    if rtt >= 0:
+                        now = time.time()
+                        self._sync_samples.append((now, rtt, offset))
+                        cutoff = now - 25.0
+                        self._sync_samples = [s for s in self._sync_samples
+                                              if s[0] >= cutoff][-40:]
+                        # Best sample = lowest round-trip delay (least jitter).
+                        best = min(self._sync_samples, key=lambda s: s[1])
+                        self.sync_rtt = best[1]
+                        self.host_offset = best[2]
+                        self.is_synced = True
+                        if self.on_sync_update:
+                            self.on_sync_update(self.sync_rtt, self.host_offset)
+                return
 
             if self.is_host:
                 if msg_type == "join":
