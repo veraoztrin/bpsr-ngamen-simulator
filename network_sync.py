@@ -29,6 +29,29 @@ def compute_offset(t0, t1, t2, t3):
     return rtt, offset
 
 
+def select_offset(samples, k=5):
+    """Pick a stable offset estimate from recent ping/pong samples.
+
+    samples: list of (local_ts, rtt, offset).
+    Uses the median offset among the k lowest-RTT samples. Low RTT means the
+    round trip was clean (little queuing), which also means the least
+    path-asymmetry bias, so those samples are the most trustworthy; the median
+    across several of them removes single-sample jitter.
+
+    Returns (display_rtt, offset). display_rtt is the best-case RTT seen.
+    """
+    if not samples:
+        return None, 0.0
+    by_rtt = sorted(samples, key=lambda s: s[1])[:max(1, k)]
+    offs = sorted(s[2] for s in by_rtt)
+    m = len(offs)
+    if m % 2:
+        offset = offs[m // 2]
+    else:
+        offset = (offs[m // 2 - 1] + offs[m // 2]) / 2.0
+    return by_rtt[0][1], offset
+
+
 class NetworkManager:
     def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None,
                  on_midi_received=None, on_sync_update=None):
@@ -268,10 +291,9 @@ class NetworkManager:
                         cutoff = now - 25.0
                         self._sync_samples = [s for s in self._sync_samples
                                               if s[0] >= cutoff][-40:]
-                        # Best sample = lowest round-trip delay (least jitter).
-                        best = min(self._sync_samples, key=lambda s: s[1])
-                        self.sync_rtt = best[1]
-                        self.host_offset = best[2]
+                        # Median offset of the lowest-RTT samples: cleaner and
+                        # steadier than trusting one single fastest round trip.
+                        self.sync_rtt, self.host_offset = select_offset(self._sync_samples)
                         self.is_synced = True
                         if self.on_sync_update:
                             self.on_sync_update(self.sync_rtt, self.host_offset)

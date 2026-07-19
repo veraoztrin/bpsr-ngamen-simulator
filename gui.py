@@ -297,6 +297,18 @@ class App(ctk.CTk):
         self.ready_btn = ctk.CTkButton(self.client_control_frame, text="I'm Ready!", command=self.toggle_ready, state="disabled")
         self.ready_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
+        # Manual sync calibration: cancels the residual start offset that the
+        # automatic clock sync can't remove (network path asymmetry + this
+        # machine's input latency). Tune by ear until both players line up.
+        nudge_row = ctk.CTkFrame(self.client_control_frame, fg_color="transparent")
+        nudge_row.grid(row=1, column=0, padx=5, pady=(0, 6), sticky="ew")
+        ctk.CTkLabel(nudge_row, text="Sync nudge (ms):").pack(side="left")
+        self.nudge_entry = ctk.CTkEntry(nudge_row, width=60)
+        self.nudge_entry.insert(0, "0")
+        self.nudge_entry.pack(side="left", padx=6)
+        ctk.CTkLabel(nudge_row, text="−earlier / +later · tune by ear, set once",
+                     text_color="gray").pack(side="left", padx=6)
+
     # --- Actions ---
 
     def update_led_loop(self):
@@ -611,12 +623,20 @@ class App(ctk.CTk):
                 self.sync_play_btn.configure(state="disabled", text="SYNC PLAY (Waiting for Ready...)")
 
     def _trigger_play(self, global_start_time, my_channels):
-        delay = global_start_time - self.network.get_global_time()
-        if delay < 0:
-            delay = 0.0  # start immediately if the target moment already passed
-        print(f"Network Play Triggered! Delaying start by {delay:.3f}s for Channels {my_channels}")
+        # Do playback cleanup FIRST. stop() may join a thread and release keys,
+        # and that duration varies per machine — computing the start delay
+        # afterwards keeps that variable latency out of the start moment.
         self.player.stop()
         self.player.set_active_channels(my_channels)
+
+        delay = global_start_time - self.network.get_global_time()
+        # Manual calibration nudge (ms): +later / -earlier.
+        nudge = self._get_float(self.nudge_entry, 0.0) / 1000.0
+        delay += nudge
+        if delay < 0:
+            delay = 0.0  # start immediately if the target moment already passed
+        print(f"Network Play Triggered! Delaying start by {delay:.3f}s "
+              f"(nudge {nudge*1000:.0f}ms) for Channels {my_channels}")
         self.player.play(delay_seconds=delay)
 
     def _save_and_load_midi(self, filename, data):

@@ -17,7 +17,7 @@ sys.modules["paho.mqtt"].client = sys.modules["paho.mqtt.client"]
 sys.modules["paho.mqtt.client"].Client = object
 sys.modules["paho.mqtt.client"].CallbackAPIVersion = types.SimpleNamespace(VERSION2=2)
 
-from network_sync import compute_offset
+from network_sync import compute_offset, select_offset
 
 PASS = 0
 FAIL = 0
@@ -87,10 +87,40 @@ def test_best_sample_selection():
     check("best sample offset is accurate", abs(best[1] - 1.0) < 1e-9, f"got {best[1]}")
 
 
+def test_select_offset():
+    print("[select_offset: median of best RTT]")
+    # samples: (ts, rtt, offset). True offset ~1.0; noisy samples have both
+    # higher RTT and skewed offsets and must be down-weighted.
+    samples = [
+        (1.0, 0.30, 1.09),   # noisy
+        (1.1, 0.05, 1.00),   # clean
+        (1.2, 0.06, 1.02),   # clean
+        (1.3, 0.40, 0.80),   # very noisy
+        (1.4, 0.055, 0.99),  # clean
+    ]
+    rtt, off = select_offset(samples)
+    check("picks best-case RTT for readout", abs(rtt - 0.05) < 1e-9, f"got {rtt}")
+    check("offset is median of clean samples (~1.0)", abs(off - 1.0) < 0.03, f"got {off}")
+
+    # A single lone noisy sample shouldn't swing the median much once clean
+    # samples exist.
+    check("empty -> zero offset", select_offset([]) == (None, 0.0))
+    one = select_offset([(1.0, 0.2, 0.42)])
+    check("single sample passes through", abs(one[1] - 0.42) < 1e-9, f"got {one}")
+
+    # Median rejects an outlier: 5 clean ~1.0 + would-be outlier at higher RTT
+    noisy = [(i*0.1, 0.05+i*0.001, 1.0) for i in range(5)] + [(9.0, 0.02, 5.0)]
+    # Note the outlier has the LOWEST rtt (0.02) — median still protects us
+    # because it's one vote among the k lowest.
+    _, off2 = select_offset(noisy, k=5)
+    check("median resists a single low-RTT outlier", abs(off2 - 1.0) < 1e-9, f"got {off2}")
+
+
 if __name__ == "__main__":
     test_symmetric()
     test_host_reply_gap()
     test_asymmetric_bounded()
     test_best_sample_selection()
+    test_select_offset()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)
