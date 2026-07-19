@@ -194,9 +194,10 @@ class App(ctk.CTk):
             ("consistent_windows", "Consistent windows"),
             ("voice_aware", "Voice-aware placement"),
             ("phrase_gap_shifting", "Phrase gap shifting"),
+            ("melody_lock", "Melody priority (octaves)"),
             ("duet_mode", "Duet mode"),
         ]
-        for row_checks in (checks[:4], checks[4:]):
+        for row_checks in (checks[:5], checks[5:]):
             row = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=(8, 0))
             for key, label in row_checks:
@@ -440,6 +441,8 @@ class App(ctk.CTk):
             consistent_windows=self.conv_vars["consistent_windows"].get(),
             voice_aware=self.conv_vars["voice_aware"].get(),
             phrase_gap_shifting=self.conv_vars["phrase_gap_shifting"].get(),
+            melody_lock=self.conv_vars["melody_lock"].get(),
+            melody_lock_mode='drop',
             duet_mode=self.conv_vars["duet_mode"].get(),
             duet_split_note=self._get_note(self.duet_split_entry, 60),
             range_low=self._get_note(self.range_low_entry, ABS_LOW),

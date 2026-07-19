@@ -34,6 +34,8 @@ class ConversionSettings:
     consistent_windows: bool = False# fixed-grid chord windows instead of greedy
     voice_aware: bool = False       # octave-fold toward each channel's register
     phrase_gap_shifting: bool = False# only change octave zones between phrases
+    melody_lock: bool = False       # lock octave shift to the melody; drop conflicts
+    melody_lock_mode: str = 'drop'  # 'drop' | 'fold' | 'hybrid'
     duet_mode: bool = False         # split into Low/High parts (channels 0/1)
     duet_split_note: int = 60       # notes below this go to the Low part
     range_low: int = ABS_LOW        # allowed output range (folded into)
@@ -320,6 +322,92 @@ def apply_phrase_zones(notes, phrase_gap):
     return zone_hints
 
 
+def apply_melody_lock(notes, chord_window, mode='drop'):
+    """Lock the octave shift to the melody (top voice) so it is never cut.
+
+    The game keyboard is one 3-octave window (36 semitones) that L-Shift /
+    L-Ctrl slide up or down; only one shift can be held at a time. So every
+    note sounding at a given instant must fit inside ONE zone window:
+        zone  0 (no mod) : 48..83
+        zone +1 (Shift)  : 60..95
+        zone -1 (Ctrl)   : 36..71
+
+    We scan the music in onset groups, keep the shift wherever the melody
+    (highest sounding line, including still-ringing notes) stays playable, and
+    resolve any note that falls outside that window:
+        mode='drop'   -> silence it (melody plays clean; default)
+        mode='fold'   -> octave-shift it into the window (keeps harmony)
+        mode='hybrid' -> fold if it lands clear of the melody, else drop
+
+    Returns (zone_hints, kept_notes). zone_hints are {'time','value'} events
+    the player uses to toggle the modifier at the right moment.
+    """
+    if not notes:
+        return [], notes
+
+    ordered = sorted(notes, key=lambda n: (n['start'], -n['note']))
+    # Group notes by onset window.
+    groups = []
+    cur = []
+    anchor = None
+    for n in ordered:
+        if anchor is None or n['start'] - anchor <= chord_window:
+            cur.append(n)
+            if anchor is None:
+                anchor = n['start']
+        else:
+            groups.append((anchor, cur))
+            cur = [n]
+            anchor = n['start']
+    if cur:
+        groups.append((anchor, cur))
+
+    kept = []
+    zone_hints = []
+    current_zone = 0
+    active = []  # kept notes still sounding, for sustained-melody tracking
+
+    for gstart, group in groups:
+        active = [k for k in active if k['end'] > gstart + 1e-9]
+        sustained_top = max((k['note'] for k in active), default=None)
+        group_max = max(n['note'] for n in group)
+        melody_ref = group_max if sustained_top is None else max(group_max, sustained_top)
+        melody_ref = min(max(melody_ref, ABS_LOW), ABS_HIGH)
+
+        valid = [z for z in (0, 1, -1)
+                 if ZONE_RANGES[z][0] <= melody_ref <= ZONE_RANGES[z][1]]
+        if not valid:
+            valid = [0]
+
+        if current_zone in valid:
+            chosen = current_zone            # hysteresis: don't toggle needlessly
+        else:
+            def fit(z):
+                lo, hi = ZONE_RANGES[z]
+                return sum(1 for n in group if lo <= n['note'] <= hi)
+            chosen = max(valid, key=lambda z: (fit(z), -abs(z - current_zone), z == 0))
+
+        if chosen != current_zone:
+            zone_hints.append({'time': gstart, 'value': chosen})
+            current_zone = chosen
+
+        lo, hi = ZONE_RANGES[chosen]
+        for n in group:
+            if lo <= n['note'] <= hi:
+                kept.append(n); active.append(n)
+                continue
+            # Out of the melody's window -> resolve by mode.
+            if mode == 'drop':
+                continue
+            folded = _fold_pitch(n['note'], lo, hi)
+            if mode == 'hybrid' and abs(folded - melody_ref) <= 3:
+                continue                     # would sit on top of the melody: drop
+            n['note'] = folded
+            kept.append(n); active.append(n)
+
+    return zone_hints, kept
+
+
 def split_duet(notes, sustains, split_note):
     """Split into Low (channel 0) / High (channel 1) parts."""
     for n in notes:
@@ -366,9 +454,12 @@ def convert(events, settings, orig_bpm=120.0):
             or settings.consistent_windows or settings.prioritize_melody):
         notes = limit_chords(notes, settings)
 
-    # 5. Phrase-gap octave zones
+    # 5. Octave-zone planning (melody-lock takes precedence over phrase-gap)
     zone_hints = []
-    if settings.phrase_gap_shifting:
+    if settings.melody_lock:
+        zone_hints, notes = apply_melody_lock(notes, settings.chord_window,
+                                              settings.melody_lock_mode)
+    elif settings.phrase_gap_shifting:
         zone_hints = apply_phrase_zones(notes, settings.phrase_gap)
 
     # 6. Final safety: everything must be physically reachable

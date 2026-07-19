@@ -217,6 +217,51 @@ def test_consistent_windows():
           f"got {len(note_ons(out))}")
 
 
+def test_melody_lock_drops_conflict():
+    print("[melody lock: drop conflicts]")
+    # Sustained high melody C6 (84) over its whole duration, with a low
+    # C3 (48) chord struck underneath. 84 and 48 span 36 semitones apart at
+    # the edges of what a single zone allows — 48 sits below zone +1 (60..95),
+    # so it must be dropped so the melody stays in the high zone.
+    evs = [on(0.0, 84), off(2.0, 84),          # long melody note
+           on(0.5, 48, vel=90), off(1.0, 48),  # low note during the melody
+           on(0.5, 52, vel=90), off(1.0, 52)]
+    out = convert(evs, ConversionSettings(melody_lock=True), orig_bpm=120)
+    kept = sorted(e['note'] for e in note_ons(out))
+    check("melody note kept", 84 in kept, f"got {kept}")
+    check("conflicting low notes dropped", 48 not in kept and 52 not in kept, f"got {kept}")
+    zones = [e for e in out if e['type'] == 'zone']
+    check("locked into high zone (+1)", any(z['value'] == 1 for z in zones), f"got {zones}")
+
+def test_melody_lock_keeps_when_fits():
+    print("[melody lock: keep when it fits]")
+    # Melody G5 (79) + accompaniment C4 (60): span 19 semitones, both fit
+    # zone 0 (48..83). Nothing should be dropped.
+    evs = [on(0.0, 79), off(1.0, 79), on(0.0, 60), off(1.0, 60)]
+    out = convert(evs, ConversionSettings(melody_lock=True), orig_bpm=120)
+    kept = sorted(e['note'] for e in note_ons(out))
+    check("both notes kept (fit one zone)", kept == [60, 79], f"got {kept}")
+
+def test_melody_lock_bass_plays_when_alone():
+    print("[melody lock: low part plays when melody absent]")
+    # First a low phrase alone, then a high phrase alone — each should play in
+    # its own zone (nothing dropped, since they don't overlap in time).
+    evs = [on(0.0, 40), off(0.5, 40), on(1.0, 90), off(1.5, 90)]
+    out = convert(evs, ConversionSettings(melody_lock=True), orig_bpm=120)
+    kept = sorted(e['note'] for e in note_ons(out))
+    check("both lone notes kept", kept == [40, 90], f"got {kept}")
+
+def test_melody_lock_fold_mode():
+    print("[melody lock: fold mode keeps notes]")
+    evs = [on(0.0, 84), off(2.0, 84), on(0.5, 48), off(1.0, 48)]
+    out = convert(evs, ConversionSettings(melody_lock=True, melody_lock_mode='fold'),
+                  orig_bpm=120)
+    ons = note_ons(out)
+    check("fold keeps both notes", len(ons) == 2, f"got {len(ons)}")
+    check("folded note pulled into high zone", all(60 <= e['note'] <= 95 for e in ons),
+          f"got {[e['note'] for e in ons]}")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
