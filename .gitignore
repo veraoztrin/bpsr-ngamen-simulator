@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller folders
+build/
+dist/
+*.spec
+
+# Test files
+test_*.mid
+
+# OS generated files
+.DS_Store
+Thumbs.db
+*.exe
+*.zip

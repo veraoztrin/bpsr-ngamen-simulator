@@ -1,0 +1,47 @@
+# Builds BPSR_MIDI_Player.exe on Windows and attaches it to the GitHub
+# release whenever you push a version tag (v1.0.0, v1.1.0, ...).
+#
+# Usage:  git tag v1.0.0 && git push origin v1.0.0
+
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Run tests
+        run: |
+          python tests/test_arranger.py
+          python tests/test_parser_player.py
+          python tests/test_passthrough_perf.py
+
+      - name: Build executable
+        run: >
+          pyinstaller --onefile --windowed --name BPSR_MIDI_Player
+          --collect-all customtkinter
+          --hidden-import mido.backends.rtmidi
+          main.py
+
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/BPSR_MIDI_Player.exe
+          generate_release_notes: true
