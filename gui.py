@@ -150,6 +150,14 @@ class App(ctk.CTk):
         self.transpose_slider.set(0)
         self.transpose_slider.pack(pady=5)
 
+        # Autoplay toggle (default OFF): when off, playback stops and releases
+        # all keys at the end of the current track instead of advancing to the
+        # next loaded MIDI.
+        self.autoplay_var = ctk.BooleanVar(value=False)
+        self.autoplay_cb = ctk.CTkCheckBox(self.control_frame, text="Autoplay next track",
+                                           variable=self.autoplay_var)
+        self.autoplay_cb.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 10), sticky="w")
+
         # --- Conversion Settings Panel ---
         self.conv_frame = ctk.CTkFrame(self.tab_solo)
         self.conv_frame.grid(row=2, column=0, padx=10, pady=(0, 5), sticky="ew")
@@ -350,12 +358,14 @@ class App(ctk.CTk):
             self.progress_bar.set(0)
             self.time_label.configure(text="00:00 / 00:00")
             
-        # Auto-advance song if finished naturally
+        # Auto-advance song if finished naturally (only when Autoplay is on).
+        # On natural finish the player already released all keys; with autoplay
+        # off we simply stop here instead of loading the next track.
         is_playing_now = self.player.is_playing
         if self.was_playing and not is_playing_now and not self.player.stop_requested:
-            # Reached end of file naturally, play next
-            self.next_song(autoplay=True)
-            
+            if self.autoplay_var.get():
+                self.next_song(autoplay=True)
+
         self.was_playing = is_playing_now
             
         self.after(200, self.update_led_loop)
