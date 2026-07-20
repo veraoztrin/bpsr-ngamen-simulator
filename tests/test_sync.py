@@ -116,11 +116,91 @@ def test_select_offset():
     check("median resists a single low-RTT outlier", abs(off2 - 1.0) < 1e-9, f"got {off2}")
 
 
+def _make_manager():
+    # NetworkManager creates an mqtt Client (stubbed to `object`) and calls
+    # _sync_ntp via ntplib (stubbed). Patch the bits leave/disband touch.
+    from network_sync import NetworkManager
+    published = []
+
+    class FakeClient:
+        def __init__(self, *a, **k): pass
+        def connect(self, *a, **k): pass
+        def loop_start(self): pass
+        def loop_stop(self): pass
+        def disconnect(self): pass
+        def subscribe(self, *a, **k): pass
+        def unsubscribe(self, *a, **k): published.append(("unsub", a[0] if a else None))
+        def publish(self, topic, payload): published.append(("pub", topic, payload))
+
+    nm = NetworkManager.__new__(NetworkManager)
+    # minimal attributes used by the methods under test
+    nm.client_id = "cid"
+    nm.client = FakeClient()
+    nm.room_code = None
+    nm.is_host = False
+    nm.room_state = {"players": [], "filename": None}
+    nm.host_offset = 5.0
+    nm.sync_rtt = 0.1
+    nm.is_synced = True
+    nm._sync_samples = [(1, 2, 3)]
+    nm.on_disband = None
+    nm.on_state_change = None
+    return nm, published
+
+
+def test_leave_and_disband_reset():
+    print("[leave/disband: state reset]")
+    import json
+    nm, pub = _make_manager()
+    nm.room_code = "ROOM1"
+    nm.is_host = False
+    nm.leave_room()
+    check("leave publishes a leave message",
+          any(p[0] == "pub" and json.loads(p[2]).get("type") == "leave" for p in pub))
+    check("leave clears room_code", nm.room_code is None)
+    check("leave resets sync state",
+          nm.host_offset == 0.0 and not nm.is_synced and nm._sync_samples == [])
+
+    nm, pub = _make_manager()
+    nm.room_code = "ROOM2"
+    nm.is_host = True
+    nm.disband_room()
+    check("disband publishes a disband message",
+          any(p[0] == "pub" and json.loads(p[2]).get("type") == "disband" for p in pub))
+    check("disband clears host flag + room", nm.room_code is None and nm.is_host is False)
+
+    # A non-host cannot disband.
+    nm, pub = _make_manager()
+    nm.room_code = "ROOM3"
+    nm.is_host = False
+    nm.disband_room()
+    check("client disband is a no-op", nm.room_code == "ROOM3" and not pub)
+
+
+def test_host_removes_leaver():
+    print("[host handles a leaving player]")
+    nm, pub = _make_manager()
+    nm.room_code = "R"
+    nm.is_host = True
+    nm.room_state = {"players": [
+        {"client_id": "cid", "nickname": "Host", "channels": [], "ready": True},
+        {"client_id": "p2", "nickname": "Bob", "channels": [], "ready": False},
+    ], "filename": None}
+    # simulate receiving a 'leave' from p2
+    import types
+    msg = types.SimpleNamespace(payload=b'{"type":"leave","client_id":"p2"}')
+    nm._on_message(None, None, msg)
+    ids = [p["client_id"] for p in nm.room_state["players"]]
+    check("leaving player removed from roster", ids == ["cid"], f"got {ids}")
+
+
 if __name__ == "__main__":
     test_symmetric()
     test_host_reply_gap()
     test_asymmetric_bounded()
     test_best_sample_selection()
     test_select_offset()
+    test_leave_and_disband_reset()
+    test_host_removes_leaver()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

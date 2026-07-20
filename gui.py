@@ -30,7 +30,8 @@ class App(ctk.CTk):
             on_play_cmd=self.on_network_play,
             on_stop_cmd=self.on_network_stop,
             on_midi_received=self.on_network_midi,
-            on_sync_update=self.on_network_sync
+            on_sync_update=self.on_network_sync,
+            on_disband=self.on_network_disband
         )
         
         self.events = []
@@ -338,7 +339,12 @@ class App(ctk.CTk):
         
         self.sync_stop_btn = ctk.CTkButton(self.host_control_frame, text="STOP SINC", command=self.sync_stop, fg_color="red", hover_color="darkred", state="disabled")
         self.sync_stop_btn.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        
+
+        self.disband_btn = ctk.CTkButton(self.host_control_frame, text="Disband Lobby",
+                                         command=self.disband_room, fg_color="#8a5a00",
+                                         hover_color="#6d4700", state="disabled")
+        self.disband_btn.grid(row=1, column=0, columnspan=2, padx=5, pady=(0, 5), sticky="ew")
+
         # Client Controls
         self.client_control_frame = ctk.CTkFrame(self.tab_multi)
         self.client_control_frame.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
@@ -358,6 +364,11 @@ class App(ctk.CTk):
         self.nudge_entry.pack(side="left", padx=6)
         ctk.CTkLabel(nudge_row, text="−earlier / +later · tune by ear, set once",
                      text_color="gray").pack(side="left", padx=6)
+
+        self.leave_btn = ctk.CTkButton(self.client_control_frame, text="Leave Room",
+                                       command=self.leave_room, fg_color="gray30",
+                                       hover_color="gray20", state="disabled")
+        self.leave_btn.grid(row=2, column=0, padx=5, pady=(0, 5), sticky="ew")
 
     # --- Actions ---
 
@@ -585,6 +596,7 @@ class App(ctk.CTk):
         self.sync_label.configure(text="🕐 Clock: host (reference)", text_color="gray")
         self.sync_play_btn.configure(state="normal")
         self.sync_stop_btn.configure(state="normal")
+        self.disband_btn.configure(state="normal")
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
 
@@ -599,10 +611,46 @@ class App(ctk.CTk):
         self.sync_label.configure(text="🕐 Syncing clock…", text_color="orange")
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
+        self.leave_btn.configure(state="normal")
         # Ready stays locked until the clock is synced with the host, so nobody
         # can start a song before the timing is aligned.
         self.ready_btn.configure(state="disabled", text="Syncing clock…")
         self.my_ready_status = False
+
+    def leave_room(self):
+        self.network.leave_room()
+        self.player.stop()
+        self._reset_multiplayer_ui("You left the room.")
+
+    def disband_room(self):
+        self.network.disband_room()
+        self.player.stop()
+        self._reset_multiplayer_ui("Lobby disbanded.")
+
+    def on_network_disband(self):
+        # Host closed the room; runs on the network thread -> marshal to UI.
+        self.after(0, self._on_host_disbanded)
+
+    def _on_host_disbanded(self):
+        self.player.stop()
+        self._reset_multiplayer_ui("Host closed the room.")
+
+    def _reset_multiplayer_ui(self, status="Not Connected"):
+        self.status_label.configure(text=status, text_color="gray")
+        self.sync_label.configure(text="")
+        self.host_btn.configure(state="normal")
+        self.join_btn.configure(state="normal")
+        self.ready_btn.configure(state="disabled", text="I'm Ready!",
+                                 fg_color=["#3a7ebf", "#1f538d"],
+                                 hover_color=["#325882", "#14375e"])
+        self.sync_play_btn.configure(state="disabled",
+                                     text="SYNC PLAY (Waiting for Ready...)")
+        self.sync_stop_btn.configure(state="disabled")
+        self.disband_btn.configure(state="disabled")
+        self.leave_btn.configure(state="disabled")
+        self.my_ready_status = False
+        for widget in self.lobby_frame.winfo_children():
+            widget.destroy()
 
     def toggle_ready(self):
         self.my_ready_status = not self.my_ready_status

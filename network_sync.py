@@ -54,7 +54,7 @@ def select_offset(samples, k=5):
 
 class NetworkManager:
     def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None,
-                 on_midi_received=None, on_sync_update=None):
+                 on_midi_received=None, on_sync_update=None, on_disband=None):
         self.client_id = str(uuid.uuid4())
         self.nickname = "Player"
         self.room_code = None
@@ -81,6 +81,7 @@ class NetworkManager:
         self.on_stop_cmd = on_stop_cmd
         self.on_midi_received = on_midi_received
         self.on_sync_update = on_sync_update
+        self.on_disband = on_disband
         
         # Room State (Host maintains this)
         self.room_state = {
@@ -148,6 +149,43 @@ class NetworkManager:
         self.running = False
         self.client.loop_stop()
         self.client.disconnect()
+
+    def _reset_room_state(self):
+        """Return to the not-in-a-room state (keeps the MQTT connection so the
+        user can host or join again)."""
+        self.room_code = None
+        self.is_host = False
+        self.room_state = {"players": [], "filename": None}
+        self.host_offset = 0.0
+        self.sync_rtt = None
+        self.is_synced = False
+        self._sync_samples = []
+
+    def leave_room(self):
+        """A client (or host) leaves the current room. Clients tell the host so
+        they're removed from the roster; the room itself stays open."""
+        if not self.room_code:
+            return
+        topic = f"{BASE_TOPIC}/{self.room_code}"
+        try:
+            if not self.is_host:
+                self._publish({"type": "leave", "client_id": self.client_id})
+            self.client.unsubscribe(topic)
+        except Exception as e:
+            print(f"Error leaving room: {e}")
+        self._reset_room_state()
+
+    def disband_room(self):
+        """Host closes the room for everyone. All clients are notified and reset
+        to the disconnected state."""
+        if not self.is_host or not self.room_code:
+            return
+        try:
+            self._publish({"type": "disband"})
+            self.client.unsubscribe(f"{BASE_TOPIC}/{self.room_code}")
+        except Exception as e:
+            print(f"Error disbanding room: {e}")
+        self._reset_room_state()
 
     def host_room(self, room_code, nickname):
         self.room_code = room_code.upper()
@@ -299,7 +337,22 @@ class NetworkManager:
                             self.on_sync_update(self.sync_rtt, self.host_offset)
                 return
 
+            # Host closed the room -> clients reset to disconnected.
+            if msg_type == "disband":
+                if self.room_code and not self.is_host:
+                    self._reset_room_state()
+                    if self.on_disband:
+                        self.on_disband()
+                return
+
             if self.is_host:
+                if msg_type == "leave":
+                    self.room_state["players"] = [
+                        p for p in self.room_state["players"]
+                        if p["client_id"] != payload.get("client_id")
+                    ]
+                    self._broadcast_state()
+                    return
                 if msg_type == "join":
                     exists = False
                     for p in self.room_state["players"]:
