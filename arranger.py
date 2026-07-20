@@ -41,6 +41,7 @@ class ConversionSettings:
     duet_split_note: int = 60       # notes below this go to the Low part
     auto_split: bool = False        # auto-assign channels by musical role
     auto_split_parts: int = 2       # 2 = melody+accomp, 3 = melody+harmony+bass
+    disable_sustain: bool = False   # strip all pedal events (hold Space manually)
     range_low: int = ABS_LOW        # allowed output range (folded into)
     range_high: int = ABS_HIGH
     chord_window: float = 0.030     # seconds; notes within this = one chord
@@ -474,6 +475,12 @@ def split_duet(notes, sustains, split_note):
 def convert(events, settings, orig_bpm=120.0):
     """Run the full conversion pipeline. Returns a new event list."""
     notes, sustains = events_to_notes(events)
+
+    # Optionally strip all sustain-pedal events: the app then never taps Space,
+    # so you can hold the in-game sustain manually for a smooth legato — useful
+    # for very fast passages where rapid key re-triggering sounds glitchy.
+    if settings.disable_sustain:
+        sustains = []
 
     # 1. Tempo / speed
     factor = 1.0

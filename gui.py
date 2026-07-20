@@ -203,6 +203,7 @@ class App(ctk.CTk):
             ("voice_aware", "Voice-aware placement"),
             ("phrase_gap_shifting", "Phrase gap shifting"),
             ("melody_lock", "Melody priority (octaves)"),
+            ("disable_sustain", "Disable sustain pedal"),
             ("duet_mode", "Duet mode"),
         ]
         for row_checks in (checks[:5], checks[5:]):
@@ -471,6 +472,7 @@ class App(ctk.CTk):
             duet_split_note=self._get_note(self.duet_split_entry, 60),
             auto_split=self.autosplit_var.get(),
             auto_split_parts=int(self.autosplit_seg.get()),
+            disable_sustain=self.conv_vars["disable_sustain"].get(),
             range_low=self._get_note(self.range_low_entry, ABS_LOW),
             range_high=self._get_note(self.range_high_entry, ABS_HIGH),
         )

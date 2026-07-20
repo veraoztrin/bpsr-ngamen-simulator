@@ -294,6 +294,21 @@ def test_auto_split_sustain_duplicated():
     sus_ch = sorted(e['channel'] for e in out if e['type'] == 'sustain')
     check("sustain copied to both parts", sus_ch == [0, 1], f"got {sus_ch}")
 
+def test_disable_sustain():
+    print("[disable sustain pedal]")
+    evs = [on(0.0, 60), off(1.0, 60), on(1.0, 62), off(2.0, 62),
+           {'time': 0.5, 'type': 'sustain', 'value': True, 'channel': 0},
+           {'time': 1.5, 'type': 'sustain', 'value': False, 'channel': 0}]
+    out = convert(evs, ConversionSettings(disable_sustain=True), orig_bpm=120)
+    check("no sustain events emitted",
+          not any(e['type'] == 'sustain' for e in out), f"got {out}")
+    check("notes untouched", len(note_ons(out)) == 2, f"got {len(note_ons(out))}")
+    # sanity: without the flag the sustains are still there
+    out2 = convert(evs, ConversionSettings(), orig_bpm=120)
+    check("sustains kept when flag off",
+          sum(1 for e in out2 if e['type'] == 'sustain') == 2, f"got {out2}")
+
+
 def test_melody_lock_fold_mode():
     print("[melody lock: fold mode keeps notes]")
     evs = [on(0.0, 84), off(2.0, 84), on(0.5, 48), off(1.0, 48)]
