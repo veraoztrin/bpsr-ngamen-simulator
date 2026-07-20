@@ -4,7 +4,7 @@ import os
 import tempfile
 from midi_parser import parse_midi_full, get_channels_info
 from arranger import ConversionSettings, convert, ABS_LOW, ABS_HIGH
-from config import midi_to_note_name, note_name_to_midi
+from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
 from player import MidiPlayer
 from network_sync import NetworkManager
 from live_midi import LiveMidiListener
@@ -172,6 +172,21 @@ class App(ctk.CTk):
                                            command=self.reconvert)
         self.reconvert_btn.pack(side="right")
 
+        # Instrument selector (sets the range MIDIs are fitted into).
+        row_inst = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        row_inst.pack(fill="x", padx=10, pady=(8, 0))
+        ctk.CTkLabel(row_inst, text="Instrument:").pack(side="left")
+        self.instrument_var = ctk.StringVar(value="Piano")
+        self.instrument_menu = ctk.CTkOptionMenu(
+            row_inst, values=list(INSTRUMENTS.keys()), variable=self.instrument_var,
+            width=120, command=self.on_instrument_change)
+        self.instrument_menu.pack(side="left", padx=8)
+        _pia = INSTRUMENTS["Piano"]
+        self.instrument_hint = ctk.CTkLabel(
+            row_inst, text=f"fits notes into {midi_to_note_name(_pia['low'])}–"
+                           f"{midi_to_note_name(_pia['high'])}", text_color="gray")
+        self.instrument_hint.pack(side="left", padx=6)
+
         # Row 1: numeric settings
         row1 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
         row1.pack(fill="x", padx=10, pady=(8, 0))
@@ -264,6 +279,17 @@ class App(ctk.CTk):
         val = int(val)
         self.transpose_label.configure(text=f"Transpose: {val:+d}")
         self.player.transpose = val
+
+    def on_instrument_change(self, choice):
+        """Apply an instrument's playable range to the Range fields, then
+        re-fit the loaded MIDI into it."""
+        rng = INSTRUMENTS.get(choice)
+        if rng:
+            lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
+            self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
+            self.range_high_entry.delete(0, "end"); self.range_high_entry.insert(0, hi)
+            self.instrument_hint.configure(text=f"fits notes into {lo}–{hi}")
+        self.reconvert()
 
     def on_midi_device_select(self, choice):
         if choice == "None":

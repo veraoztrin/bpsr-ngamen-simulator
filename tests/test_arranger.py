@@ -294,6 +294,19 @@ def test_auto_split_sustain_duplicated():
     sus_ch = sorted(e['channel'] for e in out if e['type'] == 'sustain')
     check("sustain copied to both parts", sus_ch == [0, 1], f"got {sus_ch}")
 
+def test_guitar_range_fold():
+    print("[instrument: guitar range fold E2-B4]")
+    # E1 (below), C4 (inside), E6 (above) -> all must fold into 40..71.
+    evs = [on(0.0, 28), off(0.5, 28),
+           on(0.5, 60), off(1.0, 60),
+           on(1.0, 88), off(1.5, 88)]
+    out = convert(evs, ConversionSettings(range_low=40, range_high=71), orig_bpm=120)
+    ps = sorted(e['note'] for e in note_ons(out))
+    check("all notes inside E2-B4 (40-71)", all(40 <= p <= 71 for p in ps), f"got {ps}")
+    check("pitch classes preserved (E/C/E)",
+          sorted(p % 12 for p in ps) == sorted([28 % 12, 60 % 12, 88 % 12]), f"got {ps}")
+
+
 def test_disable_sustain():
     print("[disable sustain pedal]")
     evs = [on(0.0, 60), off(1.0, 60), on(1.0, 62), off(2.0, 62),

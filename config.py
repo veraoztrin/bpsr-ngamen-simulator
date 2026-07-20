@@ -59,6 +59,17 @@ KEY_MAP = {
 # We'll map MIDI notes to their string representation.
 NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
+# Instruments: the playable MIDI-note range that loaded MIDIs are fitted into.
+# Selected in the GUI before/while a MIDI is loaded; Piano is the default and
+# keeps the current full-keyboard behavior. Notes outside the chosen range are
+# octave-folded (or compressed with Proportional remap) to fit.
+#   Piano : C2-B6  (the 3-octave keyboard extended by L-Shift / L-Ctrl)
+#   Guitar: E2-B4
+INSTRUMENTS = {
+    "Piano":  {"low": 36, "high": 95},
+    "Guitar": {"low": 40, "high": 71},
+}
+
 def midi_to_note_name(midi_note):
     octave = (midi_note // 12) - 1
     note = NOTES[midi_note % 12]

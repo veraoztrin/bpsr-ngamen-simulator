@@ -23,6 +23,8 @@ A plug-and-play desktop application designed to read standard MIDI (`.mid`) file
 
 The Solo tab includes a conversion panel that re-transcribes the loaded MIDI on the fly. Toggle options and hit **↻ Re-convert** (checkboxes apply instantly):
 
+- **Instrument:** Choose the in-game instrument before (or after) loading a MIDI. **Piano** (default) uses the full keyboard range (C2–B6) and behaves exactly as before. **Guitar** fits everything into E2–B4. Selecting an instrument sets the **Range** to its playable window, and all notes are transcribed/octave-folded to fit; you can still fine-tune the Range afterward. (Adding more instruments is just one line in `config.py`'s `INSTRUMENTS` table.)
+
 - **BPM (override):** Play the song at a different tempo than the file's original (shown next to the panel title, along with the time signature).
 - **Speed:** Simple playback speed multiplier (e.g. `0.5` = half speed, `2.0` = double).
 - **Max chord notes (1–5):** Caps how many notes strike simultaneously. Extra notes are dropped, loudest-first.
