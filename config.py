@@ -65,9 +65,16 @@ NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 # octave-folded (or compressed with Proportional remap) to fit.
 #   Piano : C2-B6  (the 3-octave keyboard extended by L-Shift / L-Ctrl)
 #   Guitar: E2-B4
+# low/high  = the instrument's playable range in its own SOUNDING pitches.
+# offset    = semitones to ADD to a target note before looking it up in the
+#             piano key map. The in-game bass keyboard is the piano layout
+#             transposed down 2 octaves (its 'C' key sounds E1 where the piano's
+#             sounds E3), so to sound bass note P we press the piano key for
+#             P+24. Piano/Guitar share the piano pitch mapping, so offset 0.
 INSTRUMENTS = {
-    "Piano":  {"low": 36, "high": 95},
-    "Guitar": {"low": 40, "high": 71},
+    "Piano":  {"low": 36, "high": 95, "offset": 0},
+    "Guitar": {"low": 40, "high": 71, "offset": 0},
+    "Bass":   {"low": 28, "high": 47, "offset": 24},
 }
 
 def midi_to_note_name(midi_note):

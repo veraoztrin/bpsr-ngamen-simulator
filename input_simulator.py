@@ -73,6 +73,10 @@ class BPSRInputSimulator:
         self.shift_delay_ms = 30
         self.shift_hold_ms = 10
         self._last_shift_change = 0.0
+        # Semitone offset added before the piano key lookup, so instruments
+        # whose keyboard is the piano layout transposed (e.g. Bass = -2 octaves)
+        # press the right key. 0 = piano/guitar.
+        self.key_offset = 0
 
     def set_octave_shift(self, target_shift):
         if self.current_octave_shift == target_shift:
@@ -110,6 +114,7 @@ class BPSRInputSimulator:
             self.sustain_active = active
 
     def press_note(self, midi_note):
+        midi_note = midi_note + self.key_offset
         target_shift, base_note = self._get_mapping(midi_note)
         if base_note is None:
             return # Out of range
@@ -130,6 +135,7 @@ class BPSRInputSimulator:
             self.key_refs[vk_code] = refs + 1
 
     def release_note(self, midi_note):
+        midi_note = midi_note + self.key_offset
         _, base_note = self._get_mapping(midi_note)
         if base_note is None:
             return

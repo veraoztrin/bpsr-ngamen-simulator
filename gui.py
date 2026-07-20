@@ -281,6 +281,9 @@ class App(ctk.CTk):
         self.transpose_label.configure(text=f"Transpose: {val:+d}")
         self.player.transpose = val
 
+    def _inst(self):
+        return INSTRUMENTS.get(self.instrument_var.get(), INSTRUMENTS["Piano"])
+
     def on_instrument_change(self, choice):
         """Apply an instrument's playable range to the Range fields, then
         re-fit the loaded MIDI into it."""
@@ -510,6 +513,9 @@ class App(ctk.CTk):
             auto_split=self.autosplit_var.get(),
             auto_split_parts=int(self.autosplit_seg.get()),
             disable_sustain=self.conv_vars["disable_sustain"].get(),
+            reach_low=self._inst()["low"],
+            reach_high=self._inst()["high"],
+            instrument_offset=self._inst()["offset"],
             range_low=self._get_note(self.range_low_entry, ABS_LOW),
             range_high=self._get_note(self.range_high_entry, ABS_HIGH),
         )
@@ -523,10 +529,11 @@ class App(ctk.CTk):
         self.events = convert(self.raw_events, settings, orig_bpm=self.orig_bpm)
         self.channels = get_channels_info(self.events)
 
-        # Apply input timing knobs
+        # Apply input timing knobs + the instrument's key offset
         if self.player.simulator:
             self.player.simulator.shift_delay_ms = self._get_float(self.shift_delay_entry, 30)
             self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
+            self.player.simulator.key_offset = self._inst()["offset"]
 
         self.build_solo_channel_ui(duet=settings.duet_mode,
                                    auto=settings.auto_split,

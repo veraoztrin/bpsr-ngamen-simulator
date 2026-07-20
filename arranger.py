@@ -19,8 +19,8 @@ from itertools import groupby
 # zone +1 : L Shift held   -> MIDI 60..95  (C4..B7 sounding)
 # zone -1 : L Ctrl held    -> MIDI 36..71  (C2..B4 sounding)
 ZONE_RANGES = {0: (48, 83), 1: (60, 95), -1: (36, 71)}
-ABS_LOW = 36   # C2 - lowest reachable note
-ABS_HIGH = 95  # B7 - highest reachable note
+ABS_LOW = 36   # C2 - lowest reachable note (piano)
+ABS_HIGH = 95  # B6 - highest reachable note (piano)
 
 
 @dataclass
@@ -44,6 +44,9 @@ class ConversionSettings:
     disable_sustain: bool = False   # strip all pedal events (hold Space manually)
     range_low: int = ABS_LOW        # allowed output range (folded into)
     range_high: int = ABS_HIGH
+    reach_low: int = ABS_LOW        # instrument's physical reach (fold floor/ceiling)
+    reach_high: int = ABS_HIGH
+    instrument_offset: int = 0      # !=0 => non-piano keyboard; skip piano zone logic
     chord_window: float = 0.030     # seconds; notes within this = one chord
     thinning_gap: float = 0.030     # min silence between same-pitch repeats
     thinning_min_len: float = 0.020 # drop notes shorter than this when thinning
@@ -490,9 +493,10 @@ def convert(events, settings, orig_bpm=120.0):
         factor /= settings.speed
     scale_times(notes, sustains, factor)
 
-    # 2. Pitch range mapping
-    lo = max(ABS_LOW, min(settings.range_low, settings.range_high))
-    hi = min(ABS_HIGH, max(settings.range_low, settings.range_high))
+    # 2. Pitch range mapping (clamped to the instrument's physical reach)
+    reach_lo, reach_hi = settings.reach_low, settings.reach_high
+    lo = max(reach_lo, min(settings.range_low, settings.range_high))
+    hi = min(reach_hi, max(settings.range_low, settings.range_high))
     if settings.proportional_remap:
         proportional_remap(notes, lo, hi)
     else:
@@ -507,16 +511,20 @@ def convert(events, settings, orig_bpm=120.0):
             or settings.consistent_windows or settings.prioritize_melody):
         notes = limit_chords(notes, settings)
 
-    # 5. Octave-zone planning (melody-lock takes precedence over phrase-gap)
+    # 5. Octave-zone planning (melody-lock takes precedence over phrase-gap).
+    # These model the PIANO's 3 shift zones, so they only apply to instruments
+    # that use the piano pitch mapping (offset 0); a transposed keyboard like
+    # Bass fits in one zone and needs no shifting.
     zone_hints = []
-    if settings.melody_lock:
-        zone_hints, notes = apply_melody_lock(notes, settings.chord_window,
-                                              settings.melody_lock_mode)
-    elif settings.phrase_gap_shifting:
-        zone_hints = apply_phrase_zones(notes, settings.phrase_gap)
+    if settings.instrument_offset == 0:
+        if settings.melody_lock:
+            zone_hints, notes = apply_melody_lock(notes, settings.chord_window,
+                                                  settings.melody_lock_mode)
+        elif settings.phrase_gap_shifting:
+            zone_hints = apply_phrase_zones(notes, settings.phrase_gap)
 
-    # 6. Final safety: everything must be physically reachable
-    fold_into_range(notes, ABS_LOW, ABS_HIGH)
+    # 6. Final safety: everything must be inside the instrument's reach
+    fold_into_range(notes, reach_lo, reach_hi)
 
     # 7. Channel assignment (auto-split by role supersedes the fixed duet split)
     if settings.auto_split:
