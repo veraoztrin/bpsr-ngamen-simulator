@@ -5,7 +5,7 @@ import os
 import random
 import tempfile
 from midi_parser import parse_midi_full, get_channels_info
-from arranger import ConversionSettings, convert, ABS_LOW, ABS_HIGH
+from arranger import ConversionSettings, convert, convert_drum, ABS_LOW, ABS_HIGH
 from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
 from player import MidiPlayer
 from network_sync import NetworkManager
@@ -222,9 +222,13 @@ class App(ctk.CTk):
         self.speed_entry.insert(0, "1.0")
         self.speed_entry.pack(side="left", padx=(4, 12))
 
-        ctk.CTkLabel(row1, text="Max chord notes:").pack(side="left")
+        # Wrapped in its own subframe so it can be hidden in Drum mode (a
+        # generated beat has no "chords" to limit) without disturbing BPM/Speed.
+        self.maxchord_frame = ctk.CTkFrame(row1, fg_color="transparent")
+        self.maxchord_frame.pack(side="left")
+        ctk.CTkLabel(self.maxchord_frame, text="Max chord notes:").pack(side="left")
         self.max_chord_seg = ctk.CTkSegmentedButton(
-            row1, values=["1", "2", "3", "4", "5"],
+            self.maxchord_frame, values=["1", "2", "3", "4", "5"],
             command=lambda _: self.reconvert())
         self.max_chord_seg.set("5")
         self.max_chord_seg.pack(side="left", padx=(4, 0))
@@ -245,9 +249,11 @@ class App(ctk.CTk):
         ]
         # 3 rows instead of 2 - 5-per-row was clipping the last label or two
         # against the window edge.
+        self.checkbox_row_frames = []
         for row_checks in (checks[:4], checks[4:7], checks[7:]):
             row = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=(8, 0))
+            self.checkbox_row_frames.append(row)
             for key, label in row_checks:
                 var = ctk.BooleanVar(value=False)
                 self.conv_vars[key] = var
@@ -255,7 +261,7 @@ class App(ctk.CTk):
                                 command=self.reconvert).pack(side="left", padx=(0, 14))
 
         # Row 3: range + timing
-        row3 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        self.row3 = row3 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
         row3.pack(fill="x", padx=10, pady=8)
 
         ctk.CTkLabel(row3, text="Range:").pack(side="left")
@@ -283,7 +289,7 @@ class App(ctk.CTk):
         self.shift_hold_entry.pack(side="left", padx=(4, 0))
 
         # Row 4: automatic part categorization
-        row4 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        self.row4 = row4 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
         row4.pack(fill="x", padx=10, pady=(0, 8))
         self.autosplit_var = ctk.BooleanVar(value=False)
         ctk.CTkCheckBox(row4, text="Auto-split parts", variable=self.autosplit_var,
@@ -295,6 +301,17 @@ class App(ctk.CTk):
         self.autosplit_seg.pack(side="left", padx=6)
         ctk.CTkLabel(row4, text="channels by role (melody / accomp / bass)",
                      text_color="gray").pack(side="left", padx=4)
+
+        # Rows that only make sense for a pitch-based instrument (chord size,
+        # note-shaping checkboxes, range/duet/timing, channel auto-split) -
+        # hidden in Drum mode, which just auto-generates a beat instead.
+        self._drum_hidden_widgets = [
+            (self.maxchord_frame, {"side": "left"}),
+        ]
+        for row in self.checkbox_row_frames:
+            self._drum_hidden_widgets.append((row, {"fill": "x", "padx": 10, "pady": (8, 0)}))
+        self._drum_hidden_widgets.append((self.row3, {"fill": "x", "padx": 10, "pady": 8}))
+        self._drum_hidden_widgets.append((self.row4, {"fill": "x", "padx": 10, "pady": (0, 8)}))
 
         self.channel_frame = ctk.CTkScrollableFrame(self.tab_solo, label_text="Solo Active Channels")
         self.channel_frame.grid(row=3, column=0, padx=10, pady=10, sticky="nsew")
@@ -309,13 +326,27 @@ class App(ctk.CTk):
 
     def on_instrument_change(self, choice):
         """Apply an instrument's playable range to the Range fields, then
-        re-fit the loaded MIDI into it."""
+        re-fit the loaded MIDI into it. Drum is a different beast - it has
+        no continuous playable range, so it gets its own hint text and hides
+        every conversion control that doesn't apply to a generated beat."""
         rng = INSTRUMENTS.get(choice)
+        is_drum = bool(rng and rng.get("is_drum"))
+
+        for widget, pack_kwargs in self._drum_hidden_widgets:
+            if is_drum:
+                widget.pack_forget()
+            else:
+                widget.pack(**pack_kwargs)
+
         if rng:
-            lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
-            self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
-            self.range_high_entry.delete(0, "end"); self.range_high_entry.insert(0, hi)
-            self.instrument_hint.configure(text=f"fits notes into {lo}–{hi}")
+            if is_drum:
+                self.instrument_hint.configure(
+                    text="auto-generates a beat (game only plays D4/F4/A4 on Drum)")
+            else:
+                lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
+                self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
+                self.range_high_entry.delete(0, "end"); self.range_high_entry.insert(0, hi)
+                self.instrument_hint.configure(text=f"fits notes into {lo}–{hi}")
         self.reconvert()
 
     def on_midi_device_select(self, choice):
@@ -663,7 +694,11 @@ class App(ctk.CTk):
         if not self.raw_events:
             return
         settings = self.build_settings()
-        self.events = convert(self.raw_events, settings, orig_bpm=self.orig_bpm)
+        is_drum = self._inst().get("is_drum", False)
+        if is_drum:
+            self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm)
+        else:
+            self.events = convert(self.raw_events, settings, orig_bpm=self.orig_bpm)
         self.channels = get_channels_info(self.events)
 
         # Apply input timing knobs + the instrument's key offset
@@ -672,8 +707,11 @@ class App(ctk.CTk):
             self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
             self.player.simulator.key_offset = self._inst()["offset"]
 
-        self.build_solo_channel_ui(duet=settings.duet_mode,
-                                   auto=settings.auto_split,
+        # Drum output is always a single channel - ignore any leftover
+        # duet/auto-split state from before the instrument was switched, so
+        # the Solo panel doesn't show stale "Duet Low/High" style labels.
+        self.build_solo_channel_ui(duet=(settings.duet_mode and not is_drum),
+                                   auto=(settings.auto_split and not is_drum),
                                    parts=settings.auto_split_parts)
         self.player.load_events(self.events, self.channels)
 

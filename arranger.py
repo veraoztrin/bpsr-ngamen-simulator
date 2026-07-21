@@ -472,6 +472,107 @@ def split_duet(notes, sustains, split_note):
 
 
 # ---------------------------------------------------------------------------
+# Drum conversion mode
+# ---------------------------------------------------------------------------
+# The in-game "Drum" instrument only responds on 3 of its on-screen keys -
+# D4/F4/A4 (see config.DRUM_NOTES) - everything else is silent. A straight
+# pitch-based 1:1 conversion would therefore drop almost the whole song, so
+# Drum gets its own conversion path: instead of remapping pitches, it builds
+# a brand new rhythm track from the MIDI's note-onset timing.
+#
+#   - If the MIDI already has a real percussion track (General MIDI channel
+#     9, i.e. "channel 10" in most DAWs), its kick/snare/hihat notes are
+#     bucketed onto the 3 playable keys, preserving the original drum part.
+#   - Otherwise (a normal melodic MIDI) a beat is invented from the note
+#     onsets: chords/near-simultaneous onsets collapse into a single hit,
+#     onsets that land on a quarter-note line alternate kick/snare for a
+#     steady backbone (kick on beats 1 & 3, snare on 2 & 4), and anything
+#     syncopated/off-grid becomes the hat - the catch-all filler voice.
+
+DRUM_KICK, DRUM_SNARE, DRUM_HAT = 62, 65, 69  # D4 / F4 / A4
+DRUM_HIT_LEN = 0.09      # seconds a drum tap is held - drums aren't sustained
+DRUM_MIN_GAP = 0.06      # per-voice retrigger floor, so a blast-beat passage
+                         # doesn't turn into an unplayable flood of re-presses
+
+# GM percussion note numbers, bucketed down to the 3 sounds the game has.
+_GM_KICK = {35, 36}
+_GM_SNARE = {37, 38, 40}
+# everything else on the GM drum channel (hihats, toms, cymbals, other
+# percussion) falls into the "hat" bucket - the catch-all top voice.
+
+
+def _gm_drum_bucket(note):
+    if note in _GM_KICK:
+        return DRUM_KICK
+    if note in _GM_SNARE:
+        return DRUM_SNARE
+    return DRUM_HAT
+
+
+def convert_drum(events, settings, orig_bpm=120.0):
+    """Drum-mode conversion: generate a beat instead of a 1:1 melody."""
+    notes, _sustains = events_to_notes(events)
+    if not notes:
+        return []
+
+    # Tempo / speed - same knobs as the normal pipeline, applied the same way.
+    factor = 1.0
+    if settings.bpm_override and settings.bpm_override > 0 and orig_bpm > 0:
+        factor *= orig_bpm / settings.bpm_override
+    if settings.speed and settings.speed > 0:
+        factor /= settings.speed
+    if factor != 1.0:
+        for n in notes:
+            n['start'] *= factor
+            n['end'] *= factor
+
+    orig_bpm_safe = orig_bpm if orig_bpm and orig_bpm > 0 else 120.0
+    beat_len = (60.0 / orig_bpm_safe) * factor
+
+    has_gm_drum_track = any(n['channel'] == 9 for n in notes)
+
+    hits = []  # (time, voice)
+    if has_gm_drum_track:
+        drum_notes = [n for n in notes if n['channel'] == 9]
+        for g in group_chords(drum_notes, settings.chord_window, settings.consistent_windows):
+            best = {}
+            for n in g:
+                voice = _gm_drum_bucket(n['note'])
+                if voice not in best or n['velocity'] > best[voice]['velocity']:
+                    best[voice] = n
+            t = min(n['start'] for n in g)
+            for voice in best:
+                hits.append((t, voice))
+    else:
+        tol = min(0.06, beat_len * 0.12) if beat_len > 0 else 0.03
+        for g in group_chords(notes, settings.chord_window, settings.consistent_windows):
+            t = min(n['start'] for n in g)
+            nearest_beat = round(t / beat_len) if beat_len > 0 else 0
+            on_grid = beat_len > 0 and abs(t - nearest_beat * beat_len) <= tol
+            if on_grid:
+                voice = DRUM_KICK if nearest_beat % 2 == 0 else DRUM_SNARE
+            else:
+                voice = DRUM_HAT
+            hits.append((t, voice))
+
+    # Per-voice retrigger floor: drop hits arriving too soon after the last
+    # hit on the same voice (keeps fast passages from becoming a key-mash).
+    hits.sort(key=lambda h: h[0])
+    last_by_voice = {}
+    kept = []
+    for t, voice in hits:
+        prev = last_by_voice.get(voice)
+        if prev is not None and t - prev < DRUM_MIN_GAP:
+            continue
+        kept.append((t, voice))
+        last_by_voice[voice] = t
+
+    out_notes = [{'start': t, 'end': t + DRUM_HIT_LEN, 'note': voice,
+                  'velocity': 100, 'channel': 0} for t, voice in kept]
+    return notes_to_events(out_notes, [], [])
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
