@@ -308,20 +308,20 @@ def test_guitar_range_fold():
 
 
 def test_bass_instrument():
-    print("[instrument: bass E1-B2 with -2oct keyboard]")
+    print("[instrument: bass E1-B2 with -3oct keyboard]")
     # A wide-range piano MIDI played on Bass: fold into E1-B2 (28-47).
     evs = [on(0.0, 20), off(0.5, 20),   # G#0, below
            on(0.5, 55), off(1.0, 55),   # G3, above B2
            on(1.0, 40), off(1.5, 40)]   # E2, inside
     s = ConversionSettings(range_low=28, range_high=47, reach_low=28,
-                           reach_high=47, instrument_offset=24)
+                           reach_high=47, instrument_offset=36)
     out = convert(evs, s, orig_bpm=120)
     ps = [e['note'] for e in note_ons(out)]
     check("all notes inside E1-B2 (28-47)", all(28 <= p <= 47 for p in ps), f"got {ps}")
-    # After the +24 key offset every note must hit a real piano key (36-95),
+    # After the +36 key offset every note must hit a real piano key (36-95),
     # and land in a single zone (48-83) so no octave shift is needed.
     check("offset notes reach piano keys 48-83",
-          all(48 <= p + 24 <= 83 for p in ps), f"got {[p+24 for p in ps]}")
+          all(48 <= p + 36 <= 83 for p in ps), f"got {[p+36 for p in ps]}")
 
 def test_bass_skips_zone_features():
     print("[instrument: bass skips piano zone logic]")
@@ -329,7 +329,7 @@ def test_bass_skips_zone_features():
     # never drop low bass notes.
     evs = [on(0.0, 28), off(1.0, 28), on(0.0, 47), off(1.0, 47)]
     s = ConversionSettings(range_low=28, range_high=47, reach_low=28,
-                           reach_high=47, instrument_offset=24,
+                           reach_high=47, instrument_offset=36,
                            melody_lock=True, phrase_gap_shifting=True)
     out = convert(evs, s, orig_bpm=120)
     check("no zone hints for bass", not any(e['type'] == 'zone' for e in out))

@@ -68,13 +68,19 @@ NOTES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 # low/high  = the instrument's playable range in its own SOUNDING pitches.
 # offset    = semitones to ADD to a target note before looking it up in the
 #             piano key map. The in-game bass keyboard is the piano layout
-#             transposed down 2 octaves (its 'C' key sounds E1 where the piano's
-#             sounds E3), so to sound bass note P we press the piano key for
-#             P+24. Piano/Guitar share the piano pitch mapping, so offset 0.
+#             transposed down 3 octaves (its 'D' key sounds E1 where the
+#             piano's D key sounds E4), so to sound bass note P we press the
+#             piano key for P+36. Piano/Guitar share the piano pitch mapping,
+#             so offset 0.
+#             (Confirmed empirically: loading a C-major-scale MIDI on Bass
+#             pressed physical keys D/F/G/H/J, which the game itself reported
+#             sounding E1/F1/G1/A1/B1 - exactly 36 semitones below what those
+#             same keys sound on Piano (E4/F4/G4/A4/B4), not the 24 originally
+#             assumed here. Confirmed 24 was wrong before this fix.)
 INSTRUMENTS = {
     "Piano":  {"low": 36, "high": 95, "offset": 0},
     "Guitar": {"low": 40, "high": 71, "offset": 0},
-    "Bass":   {"low": 28, "high": 47, "offset": 24},
+    "Bass":   {"low": 28, "high": 47, "offset": 36},
     # Drum isn't a continuous playable range like the others - see DRUM_NOTES
     # below and arranger.convert_drum(). low/high/offset are kept here only
     # so code that generically reads INSTRUMENTS[...] doesn't need a special
