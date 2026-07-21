@@ -73,6 +73,71 @@ class MidiPlayer:
         self.thread = threading.Thread(target=self._playback_loop, daemon=True)
         self.thread.start()
 
+    def seek(self, target_time):
+        """Jump to a specific point in the song (seconds).
+
+        This doesn't decode audio, it simulates real key presses, so
+        "seeking" means silently fast-forwarding through everything up to
+        target_time rather than moving an audio playhead. Individual notes
+        already sounding at that instant are intentionally not re-pressed
+        (release_note() is reference-counted, so their eventual note_off is
+        a harmless no-op) - but the sustain pedal and octave-shift modifier
+        are global state, so we replay whatever their last value was before
+        target_time, or resuming mid-song would drop the pedal / snap to
+        the wrong octave.
+
+        Preserves whatever state you were in: playing stays playing (from
+        the new spot), paused stays paused (at the new spot, ready for the
+        next Play), and seeking while stopped arms a paused-at-that-point
+        state the same way.
+        """
+        if not self.events:
+            return
+        target_time = max(0.0, min(target_time, self.get_total_time()))
+        was_playing = self.is_playing and not self.is_paused
+
+        # Halt the running thread (if any) and release whatever's currently
+        # held, without resetting current_event_idx the way stop() does.
+        self.stop_requested = True
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.simulator:
+            self.simulator.release_all()
+
+        last_sustain, last_zone, idx = 0, 0, 0
+        for i, ev in enumerate(self.events):
+            if ev['time'] > target_time:
+                break
+            idx = i + 1
+            if ev['type'] == 'sustain':
+                last_sustain = ev['value']
+            elif ev['type'] == 'zone':
+                last_zone = ev['value']
+        self.current_event_idx = idx
+
+        if self.simulator:
+            if self.transpose == 0:
+                self.simulator.set_octave_shift(last_zone)
+            self.simulator.set_sustain(bool(last_sustain))
+
+        self.stop_requested = False
+        now = time.perf_counter()
+        if was_playing:
+            self.start_time = now - target_time
+            self.is_paused = False
+            self.is_playing = True
+            self.thread = threading.Thread(target=self._playback_loop, daemon=True)
+            self.thread.start()
+        else:
+            # Stopped or already paused: land in "paused at this position"
+            # so get_current_time()/the progress bar reflect it immediately,
+            # and the next Play() resumes from here (play()'s is_paused
+            # branch just offsets start_time by the time since pause_time).
+            self.is_playing = False
+            self.is_paused = True
+            self.pause_time = now
+            self.start_time = now - target_time
+
     def pause(self):
         if self.is_playing and not self.is_paused:
             self.is_paused = True

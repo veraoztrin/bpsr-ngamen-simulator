@@ -99,6 +99,9 @@ class App(ctk.CTk):
         self.progress_bar = ctk.CTkProgressBar(self.progress_frame)
         self.progress_bar.pack(side="left", fill="x", expand=True, padx=5)
         self.progress_bar.set(0)
+        # Click-to-seek: jump to wherever on the bar was clicked (feedback:
+        # "click and it plays from there", like a YouTube timeline).
+        self.progress_bar.bind("<Button-1>", self.on_progress_click)
 
         # Tabs
         self.tabview = ctk.CTkTabview(self)
@@ -395,21 +398,14 @@ class App(ctk.CTk):
 
     # --- Actions ---
 
-    def update_led_loop(self):
-        if self.player.is_syncing:
-            self.led_label.configure(text="🟡 Syncing...", text_color="yellow")
-        elif self.player.is_playing:
-            self.led_label.configure(text="🟢 Playing", text_color="green")
-        else:
-            self.led_label.configure(text="🔴 Stopped", text_color="gray")
-            
+    def _refresh_progress_bar(self):
         current = self.player.get_current_time()
         total = self.player.get_total_time()
-        
+
         if total > 0:
             progress = max(0.0, min(1.0, current / total))
             self.progress_bar.set(progress)
-            
+
             curr_m = int(current // 60)
             curr_s = int(current % 60)
             tot_m = int(total // 60)
@@ -418,7 +414,31 @@ class App(ctk.CTk):
         else:
             self.progress_bar.set(0)
             self.time_label.configure(text="00:00 / 00:00")
-            
+
+    def on_progress_click(self, event):
+        """Click-to-seek: jump playback to wherever on the bar was clicked."""
+        if not self.events:
+            return
+        total = self.player.get_total_time()
+        if total <= 0:
+            return
+        width = self.progress_bar.winfo_width()
+        if width <= 1:
+            return
+        frac = max(0.0, min(1.0, event.x / width))
+        self.player.seek(frac * total)
+        self._refresh_progress_bar()  # instant feedback, don't wait for the next 200ms tick
+
+    def update_led_loop(self):
+        if self.player.is_syncing:
+            self.led_label.configure(text="🟡 Syncing...", text_color="yellow")
+        elif self.player.is_playing:
+            self.led_label.configure(text="🟢 Playing", text_color="green")
+        else:
+            self.led_label.configure(text="🔴 Stopped", text_color="gray")
+
+        self._refresh_progress_bar()
+
         # Auto-advance song if finished naturally (only when Autoplay is on).
         # On natural finish the player already released all keys; with autoplay
         # off we simply stop here instead of loading the next track.
