@@ -4,7 +4,7 @@ import json
 import os
 import random
 import tempfile
-from midi_parser import parse_midi_full, get_channels_info
+from midi_parser import parse_midi_full, get_channels_info, guess_channel_instrument
 from arranger import ConversionSettings, convert, convert_drum, ABS_LOW, ABS_HIGH
 from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
 from player import MidiPlayer
@@ -45,6 +45,7 @@ class App(ctk.CTk):
         self.events = []
         self.raw_events = []          # untouched parse result (conversion source)
         self.orig_bpm = 120.0
+        self.channel_programs = {}   # channel -> GM program number, from the raw MIDI
         self.beats_per_measure = 4
         self.channels = []
         self.host_checkbox_vars = {}
@@ -514,6 +515,7 @@ class App(ctk.CTk):
             self.raw_events = []
             self.events = []
             self.channels = []
+            self.channel_programs = {}
             self.song_info_label.configure(text="")
         else:
             self.current_song_idx = min(self.current_song_idx, len(self.playlist) - 1)
@@ -571,6 +573,7 @@ class App(ctk.CTk):
         self.raw_events = parsed['events']
         self.orig_bpm = parsed['bpm']
         self.beats_per_measure = parsed['beats_per_measure']
+        self.channel_programs = parsed.get('channel_programs', {})
         self.song_info_label.configure(
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4")
         self.reconvert()
@@ -740,6 +743,15 @@ class App(ctk.CTk):
                 return {0: "Melody", 1: "Accompaniment"}.get(ch, f"Part {ch}")
             if duet:
                 return {0: "Duet Low (bass)", 1: "Duet High (melody)"}.get(ch, f"Channel {ch}")
+            # Plain (no auto-split/duet) mode: keep the raw channel number,
+            # but tack on an educated instrument guess when we have one -
+            # from the channel's GM Program Change, or "Drums" for the
+            # reserved GM percussion channel. Channels with neither just
+            # stay "Channel N" as before rather than showing a guess we
+            # aren't confident in.
+            guess = guess_channel_instrument(ch, self.channel_programs)
+            if guess:
+                return f"Channel {ch} - {guess}"
             return f"Channel {ch}"
 
         for ch in self.channels:
