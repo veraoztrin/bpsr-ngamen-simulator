@@ -1,14 +1,38 @@
-import ntplib
 import time
 import json
 import base64
 import uuid
+import os
 import threading
 import paho.mqtt.client as mqtt
 
 BROKER = "broker.hivemq.com"
 PORT = 1883
 BASE_TOPIC = "bpsr_bard/room"
+
+# The release build runs with PyInstaller's --windowed flag (no console), so
+# print() output disappears into the void for every real user. Mirror it to a
+# small log file next to the user's home dir so a connection problem can
+# actually be diagnosed after the fact instead of just looking like "stuck".
+_LOG_PATH = os.path.join(os.path.expanduser("~"), ".bpsr_midi_player", "network.log")
+
+
+def _log(msg):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line)
+    try:
+        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+        with open(_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        # Cheap cap so the log can't grow forever across long sessions.
+        if os.path.getsize(_LOG_PATH) > 512_000:
+            with open(_LOG_PATH, "r+", encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()[-2000:]
+                f.seek(0)
+                f.writelines(lines)
+                f.truncate()
+    except Exception:
+        pass  # Logging must never be the thing that breaks the app.
 
 
 def compute_offset(t0, t1, t2, t3):
@@ -54,26 +78,33 @@ def select_offset(samples, k=5):
 
 class NetworkManager:
     def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None,
-                 on_midi_received=None, on_sync_update=None, on_disband=None):
+                 on_midi_received=None, on_sync_update=None, on_disband=None,
+                 on_connection_status=None, on_sync_stalled=None):
         self.client_id = str(uuid.uuid4())
         self.nickname = "Player"
         self.room_code = None
         self.is_host = False
 
-        # Peer-to-peer clock sync (replaces the old one-shot external NTP).
-        # A client measures its offset directly against the host over MQTT,
-        # so it no longer depends on pool.ntp.org being reachable.
-        self.ntp_offset = 0.0          # kept for backward compat; unused in scheduling
+        # Peer-to-peer clock sync (replaces the old one-shot external NTP,
+        # which used to be blocked by the same kind of firewalls that can
+        # also get in the way of this MQTT connection - see on_connection_status).
         self.host_offset = 0.0         # host_time ~= local_time + host_offset
         self.sync_rtt = None           # best round-trip delay seen (seconds)
         self.is_synced = False
         self._sync_samples = []        # list of (local_ts, rtt, offset)
         self._sync_id = 0
+        self._room_joined_at = None    # monotonic time we joined/hosted, for the stall watchdog
+        self._sync_stall_reported = False
         self.sync_thread = None
 
         self.client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=self.client_id)
         self.client.on_connect = self._on_connect
+        self.client.on_disconnect = self._on_disconnect
         self.client.on_message = self._on_message
+        # Auto-reconnect (paho already retries in the loop_start() thread) but
+        # with a much shorter cap than the 120s default - a live jam session
+        # shouldn't wait two minutes to notice the wifi blinked.
+        self.client.reconnect_delay_set(min_delay=1, max_delay=8)
 
         # Callbacks to UI
         self.on_state_change = on_state_change
@@ -82,7 +113,9 @@ class NetworkManager:
         self.on_midi_received = on_midi_received
         self.on_sync_update = on_sync_update
         self.on_disband = on_disband
-        
+        self.on_connection_status = on_connection_status  # ("connected"|"reconnecting"|"disconnected", detail)
+        self.on_sync_stalled = on_sync_stalled             # fired once if no sync_pong arrives for a while
+
         # Room State (Host maintains this)
         self.room_state = {
             "players": [], # list of dicts: {"client_id": "", "nickname": "", "channels": [], "connected": True, "last_seen": 0, "ready": False}
@@ -91,16 +124,6 @@ class NetworkManager:
 
         self.heartbeat_thread = None
         self.running = False
-
-    def _sync_ntp(self):
-        try:
-            client = ntplib.NTPClient()
-            response = client.request('pool.ntp.org', version=3, timeout=3)
-            self.ntp_offset = response.offset
-            print(f"NTP Sync successful. Offset: {self.ntp_offset:.3f}s")
-        except Exception as e:
-            print(f"NTP Sync failed. Relying on local clock. Error: {e}")
-            self.ntp_offset = 0.0
 
     def get_global_time(self):
         # The shared reference frame IS the host's clock.
@@ -111,7 +134,17 @@ class NetworkManager:
 
     def connect(self):
         self.running = True
-        self.client.connect(BROKER, PORT, 60)
+        try:
+            self.client.connect(BROKER, PORT, 60)
+        except Exception as e:
+            # A blocked/unreachable broker (firewalled port 1883, no network,
+            # DNS failure, ...) used to raise straight out of a GUI button
+            # handler with nothing shown to the user. Surface it instead.
+            _log(f"Could not reach {BROKER}:{PORT}: {e}")
+            self.running = False
+            if self.on_connection_status:
+                self.on_connection_status("disconnected", str(e))
+            raise
         self.client.loop_start()
 
         # Start heartbeat loop
@@ -136,6 +169,20 @@ class NetworkManager:
                     self._send_sync_ping()
                     time.sleep(0.12)
                 time.sleep(2.0)
+
+                # Watchdog: if we've been in the room for a while with zero
+                # sync_pong replies, the "Syncing clock..." lock is otherwise
+                # silent and permanent (no timeout existed before this). Tell
+                # the UI once so it can show *something* actionable instead of
+                # hanging forever with no explanation.
+                if (not self.is_synced and not self._sync_stall_reported
+                        and self._room_joined_at is not None
+                        and time.time() - self._room_joined_at > 8.0):
+                    self._sync_stall_reported = True
+                    _log("No sync_pong received after 8s - host unreachable "
+                         "over the MQTT topic, or the broker connection is stuck.")
+                    if self.on_sync_stalled:
+                        self.on_sync_stalled()
             else:
                 time.sleep(0.5)
 
@@ -160,6 +207,8 @@ class NetworkManager:
         self.sync_rtt = None
         self.is_synced = False
         self._sync_samples = []
+        self._room_joined_at = None
+        self._sync_stall_reported = False
 
     def leave_room(self):
         """A client (or host) leaves the current room. Clients tell the host so
@@ -172,7 +221,7 @@ class NetworkManager:
                 self._publish({"type": "leave", "client_id": self.client_id})
             self.client.unsubscribe(topic)
         except Exception as e:
-            print(f"Error leaving room: {e}")
+            _log(f"Error leaving room: {e}")
         self._reset_room_state()
 
     def disband_room(self):
@@ -184,13 +233,15 @@ class NetworkManager:
             self._publish({"type": "disband"})
             self.client.unsubscribe(f"{BASE_TOPIC}/{self.room_code}")
         except Exception as e:
-            print(f"Error disbanding room: {e}")
+            _log(f"Error disbanding room: {e}")
         self._reset_room_state()
 
     def host_room(self, room_code, nickname):
         self.room_code = room_code.upper()
         self.nickname = nickname
         self.is_host = True
+        self._room_joined_at = time.time()
+        self._sync_stall_reported = False
         self.room_state = {
             "players": [{"client_id": self.client_id, "nickname": self.nickname, "channels": [], "connected": True, "last_seen": time.time(), "ready": True}],
             "filename": None
@@ -202,8 +253,10 @@ class NetworkManager:
         self.room_code = room_code.upper()
         self.nickname = nickname
         self.is_host = False
+        self._room_joined_at = time.time()
+        self._sync_stall_reported = False
         self._subscribe()
-        
+
         # Send join request
         self._publish({
             "type": "join",
@@ -241,7 +294,7 @@ class NetworkManager:
             })
             self._broadcast_state()
         except Exception as e:
-            print(f"Failed to share MIDI: {e}")
+            _log(f"Failed to share MIDI: {e}")
 
     def send_play(self, delay_seconds=4.0):
         if not self.is_host:
@@ -303,7 +356,40 @@ class NetworkManager:
             time.sleep(5)
 
     def _on_connect(self, client, userdata, flags, reason_code, properties):
-        print(f"Connected to MQTT broker with result code {reason_code}")
+        failed = bool(getattr(reason_code, "is_failure", reason_code != 0))
+        if failed:
+            _log(f"MQTT connect rejected by broker: {reason_code}")
+            if self.on_connection_status:
+                self.on_connection_status("disconnected", str(reason_code))
+            return
+
+        _log(f"Connected to MQTT broker (result: {reason_code})")
+        if self.on_connection_status:
+            self.on_connection_status("connected", None)
+
+        # If we were already in a room, this on_connect fires again after an
+        # automatic reconnect (paho retries the transport on its own, but it
+        # does NOT re-subscribe our topic or re-announce us to the host).
+        # Without this, a single dropped wifi packet silently and permanently
+        # kills the subscription: the app still "looks" connected but never
+        # gets another state/sync_pong message again - exactly the "stuck on
+        # Syncing clock forever" failure mode this fixes.
+        if self.room_code:
+            self._subscribe()
+            if self.is_host:
+                self._broadcast_state()
+            else:
+                self._publish({
+                    "type": "join",
+                    "client_id": self.client_id,
+                    "nickname": self.nickname
+                })
+
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
+        _log(f"Disconnected from MQTT broker: {reason_code}")
+        if self.on_connection_status:
+            self.on_connection_status("reconnecting" if self.running else "disconnected",
+                                      str(reason_code))
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -417,4 +503,8 @@ class NetworkManager:
                     self.on_stop_cmd()
 
         except Exception as e:
-            pass # Ignore malformed json
+            # Still non-fatal (a stray malformed/foreign payload on a shared
+            # public topic shouldn't take the app down), but log it now
+            # instead of swallowing it completely - this used to hide real
+            # bugs in the sync/state handling with no trace anywhere.
+            _log(f"Error handling message on {msg.topic if hasattr(msg, 'topic') else '?'}: {e}")

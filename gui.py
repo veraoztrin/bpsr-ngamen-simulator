@@ -1,6 +1,7 @@
 import customtkinter as ctk
 from tkinter import filedialog
 import os
+import random
 import tempfile
 from midi_parser import parse_midi_full, get_channels_info
 from arranger import ConversionSettings, convert, ABS_LOW, ABS_HIGH
@@ -31,7 +32,9 @@ class App(ctk.CTk):
             on_stop_cmd=self.on_network_stop,
             on_midi_received=self.on_network_midi,
             on_sync_update=self.on_network_sync,
-            on_disband=self.on_network_disband
+            on_disband=self.on_network_disband,
+            on_connection_status=self.on_network_connection_status,
+            on_sync_stalled=self.on_network_sync_stalled
         )
         
         self.events = []
@@ -596,8 +599,16 @@ class App(ctk.CTk):
 
     def host_room(self):
         nick = self.nick_entry.get() or "Host"
-        room = self.room_entry.get() or "1234"
-        self.network.connect()
+        # Random per-session code when left blank - a fixed "1234" fallback
+        # meant two unrelated hosts who both leave the field empty would land
+        # on the *exact same* public MQTT topic (broker.hivemq.com is shared
+        # by anyone) and see/hear each other's rooms.
+        room = self.room_entry.get() or f"{random.randint(1000, 9999)}"
+        try:
+            self.network.connect()
+        except Exception as e:
+            self.status_label.configure(text=f"Couldn't connect: {e}", text_color="red")
+            return
         self.network.host_room(room, nick)
         self.status_label.configure(text=f"Hosting Room: {room} | Waiting for players...", text_color="green")
         self.sync_label.configure(text="🕐 Clock: host (reference)", text_color="gray")
@@ -612,7 +623,11 @@ class App(ctk.CTk):
         room = self.room_entry.get()
         if not room:
             return
-        self.network.connect()
+        try:
+            self.network.connect()
+        except Exception as e:
+            self.status_label.configure(text=f"Couldn't connect: {e}", text_color="red")
+            return
         self.network.join_room(room, nick)
         self.status_label.configure(text=f"Joined Room: {room}", text_color="green")
         self.sync_label.configure(text="🕐 Syncing clock…", text_color="orange")
@@ -699,6 +714,40 @@ class App(ctk.CTk):
         if (not self.network.is_host and not self.my_ready_status
                 and self.ready_btn.cget("state") == "disabled"):
             self.ready_btn.configure(state="normal", text="I'm Ready!")
+
+    def on_network_sync_stalled(self):
+        # Fired once from the background sync thread if ~8s pass in a room
+        # with zero replies from the host. Previously "Syncing clock..." had
+        # no timeout at all and would just sit there forever with no
+        # explanation, even though Ready was hard-locked until it resolved.
+        self.after(0, self._show_sync_stalled)
+
+    def _show_sync_stalled(self):
+        if self.network.is_host or not self.network.room_code or self.network.is_synced:
+            return  # already resolved, or state changed since the watchdog fired
+        self.sync_label.configure(
+            text="🕐 Can't reach host clock (check firewall/port 1883)",
+            text_color="red")
+
+    def on_network_connection_status(self, status, detail):
+        self.after(0, self._update_connection_status, status, detail)
+
+    def _update_connection_status(self, status, detail):
+        if status == "connected":
+            # A fresh connect, or a recovered one after a drop. If we were
+            # mid-sync when the link dropped, our samples are gone; let the
+            # label reflect that we're re-measuring rather than silently
+            # keeping a stale "Syncing clock..." with no further updates.
+            if not self.network.is_host and self.network.room_code and not self.network.is_synced:
+                self.sync_label.configure(text="🕐 Syncing clock…", text_color="orange")
+        elif status == "reconnecting":
+            if self.network.room_code:
+                self.status_label.configure(text="Connection lost - reconnecting…", text_color="orange")
+        elif status == "disconnected":
+            if self.network.room_code:
+                self.status_label.configure(
+                    text=f"Disconnected from server ({detail or 'connection lost'}).",
+                    text_color="red")
 
     def on_network_midi(self, filename, data):
         self.after(0, self._save_and_load_midi, filename, data)
