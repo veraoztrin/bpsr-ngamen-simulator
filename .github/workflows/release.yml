@@ -32,6 +32,9 @@ jobs:
           python tests/test_arranger.py
           python tests/test_parser_player.py
           python tests/test_passthrough_perf.py
+          python tests/test_seek.py
+          python tests/test_sync.py
+          python tests/test_drum.py
 
       - name: Build executable
         run: >
