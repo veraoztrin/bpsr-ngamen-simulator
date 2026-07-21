@@ -1,5 +1,6 @@
 import customtkinter as ctk
 from tkinter import filedialog
+import json
 import os
 import random
 import tempfile
@@ -18,6 +19,9 @@ except Exception:
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+# Same folder network_sync.py logs to - one place for this app's local state.
+PREFS_PATH = os.path.join(os.path.expanduser("~"), ".bpsr_midi_player", "prefs.json")
+
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -34,7 +38,8 @@ class App(ctk.CTk):
             on_sync_update=self.on_network_sync,
             on_disband=self.on_network_disband,
             on_connection_status=self.on_network_connection_status,
-            on_sync_stalled=self.on_network_sync_stalled
+            on_sync_stalled=self.on_network_sync_stalled,
+            on_kicked=self.on_network_kicked
         )
         
         self.events = []
@@ -77,6 +82,12 @@ class App(ctk.CTk):
         
         self.load_btn = ctk.CTkButton(self.global_file_frame, text="Load MIDI(s)", command=self.load_files)
         self.load_btn.pack(side="right", padx=10, pady=10)
+
+        self.remove_song_btn = ctk.CTkButton(
+            self.global_file_frame, text="🗑", width=30,
+            fg_color="gray30", hover_color="darkred",
+            command=self.remove_current_song)
+        self.remove_song_btn.pack(side="right", padx=(0, 4), pady=10)
         
         # Timeline / Progress
         self.progress_frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -98,6 +109,10 @@ class App(ctk.CTk):
 
         self.setup_solo_tab()
         self.setup_multi_tab()
+
+        # Restore the conversion panel from the last session (feedback: it
+        # used to silently reset to defaults every launch).
+        self.load_prefs()
 
         # Global hotkeys: work even while the game window has focus.
         # Callbacks fire on the listener thread -> marshal onto the Tk loop.
@@ -225,7 +240,9 @@ class App(ctk.CTk):
             ("disable_sustain", "Disable sustain pedal"),
             ("duet_mode", "Duet mode"),
         ]
-        for row_checks in (checks[:5], checks[5:]):
+        # 3 rows instead of 2 - 5-per-row was clipping the last label or two
+        # against the window edge.
+        for row_checks in (checks[:4], checks[4:7], checks[7:]):
             row = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=(8, 0))
             for key, label in row_checks:
@@ -417,16 +434,45 @@ class App(ctk.CTk):
     def load_files(self):
         file_paths = filedialog.askopenfilenames(filetypes=[("MIDI Files", "*.mid *.midi")])
         if file_paths:
+            last_new_idx = None
             for p in file_paths:
                 name = os.path.basename(p)
                 if name not in [s["name"] for s in self.playlist]:
                     self.playlist.append({"name": name, "path": p})
-            
+                    last_new_idx = len(self.playlist) - 1
+
             self._update_playlist_ui()
-            
-            if self.current_song_idx == -1 and self.playlist:
-                self.current_song_idx = 0
+
+            # Jump to whatever was just loaded instead of leaving it sitting
+            # unselected in the dropdown while a different song stays active
+            # (feedback: loading a MIDI should make it the selected one).
+            if last_new_idx is not None:
+                self.current_song_idx = last_new_idx
                 self._load_current_song()
+
+    def remove_current_song(self):
+        """Drop the currently selected song from the playlist (feedback:
+        no way to clear out songs once loaded)."""
+        if not (0 <= self.current_song_idx < len(self.playlist)):
+            return
+        self.player.stop()
+        del self.playlist[self.current_song_idx]
+
+        if not self.playlist:
+            self.current_song_idx = -1
+            self.raw_events = []
+            self.events = []
+            self.channels = []
+            self.song_info_label.configure(text="")
+        else:
+            self.current_song_idx = min(self.current_song_idx, len(self.playlist) - 1)
+
+        self._update_playlist_ui()
+        if self.playlist:
+            self._load_current_song()
+
+        if self.network.room_code:
+            self._update_lobby_ui(self.network.room_state)
 
     def _update_playlist_ui(self):
         if not self.playlist:
@@ -488,6 +534,73 @@ class App(ctk.CTk):
         val = note_name_to_midi(entry.get())
         return val if val is not None else default
 
+    def save_prefs(self):
+        """Persist the conversion panel so it survives closing the app
+        instead of silently resetting to defaults every launch."""
+        try:
+            prefs = {
+                "checks": {k: v.get() for k, v in self.conv_vars.items()},
+                "bpm": self.bpm_entry.get(),
+                "speed": self.speed_entry.get(),
+                "max_chord_notes": self.max_chord_seg.get(),
+                "range_low": self.range_low_entry.get(),
+                "range_high": self.range_high_entry.get(),
+                "duet_split": self.duet_split_entry.get(),
+                "shift_delay": self.shift_delay_entry.get(),
+                "shift_hold": self.shift_hold_entry.get(),
+                "autosplit": self.autosplit_var.get(),
+                "autosplit_parts": self.autosplit_seg.get(),
+                "instrument": self.instrument_var.get(),
+                "autoplay": self.autoplay_var.get(),
+            }
+            os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
+            with open(PREFS_PATH, "w", encoding="utf-8") as f:
+                json.dump(prefs, f)
+        except Exception:
+            pass  # Persistence is a nicety - never worth crashing the app over.
+
+    def load_prefs(self):
+        """Load the last saved conversion panel, if any. Safe to call with no
+        song loaded yet - it only touches the settings widgets."""
+        try:
+            with open(PREFS_PATH, "r", encoding="utf-8") as f:
+                prefs = json.load(f)
+        except Exception:
+            return
+
+        for key, val in prefs.get("checks", {}).items():
+            if key in self.conv_vars:
+                self.conv_vars[key].set(bool(val))
+
+        def _set_entry(entry, val):
+            if val is None:
+                return
+            entry.delete(0, "end")
+            entry.insert(0, str(val))
+
+        # Instrument first - on_instrument_change overwrites the range fields
+        # with that instrument's default, so it must run before we reapply
+        # any custom range the user had dialed in on top of it.
+        instrument = prefs.get("instrument")
+        if instrument in INSTRUMENTS:
+            self.instrument_var.set(instrument)
+            self.on_instrument_change(instrument)
+
+        _set_entry(self.bpm_entry, prefs.get("bpm"))
+        _set_entry(self.speed_entry, prefs.get("speed"))
+        _set_entry(self.range_low_entry, prefs.get("range_low"))
+        _set_entry(self.range_high_entry, prefs.get("range_high"))
+        _set_entry(self.duet_split_entry, prefs.get("duet_split"))
+        _set_entry(self.shift_delay_entry, prefs.get("shift_delay"))
+        _set_entry(self.shift_hold_entry, prefs.get("shift_hold"))
+
+        if prefs.get("max_chord_notes"):
+            self.max_chord_seg.set(prefs["max_chord_notes"])
+        if prefs.get("autosplit_parts"):
+            self.autosplit_seg.set(prefs["autosplit_parts"])
+        self.autosplit_var.set(bool(prefs.get("autosplit", False)))
+        self.autoplay_var.set(bool(prefs.get("autoplay", False)))
+
     def build_settings(self):
         """Collect the conversion panel state into a ConversionSettings."""
         bpm_text = self.bpm_entry.get().strip()
@@ -522,6 +635,7 @@ class App(ctk.CTk):
             range_low=self._get_note(self.range_low_entry, ABS_LOW),
             range_high=self._get_note(self.range_high_entry, ABS_HIGH),
         )
+        self.save_prefs()
         return s
 
     def reconvert(self):
@@ -657,6 +771,18 @@ class App(ctk.CTk):
         self.player.stop()
         self._reset_multiplayer_ui("Host closed the room.")
 
+    def kick_player(self, client_id):
+        if self.network.is_host:
+            self.network.kick_player(client_id)
+
+    def on_network_kicked(self):
+        # Runs on the network thread -> marshal to UI.
+        self.after(0, self._on_kicked)
+
+    def _on_kicked(self):
+        self.player.stop()
+        self._reset_multiplayer_ui("You were removed from the room by the host.")
+
     def _reset_multiplayer_ui(self, status="Not Connected"):
         self.status_label.configure(text=status, text_color="gray")
         self.sync_label.configure(text="")
@@ -782,7 +908,15 @@ class App(ctk.CTk):
             
             lbl = ctk.CTkLabel(frame, text=name, width=120, anchor="w", font=ctk.CTkFont(weight="bold"))
             lbl.pack(side="left", padx=(5, 10), pady=10)
-            
+
+            if self.network.is_host and not is_me:
+                # Pack this before ch_frame so it reserves its space on the
+                # right first; ch_frame's expand=True then fills what's left.
+                kick_btn = ctk.CTkButton(
+                    frame, text="Kick", width=50, fg_color="darkred", hover_color="red",
+                    command=lambda cid=p['client_id']: self.kick_player(cid))
+                kick_btn.pack(side="right", padx=(5, 10), pady=10)
+
             if self.network.is_host:
                 ch_frame = ctk.CTkScrollableFrame(frame, height=40, fg_color="transparent", orientation="horizontal")
                 ch_frame.pack(side="left", fill="x", expand=True, padx=5)
@@ -846,6 +980,7 @@ class App(ctk.CTk):
         self._parse_and_load(file_path)
 
     def destroy(self):
+        self.save_prefs()  # catch any change that never triggered a reconvert
         if self.hotkeys:
             self.hotkeys.stop()
         self.player.stop()

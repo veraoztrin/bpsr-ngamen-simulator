@@ -79,7 +79,7 @@ def select_offset(samples, k=5):
 class NetworkManager:
     def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None,
                  on_midi_received=None, on_sync_update=None, on_disband=None,
-                 on_connection_status=None, on_sync_stalled=None):
+                 on_connection_status=None, on_sync_stalled=None, on_kicked=None):
         self.client_id = str(uuid.uuid4())
         self.nickname = "Player"
         self.room_code = None
@@ -115,6 +115,7 @@ class NetworkManager:
         self.on_disband = on_disband
         self.on_connection_status = on_connection_status  # ("connected"|"reconnecting"|"disconnected", detail)
         self.on_sync_stalled = on_sync_stalled             # fired once if no sync_pong arrives for a while
+        self.on_kicked = on_kicked                         # fired on the removed client when the host kicks them
 
         # Room State (Host maintains this)
         self.room_state = {
@@ -270,6 +271,21 @@ class NetworkManager:
         for p in self.room_state["players"]:
             if p["client_id"] == target_client_id:
                 p["channels"] = channels
+        self._broadcast_state()
+
+    def kick_player(self, target_client_id):
+        """Host removes a player from the room. Mirrors leave/disband:
+        drop them from the roster here, and tell that specific client
+        (over the shared topic, filtered by client_id) to reset itself."""
+        if not self.is_host or not self.room_code:
+            return
+        if target_client_id == self.client_id:
+            return  # can't kick yourself
+        self.room_state["players"] = [
+            p for p in self.room_state["players"]
+            if p["client_id"] != target_client_id
+        ]
+        self._publish({"type": "kick", "client_id": target_client_id})
         self._broadcast_state()
 
     def send_ready_status(self, is_ready):
@@ -429,6 +445,15 @@ class NetworkManager:
                     self._reset_room_state()
                     if self.on_disband:
                         self.on_disband()
+                return
+
+            # Host kicked a specific player -> only that client resets.
+            if msg_type == "kick":
+                if (self.room_code and not self.is_host
+                        and payload.get("client_id") == self.client_id):
+                    self._reset_room_state()
+                    if self.on_kicked:
+                        self.on_kicked()
                 return
 
             if self.is_host:
