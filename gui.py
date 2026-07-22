@@ -342,8 +342,8 @@ class App(ctk.CTk):
         if rng:
             if is_drum:
                 self.instrument_hint.configure(
-                    text="builds an adaptive kit groove (busy song = busier beat); "
-                         "a real drum track is kept as-is")
+                    text="writes a full-kit groove that follows the song's "
+                         "sections; a real drum track is kept as-is")
             else:
                 lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
                 self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
