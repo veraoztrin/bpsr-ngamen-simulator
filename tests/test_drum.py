@@ -57,14 +57,15 @@ def test_melodic_onbeat_alternates_kick_snare():
 
 
 def test_offbeat_note_becomes_hat():
-    from arranger import ConversionSettings, convert_drum, DRUM_HAT
+    from arranger import ConversionSettings, convert_drum, DRUM_HH_CLOSED
     # 120 BPM: an 8th-note offbeat (t=0.25) sits well outside the on-grid
     # tolerance around the surrounding quarter notes.
     events = _note(0.25, 0.05, 64)
     out = convert_drum(events, ConversionSettings(), orig_bpm=120)
     hits = _hits(out)
     check("syncopated note produces exactly 1 hit", len(hits) == 1, f"got {hits}")
-    check("off-grid onset maps to the hat voice", hits[0][1] == DRUM_HAT, f"got {hits}")
+    check("off-grid onset maps to the closed hi-hat voice",
+          hits[0][1] == DRUM_HH_CLOSED, f"got {hits}")
 
 
 def test_chord_collapses_to_one_hit():
@@ -81,7 +82,7 @@ def test_chord_collapses_to_one_hit():
 
 
 def test_gm_drum_track_maps_by_bucket():
-    from arranger import ConversionSettings, convert_drum, DRUM_KICK, DRUM_SNARE, DRUM_HAT
+    from arranger import ConversionSettings, convert_drum, DRUM_KICK, DRUM_SNARE, DRUM_HH_CLOSED
     # A real GM percussion track (channel 9): kick(36), snare(38), closed
     # hihat(42), spread out in time so none collide with the chord window.
     events = (_note(0.00, 0.03, 36, channel=9)
@@ -93,7 +94,40 @@ def test_gm_drum_track_maps_by_bucket():
     check("3 distinct GM drum hits produce 3 hits", len(hits) == 3, f"got {hits}")
     check("GM kick(36) -> DRUM_KICK", hits[0][1] == DRUM_KICK, f"got {hits}")
     check("GM snare(38) -> DRUM_SNARE", hits[1][1] == DRUM_SNARE, f"got {hits}")
-    check("GM hihat(42) -> DRUM_HAT", hits[2][1] == DRUM_HAT, f"got {hits}")
+    check("GM closed hihat(42) -> DRUM_HH_CLOSED", hits[2][1] == DRUM_HH_CLOSED, f"got {hits}")
+
+
+def test_gm_full_kit_maps_to_distinct_voices():
+    from arranger import (ConversionSettings, convert_drum, DRUM_KICK, DRUM_SNARE,
+                          DRUM_FLOOR_TOM, DRUM_TOM_1, DRUM_TOM_2, DRUM_CRASH_1,
+                          DRUM_CRASH_2, DRUM_HH_CLOSED, DRUM_HH_OPEN)
+    # One hit per major GM voice, spaced 0.4s apart so none collide, in time
+    # order. Verifies the expanded GM table routes toms, crashes and the open
+    # hi-hat to their own in-game voices instead of collapsing to one bucket.
+    #   36 kick, 38 snare, 42 closed hh, 46 open hh, 41 low floor tom,
+    #   45 low tom, 48 hi-mid tom, 49 crash 1, 57 crash 2
+    plan = [36, 38, 42, 46, 41, 45, 48, 49, 57]
+    expected = [DRUM_KICK, DRUM_SNARE, DRUM_HH_CLOSED, DRUM_HH_OPEN,
+                DRUM_FLOOR_TOM, DRUM_TOM_2, DRUM_TOM_1, DRUM_CRASH_1, DRUM_CRASH_2]
+    events = []
+    for i, gm_note in enumerate(plan):
+        events += _note(i * 0.4, 0.03, gm_note, channel=9)
+    events.sort(key=lambda e: e['time'])
+    out = convert_drum(events, ConversionSettings(), orig_bpm=120)
+    voices = [n for _, n in _hits(out)]
+    check("each GM voice maps to its own in-game voice", voices == expected,
+          f"got {voices}, expected {expected}")
+    check("all 9 distinct GM voices survive as 9 hits", len(voices) == 9, f"got {voices}")
+
+
+def test_gm_ride_folds_to_closed_hat():
+    from arranger import ConversionSettings, convert_drum, DRUM_HH_CLOSED
+    # The game has no ride cymbal; GM ride (51) folds onto the closed hi-hat.
+    events = _note(0.0, 0.03, 51, channel=9)
+    out = convert_drum(events, ConversionSettings(), orig_bpm=120)
+    hits = _hits(out)
+    check("GM ride(51) folds to closed hi-hat",
+          hits == [(0.0, DRUM_HH_CLOSED)], f"got {hits}")
 
 
 def test_gm_track_ignores_other_channels():
@@ -179,6 +213,8 @@ if __name__ == "__main__":
     test_offbeat_note_becomes_hat()
     test_chord_collapses_to_one_hit()
     test_gm_drum_track_maps_by_bucket()
+    test_gm_full_kit_maps_to_distinct_voices()
+    test_gm_ride_folds_to_closed_hat()
     test_gm_track_ignores_other_channels()
     test_retrigger_floor_drops_rapid_same_voice_hits()
     test_speed_scales_the_beat_grid()

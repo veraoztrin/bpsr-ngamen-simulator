@@ -342,7 +342,8 @@ class App(ctk.CTk):
         if rng:
             if is_drum:
                 self.instrument_hint.configure(
-                    text="auto-generates a beat (game only plays D4/F4/A4 on Drum)")
+                    text="maps drums onto the game's 9 drum voices (kick, snare, "
+                         "hats, toms, crashes)")
             else:
                 lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
                 self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)

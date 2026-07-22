@@ -14,6 +14,14 @@
 from dataclasses import dataclass
 from itertools import groupby
 
+# The nine fixed in-game drum voices are defined once in config (the actual
+# keys the game's Drum instrument sounds); import them here so convert_drum
+# and its GM-percussion table reference a single source of truth.
+from config import (
+    DRUM_HH_CLOSED, DRUM_KICK, DRUM_FLOOR_TOM, DRUM_SNARE,
+    DRUM_TOM_1, DRUM_TOM_2, DRUM_CRASH_1, DRUM_HH_OPEN, DRUM_CRASH_2,
+)
+
 # Playable zones for the BPSR 3-octave keyboard + octave modifiers.
 # zone 0  : no modifier    -> MIDI 48..83  (C3..B5)
 # zone +1 : L Shift held   -> MIDI 60..95  (C4..B7 sounding)
@@ -474,39 +482,66 @@ def split_duet(notes, sustains, split_note):
 # ---------------------------------------------------------------------------
 # Drum conversion mode
 # ---------------------------------------------------------------------------
-# The in-game "Drum" instrument only responds on 3 of its on-screen keys -
-# D4/F4/A4 (see config.DRUM_NOTES) - everything else is silent. A straight
-# pitch-based 1:1 conversion would therefore drop almost the whole song, so
-# Drum gets its own conversion path: instead of remapping pitches, it builds
-# a brand new rhythm track from the MIDI's note-onset timing.
+# The in-game "Drum" instrument responds on 9 fixed on-screen keys, each a
+# distinct percussion voice (D4..A5 - see config.DRUM_NOTES); every other key
+# is silent. A straight pitch-based 1:1 conversion would drop almost the whole
+# song, so Drum gets its own conversion path: instead of remapping pitches, it
+# maps onto those 9 voices.
 #
 #   - If the MIDI already has a real percussion track (General MIDI channel
-#     9, i.e. "channel 10" in most DAWs), its kick/snare/hihat notes are
-#     bucketed onto the 3 playable keys, preserving the original drum part.
+#     9, i.e. "channel 10" in most DAWs), each note is routed through the
+#     GM-percussion table below onto its closest in-game voice - so kicks,
+#     snares, hi-hats, toms and crashes all keep their identity.
 #   - Otherwise (a normal melodic MIDI) a beat is invented from the note
 #     onsets: chords/near-simultaneous onsets collapse into a single hit,
 #     onsets that land on a quarter-note line alternate kick/snare for a
 #     steady backbone (kick on beats 1 & 3, snare on 2 & 4), and anything
-#     syncopated/off-grid becomes the hat - the catch-all filler voice.
+#     syncopated/off-grid becomes the closed hi-hat - the filler voice.
 
-DRUM_KICK, DRUM_SNARE, DRUM_HAT = 62, 65, 69  # D4 / F4 / A4
 DRUM_HIT_LEN = 0.09      # seconds a drum tap is held - drums aren't sustained
 DRUM_MIN_GAP = 0.06      # per-voice retrigger floor, so a blast-beat passage
                          # doesn't turn into an unplayable flood of re-presses
 
-# GM percussion note numbers, bucketed down to the 3 sounds the game has.
-_GM_KICK = {35, 36}
-_GM_SNARE = {37, 38, 40}
-# everything else on the GM drum channel (hihats, toms, cymbals, other
-# percussion) falls into the "hat" bucket - the catch-all top voice.
+# General MIDI percussion (channel 10) note number -> closest in-game drum
+# voice. The common backbone (kick / snare / hi-hats / toms / crashes) maps
+# faithfully; rarer hand & auxiliary percussion is folded onto the nearest
+# voice (drum-like -> toms, short metallic/shaker ticks -> closed hi-hat,
+# sustained metallic -> open hi-hat). The game has no ride cymbal, so rides
+# fold onto the closed hi-hat (their usual steady-timekeeping role). Anything
+# not listed defaults to the closed hi-hat (see _gm_drum_bucket).
+_GM_TO_VOICE = {
+    # kick
+    35: DRUM_KICK, 36: DRUM_KICK,
+    # snare / rimshot / clap
+    37: DRUM_SNARE, 38: DRUM_SNARE, 39: DRUM_SNARE, 40: DRUM_SNARE,
+    # toms: high -> tom 1, mid -> tom 2, floor -> floor tom
+    50: DRUM_TOM_1, 48: DRUM_TOM_1,
+    47: DRUM_TOM_2, 45: DRUM_TOM_2,
+    43: DRUM_FLOOR_TOM, 41: DRUM_FLOOR_TOM,
+    # hi-hats
+    42: DRUM_HH_CLOSED, 44: DRUM_HH_CLOSED, 46: DRUM_HH_OPEN,
+    # cymbals
+    49: DRUM_CRASH_1, 55: DRUM_CRASH_1, 57: DRUM_CRASH_2, 52: DRUM_CRASH_2,
+    58: DRUM_CRASH_1,                       # vibraslap -> trashy crash
+    51: DRUM_HH_CLOSED, 59: DRUM_HH_CLOSED, 53: DRUM_HH_CLOSED,  # rides
+    # hand drums -> toms
+    60: DRUM_TOM_1, 62: DRUM_TOM_1, 63: DRUM_TOM_1, 65: DRUM_TOM_1,
+    76: DRUM_TOM_1, 78: DRUM_TOM_1,
+    61: DRUM_TOM_2, 66: DRUM_TOM_2, 77: DRUM_TOM_2, 79: DRUM_TOM_2,
+    64: DRUM_FLOOR_TOM,                     # low conga
+    # shakers / metallic ticks -> closed hi-hat
+    54: DRUM_HH_CLOSED, 56: DRUM_HH_CLOSED, 67: DRUM_HH_CLOSED,
+    68: DRUM_HH_CLOSED, 69: DRUM_HH_CLOSED, 70: DRUM_HH_CLOSED,
+    71: DRUM_HH_CLOSED, 73: DRUM_HH_CLOSED, 75: DRUM_HH_CLOSED,
+    80: DRUM_HH_CLOSED,
+    # sustained metallic -> open hi-hat
+    72: DRUM_HH_OPEN, 74: DRUM_HH_OPEN, 81: DRUM_HH_OPEN,
+}
 
 
 def _gm_drum_bucket(note):
-    if note in _GM_KICK:
-        return DRUM_KICK
-    if note in _GM_SNARE:
-        return DRUM_SNARE
-    return DRUM_HAT
+    """Closest in-game drum voice for a GM percussion note (channel 10)."""
+    return _GM_TO_VOICE.get(note, DRUM_HH_CLOSED)
 
 
 def convert_drum(events, settings, orig_bpm=120.0):
@@ -552,7 +587,7 @@ def convert_drum(events, settings, orig_bpm=120.0):
             if on_grid:
                 voice = DRUM_KICK if nearest_beat % 2 == 0 else DRUM_SNARE
             else:
-                voice = DRUM_HAT
+                voice = DRUM_HH_CLOSED
             hits.append((t, voice))
 
     # Per-voice retrigger floor: drop hits arriving too soon after the last

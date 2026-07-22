@@ -82,22 +82,35 @@ INSTRUMENTS = {
     "Guitar": {"low": 40, "high": 71, "offset": 0},
     "Bass":   {"low": 28, "high": 47, "offset": 36},
     # Drum isn't a continuous playable range like the others - see DRUM_NOTES
-    # below and arranger.convert_drum(). low/high/offset are kept here only
-    # so code that generically reads INSTRUMENTS[...] doesn't need a special
-    # case just to populate the dropdown / range hint.
-    "Drum": {"low": 62, "high": 69, "offset": 0, "is_drum": True},
+    # below and arranger.convert_drum(). low/high span the fixed drum keys
+    # (D4..A5) and offset is 0; they're kept here only so code that generically
+    # reads INSTRUMENTS[...] doesn't need a special case just to populate the
+    # dropdown / range hint.
+    "Drum": {"low": 62, "high": 81, "offset": 0, "is_drum": True},
 }
 
-# The in-game "Drum" instrument only produces sound on 3 of its on-screen
-# keys - every other key (all black keys, the other 4 white keys in its home
-# octave, and its entire upper octave) is silent. Confirmed by frame-by-frame
-# analysis of the in-game key-press flash colors on a demo video. Because of
-# this, drum conversion doesn't do a 1:1 pitch mapping like the other
-# instruments - see arranger.convert_drum().
-DRUM_KICK = 62   # D4
-DRUM_SNARE = 65  # F4
-DRUM_HAT = 69    # A4
-DRUM_NOTES = (DRUM_KICK, DRUM_SNARE, DRUM_HAT)
+# The in-game "Drum" instrument produces sound on exactly 9 of its on-screen
+# keys, each a fixed percussion voice (every other key - all black keys,
+# C4/E4/G4/B4 in its home octave, and B5 - is silent). It is NOT a pitched,
+# continuous range like the other instruments, so drum conversion maps General
+# MIDI percussion onto these 9 voices instead of doing a 1:1 pitch mapping -
+# see arranger.convert_drum(). The layout, confirmed from an in-game drum demo:
+#
+#     D4 closed hi-hat    C5 snare       F5 crash 1
+#     F4 kick             D5 tom 1       G5 open hi-hat
+#     A4 floor tom        E5 tom 2       A5 crash 2
+#
+DRUM_HH_CLOSED = 62  # D4  - closed hi-hat
+DRUM_KICK      = 65  # F4  - kick
+DRUM_FLOOR_TOM = 69  # A4  - floor tom
+DRUM_SNARE     = 72  # C5  - snare
+DRUM_TOM_1     = 74  # D5  - tom 1
+DRUM_TOM_2     = 76  # E5  - tom 2
+DRUM_CRASH_1   = 77  # F5  - crash 1
+DRUM_HH_OPEN   = 79  # G5  - open hi-hat
+DRUM_CRASH_2   = 81  # A5  - crash 2
+DRUM_NOTES = (DRUM_HH_CLOSED, DRUM_KICK, DRUM_FLOOR_TOM, DRUM_SNARE,
+              DRUM_TOM_1, DRUM_TOM_2, DRUM_CRASH_1, DRUM_HH_OPEN, DRUM_CRASH_2)
 
 def midi_to_note_name(midi_note):
     octave = (midi_note // 12) - 1
