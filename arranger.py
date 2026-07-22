@@ -11,12 +11,13 @@
 # which is much easier to reason about than raw events, then get re-emitted
 # as an event list at the end.
 
+import math
 from dataclasses import dataclass
 from itertools import groupby
 
 # The nine fixed in-game drum voices are defined once in config (the actual
-# keys the game's Drum instrument sounds); import them here so convert_drum
-# and its GM-percussion table reference a single source of truth.
+# keys the game's Drum instrument sounds); import them here so the drum
+# conversion and its GM-percussion table reference a single source of truth.
 from config import (
     DRUM_HH_CLOSED, DRUM_KICK, DRUM_FLOOR_TOM, DRUM_SNARE,
     DRUM_TOM_1, DRUM_TOM_2, DRUM_CRASH_1, DRUM_HH_OPEN, DRUM_CRASH_2,
@@ -485,22 +486,28 @@ def split_duet(notes, sustains, split_note):
 # The in-game "Drum" instrument responds on 9 fixed on-screen keys, each a
 # distinct percussion voice (D4..A5 - see config.DRUM_NOTES); every other key
 # is silent. A straight pitch-based 1:1 conversion would drop almost the whole
-# song, so Drum gets its own conversion path: instead of remapping pitches, it
-# maps onto those 9 voices.
+# song, so Drum gets its own conversion path with two modes:
 #
 #   - If the MIDI already has a real percussion track (General MIDI channel
 #     9, i.e. "channel 10" in most DAWs), each note is routed through the
-#     GM-percussion table below onto its closest in-game voice - so kicks,
-#     snares, hi-hats, toms and crashes all keep their identity.
-#   - Otherwise (a normal melodic MIDI) a beat is invented from the note
-#     onsets: chords/near-simultaneous onsets collapse into a single hit,
-#     onsets that land on a quarter-note line alternate kick/snare for a
-#     steady backbone (kick on beats 1 & 3, snare on 2 & 4), and anything
-#     syncopated/off-grid becomes the closed hi-hat - the filler voice.
+#     GM-percussion table below onto its closest in-game voice - kicks,
+#     snares, hi-hats, toms and crashes all keep their identity, so the
+#     original drum part is preserved as-is.
+#   - Otherwise (a normal melodic MIDI) there is no drum part to preserve, so
+#     _generate_groove() writes one: a real drum-kit groove locked to the
+#     tempo grid (kick/snare/hi-hat backbone, tom fills at phrase ends,
+#     crashes on section starts) whose intensity per bar tracks how busy the
+#     melody is - sparse bars get a minimal supporting beat, busy bars get
+#     16th hats, ghost snares, syncopated kicks and denser fills.
 
 DRUM_HIT_LEN = 0.09      # seconds a drum tap is held - drums aren't sustained
 DRUM_MIN_GAP = 0.06      # per-voice retrigger floor, so a blast-beat passage
                          # doesn't turn into an unplayable flood of re-presses
+
+# Velocity presets. The game plays plain keystrokes, so velocity isn't audible
+# in-game, but sensible values keep the output musically meaningful (and feed
+# the GM path's loudest-in-chord pick and any future velocity-aware playback).
+_V_ACCENT, _V_NORMAL, _V_SOFT, _V_GHOST = 118, 100, 82, 55
 
 # General MIDI percussion (channel 10) note number -> closest in-game drum
 # voice. The common backbone (kick / snare / hi-hats / toms / crashes) maps
@@ -544,8 +551,154 @@ def _gm_drum_bucket(note):
     return _GM_TO_VOICE.get(note, DRUM_HH_CLOSED)
 
 
-def convert_drum(events, settings, orig_bpm=120.0):
-    """Drum-mode conversion: generate a beat instead of a 1:1 melody."""
+def _chord_onsets(notes):
+    """Collapse near-simultaneous note starts into single onsets.
+
+    Returns a sorted list of (time, lowest_pitch) - one entry per musical
+    onset, with the lowest pitch in the group (used to nudge kick accents
+    toward bass-register hits).
+    """
+    starts = sorted(notes, key=lambda n: n['start'])
+    onsets = []
+    for n in starts:
+        if onsets and n['start'] - onsets[-1][0] < 0.03:
+            t, low = onsets[-1]
+            onsets[-1] = (t, min(low, n['note']))
+        else:
+            onsets.append((n['start'], n['note']))
+    return onsets
+
+
+def _generate_groove(notes, beat_len, beats_per_measure):
+    """Write an adaptive drum-kit groove for a melodic (non-GM-drum) MIDI.
+
+    Returns a list of (time, voice, velocity). The groove is locked to the
+    tempo grid rather than slaved to the melody's onsets, but its intensity
+    per bar follows how many notes the melody plays in that bar, so busy
+    passages get an energetic beat and sparse passages a minimal one.
+    """
+    if beat_len <= 0:
+        return []
+    onsets = _chord_onsets(notes)
+    if not onsets:
+        return []
+
+    nbeats = max(1, int(beats_per_measure))
+    bar_len = beat_len * nbeats
+    t0 = onsets[0][0]
+    t_end = max(n['end'] for n in notes)
+    n_bars = max(1, int(math.ceil((t_end - t0) / bar_len - 1e-9)))
+
+    # Melody onset count per bar.
+    counts = [0] * n_bars
+    for t, _low in onsets:
+        bi = int((t - t0) / bar_len)
+        if 0 <= bi < n_bars:
+            counts[bi] += 1
+
+    def energy(bi):
+        """Per-bar intensity: -1 rest, 0 sparse, 1 medium, 2 busy.
+
+        A bar with no melody notes is always a rest (drums honour the
+        silence). For bars that do have notes, the density is smoothed over
+        the bar and its neighbours so the intensity level doesn't flicker on
+        a single busier/quieter bar inside a section.
+        """
+        if counts[bi] == 0:
+            return -1
+        window = [counts[j] for j in (bi - 1, bi, bi + 1) if 0 <= j < n_bars]
+        avg = sum(window) / len(window)
+        per_beat = avg / nbeats
+        if per_beat < 0.85:      # up to ~quarter-note density: minimal support
+            return 0
+        if per_beat < 2.2:       # around 8th-note density: standard backbeat
+            return 1
+        return 2                 # busier than 8ths: energetic (16ths + accents)
+
+    levels = [energy(bi) for bi in range(n_bars)]
+    half = beat_len / 2.0
+    s16 = beat_len / 4.0
+    hits = []  # (time, voice, velocity)
+
+    for bi in range(n_bars):
+        lvl = levels[bi]
+        if lvl < 0:
+            continue
+        base = t0 + bi * bar_len
+        beats = [base + b * beat_len for b in range(nbeats)]
+        prev = levels[bi - 1] if bi > 0 else -1
+        section_start = (bi == 0) or (prev < 0)
+
+        # A tom fill closes every 4-bar phrase, scaled by intensity.
+        # fill_beats = how many trailing beats it occupies; 0 = no fill.
+        phrase_end = ((bi + 1) % 4 == 0) and (bi + 1 < n_bars) and (levels[bi + 1] >= 0)
+        fill_beats = (2 if (lvl >= 2 and nbeats >= 4) else 1) if (phrase_end and lvl >= 1) else 0
+        groove_beats = nbeats - fill_beats
+
+        # Crash to announce a new section (first bar, or first bar after a rest).
+        if section_start:
+            hits.append((beats[0], DRUM_CRASH_1, _V_ACCENT))
+
+        # --- steady groove on the beats the fill doesn't cover ---
+        for b in range(groove_beats):
+            bt = beats[b]
+            down = (b == 0)
+
+            # Kick: beat 1 always; beat 3 as well once we're at medium+.
+            if b == 0 or (lvl >= 1 and b == 2):
+                hits.append((bt, DRUM_KICK, _V_ACCENT if down else _V_NORMAL))
+            # Snare backbeat on 2 & 4 at medium+; a lone soft snare on beat 3
+            # gives sparse bars a gentle half-time feel.
+            if lvl >= 1 and b % 2 == 1:
+                hits.append((bt, DRUM_SNARE, _V_NORMAL))
+            elif lvl == 0 and b == 2:
+                hits.append((bt, DRUM_SNARE, _V_SOFT))
+
+            # Hi-hats: quarters when sparse, 8ths at medium, 16ths when busy
+            # (falling back to 8ths if 16ths would be too fast to retrigger).
+            if lvl == 0:
+                hits.append((bt, DRUM_HH_CLOSED, _V_SOFT))
+            elif lvl == 1:
+                hits.append((bt, DRUM_HH_CLOSED, _V_NORMAL if down else _V_SOFT))
+                hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
+            elif s16 >= DRUM_MIN_GAP:
+                for k in range(4):
+                    hits.append((bt + k * s16, DRUM_HH_CLOSED,
+                                 _V_NORMAL if k == 0 else _V_GHOST))
+            else:
+                hits.append((bt, DRUM_HH_CLOSED, _V_NORMAL if down else _V_SOFT))
+                hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
+
+            # Busy bars get a syncopated kick pushing off the "and" of beat 3.
+            if lvl >= 2 and b == 2:
+                hits.append((bt + half, DRUM_KICK, _V_SOFT))
+
+        # --- the fill itself: a descending tom roll over the last beat(s) ---
+        if fill_beats:
+            roll = [DRUM_SNARE, DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM]
+            steps = fill_beats * 4  # 16th-note roll
+            for s in range(steps):
+                t = beats[groove_beats] + s * s16
+                voice = roll[min(int(s / steps * len(roll)), len(roll) - 1)]
+                hits.append((t, voice, _V_NORMAL if s % 2 == 0 else _V_SOFT))
+            # Land the phrase on a crash at the next downbeat (crash 2, to
+            # contrast with the crash 1 used on section openings).
+            nxt = bi + 1
+            if nxt < n_bars and levels[nxt] >= 0:
+                hits.append((t0 + nxt * bar_len, DRUM_CRASH_2, _V_ACCENT))
+        elif lvl >= 1:
+            # No fill: an open hi-hat on the final "and" leads into the next bar.
+            hits.append((beats[-1] + half, DRUM_HH_OPEN, _V_NORMAL))
+
+    return hits
+
+
+def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4):
+    """Drum-mode conversion.
+
+    Preserves a real GM percussion track note-for-note (mapped onto the 9
+    in-game voices), or writes an adaptive groove when the source is melodic.
+    """
     notes, _sustains = events_to_notes(events)
     if not notes:
         return []
@@ -566,7 +719,7 @@ def convert_drum(events, settings, orig_bpm=120.0):
 
     has_gm_drum_track = any(n['channel'] == 9 for n in notes)
 
-    hits = []  # (time, voice)
+    hits = []  # (time, voice, velocity)
     if has_gm_drum_track:
         drum_notes = [n for n in notes if n['channel'] == 9]
         for g in group_chords(drum_notes, settings.chord_window, settings.consistent_windows):
@@ -576,34 +729,39 @@ def convert_drum(events, settings, orig_bpm=120.0):
                 if voice not in best or n['velocity'] > best[voice]['velocity']:
                     best[voice] = n
             t = min(n['start'] for n in g)
-            for voice in best:
-                hits.append((t, voice))
+            for voice, n in best.items():
+                hits.append((t, voice, n['velocity']))
     else:
-        tol = min(0.06, beat_len * 0.12) if beat_len > 0 else 0.03
-        for g in group_chords(notes, settings.chord_window, settings.consistent_windows):
-            t = min(n['start'] for n in g)
-            nearest_beat = round(t / beat_len) if beat_len > 0 else 0
-            on_grid = beat_len > 0 and abs(t - nearest_beat * beat_len) <= tol
-            if on_grid:
-                voice = DRUM_KICK if nearest_beat % 2 == 0 else DRUM_SNARE
-            else:
-                voice = DRUM_HH_CLOSED
-            hits.append((t, voice))
+        hits = _generate_groove(notes, beat_len, beats_per_measure)
 
     # Per-voice retrigger floor: drop hits arriving too soon after the last
     # hit on the same voice (keeps fast passages from becoming a key-mash).
     hits.sort(key=lambda h: h[0])
     last_by_voice = {}
     kept = []
-    for t, voice in hits:
+    for t, voice, vel in hits:
         prev = last_by_voice.get(voice)
         if prev is not None and t - prev < DRUM_MIN_GAP:
             continue
-        kept.append((t, voice))
+        kept.append([t, voice, vel])
         last_by_voice[voice] = t
 
-    out_notes = [{'start': t, 'end': t + DRUM_HIT_LEN, 'note': voice,
-                  'velocity': 100, 'channel': 0} for t, voice in kept]
+    # Trim each tap so it never overlaps the next hit on the SAME voice (that
+    # key is about to be re-pressed), while staying a short tap otherwise.
+    next_same = {}
+    for item in reversed(kept):
+        t, voice, _vel = item
+        nxt = next_same.get(voice)
+        end = t + DRUM_HIT_LEN
+        if nxt is not None:
+            end = min(end, nxt - 0.005)
+        if end <= t:
+            end = t + 0.01
+        item.append(end)
+        next_same[voice] = t
+
+    out_notes = [{'start': t, 'end': end, 'note': voice,
+                  'velocity': vel, 'channel': 0} for t, voice, vel, end in kept]
     return notes_to_events(out_notes, [], [])
 
 

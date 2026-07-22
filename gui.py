@@ -342,8 +342,8 @@ class App(ctk.CTk):
         if rng:
             if is_drum:
                 self.instrument_hint.configure(
-                    text="maps drums onto the game's 9 drum voices (kick, snare, "
-                         "hats, toms, crashes)")
+                    text="builds an adaptive kit groove (busy song = busier beat); "
+                         "a real drum track is kept as-is")
             else:
                 lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
                 self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
@@ -700,7 +700,8 @@ class App(ctk.CTk):
         settings = self.build_settings()
         is_drum = self._inst().get("is_drum", False)
         if is_drum:
-            self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm)
+            self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm,
+                                       beats_per_measure=self.beats_per_measure)
         else:
             self.events = convert(self.raw_events, settings, orig_bpm=self.orig_bpm)
         self.channels = get_channels_info(self.events)
