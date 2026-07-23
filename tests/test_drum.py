@@ -1,7 +1,7 @@
 # Tests for arranger.convert_drum() - the "Drum" instrument conversion mode.
 # Two paths are covered:
 #   * a real GM percussion track (channel 9) mapped onto the 9 in-game voices
-#   * a melodic MIDI turned into a section-aware kit groove (_generate_groove)
+#   * a melodic MIDI turned into a section-aware, melody-following kit groove
 # See config.DRUM_NOTES / convert_drum's docstring for why this isn't a 1:1
 # pitch mapping. Run from the repo root:  python tests\test_drum.py
 
@@ -144,7 +144,7 @@ def test_gm_retrigger_floor_drops_rapid_same_voice_hits():
 
 
 # ---------------------------------------------------------------------------
-# Section-aware groove path (a melodic MIDI, no drum channel)
+# Section-aware, melody-following groove path (a melodic MIDI, no drum channel)
 # ---------------------------------------------------------------------------
 
 def test_melodic_midi_generates_backbone_groove():
@@ -186,11 +186,10 @@ def test_sparse_song_stays_minimal():
 
 def test_closed_hats_are_not_sixteenth_spammed():
     from arranger import ConversionSettings, convert_drum, DRUM_HH_CLOSED
-    # The anti-spam fix: in a busy section closed hi-hats should sit on the
-    # 8th-note grid, not a wall of 16ths. At 180 BPM an 8th is 0.167s and a
-    # 16th is 0.083s; the TYPICAL gap between consecutive closed hats must be
-    # around an 8th (short 16th flutters as lead-ins are still allowed, so we
-    # check the median, not the minimum).
+    # In a busy section closed hi-hats should sit on the 8th-note grid, not a
+    # wall of 16ths. At 180 BPM an 8th is 0.167s and a 16th is 0.083s; the
+    # TYPICAL (median) gap between consecutive closed hats must be around an
+    # 8th - short 16th flutters as lead-ins are still allowed.
     out = convert_drum(_melody(8, 16, base=79), ConversionSettings(), orig_bpm=180, beats_per_measure=4)
     times = sorted(t for t, n in _hits(out) if n == DRUM_HH_CLOSED)
     gaps = sorted(b - a for a, b in zip(times, times[1:]))
@@ -199,14 +198,37 @@ def test_closed_hats_are_not_sixteenth_spammed():
           f"median closed-hat gap {median_gap:.3f}s (8th=0.167, 16th=0.083)")
 
 
+def test_kick_follows_the_bassline():
+    from arranger import ConversionSettings, convert_drum, DRUM_KICK
+    # Two 8-bar songs at the same density but different bass rhythms must yield
+    # different kick patterns - the kick follows the melody, it isn't a fixed
+    # template. Song A: bass on beats. Song B: bass pushed onto the off-beats.
+    beat, beats = 0.5, 4
+    bar = beat * beats
+    def build(offsets):
+        evs = []
+        for b in range(8):
+            for off in offsets:
+                evs += _note(b * bar + off, 0.1, 43)  # low note = bass
+                evs += _note(b * bar + off, 0.1, 72)  # a high note too (density)
+        evs.sort(key=lambda e: e['time'])
+        return evs
+    a = convert_drum(build([0.0, 1.0, 2.0, 3.0]), ConversionSettings(), orig_bpm=120, beats_per_measure=4)
+    b = convert_drum(build([0.25, 1.25, 2.25, 3.25]), ConversionSettings(), orig_bpm=120, beats_per_measure=4)
+    ka = sorted(round(t, 3) for t, n in _hits(a) if n == DRUM_KICK)
+    kb = sorted(round(t, 3) for t, n in _hits(b) if n == DRUM_KICK)
+    check("different basslines produce different kick patterns", ka != kb,
+          f"identical kick times ({len(ka)})")
+
+
 def test_rest_bars_produce_no_drums():
     from arranger import ConversionSettings, convert_drum
-    bar = 0.5 * 4  # 2.0s at 120 BPM 4/4
+    bar = 0.5 * 4
     events = []
     for i in range(8):
-        events += _note(i * (bar / 8), 0.1, 60)            # bar 0 busy
+        events += _note(i * (bar / 8), 0.1, 60)
     for i in range(8):
-        events += _note(4 * bar + i * (bar / 8), 0.1, 60)  # bar 4 busy
+        events += _note(4 * bar + i * (bar / 8), 0.1, 60)
     events.sort(key=lambda e: e['time'])
     out = convert_drum(events, ConversionSettings(), orig_bpm=120, beats_per_measure=4)
     ons = [e['time'] for e in out if e['type'] == 'note_on']
@@ -228,13 +250,10 @@ def test_groove_scales_with_speed():
 
 def test_varied_song_uses_all_nine_voices():
     from arranger import ConversionSettings, convert_drum, DRUM_NOTES
-    # Distinct sections: sparse+low, medium+mid, busy+high (a drop), busy+mid.
-    # Across ballad/backbeat/four/drive styles + fills + crashes the groove
-    # should touch every one of the 9 in-game voices.
-    events = (_melody(4, 1, base=46, start_bar=0)      # sparse, low register
-              + _melody(4, 4, base=60, start_bar=4)    # medium, mid
-              + _melody(4, 18, base=79, start_bar=8)   # busy, high  -> a "drop"
-              + _melody(4, 18, base=60, start_bar=12))  # busy, mid
+    events = (_melody(4, 1, base=46, start_bar=0)
+              + _melody(4, 4, base=60, start_bar=4)
+              + _melody(4, 18, base=79, start_bar=8)
+              + _melody(4, 18, base=60, start_bar=12))
     events.sort(key=lambda e: e['time'])
     out = convert_drum(events, ConversionSettings(), orig_bpm=120, beats_per_measure=4)
     voices = set(n for _, n in _hits(out))
@@ -243,10 +262,33 @@ def test_varied_song_uses_all_nine_voices():
           not missing, f"missing {sorted(missing)}; used {sorted(voices)}")
 
 
+def test_fills_are_varied():
+    from arranger import (ConversionSettings, convert_drum, DRUM_TOM_1, DRUM_TOM_2,
+                          DRUM_FLOOR_TOM, DRUM_SNARE)
+    # Over a long busy song there should be several fills, and they should not
+    # all be the identical voice sequence - collect the fill "shapes" and check
+    # for variety. A fill is a burst of tom/snare hits between backbone hits.
+    out = convert_drum(_melody(24, 16, base=72), ConversionSettings(), orig_bpm=120, beats_per_measure=4)
+    tom_voices = {DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM}
+    seq = [(round(t, 3), n) for t, n in _hits(out) if n in tom_voices or n == DRUM_SNARE]
+    # group into fills by time-gap
+    fills = []
+    cur = []
+    for i, (t, n) in enumerate(seq):
+        if cur and t - cur[-1][0] > 0.4:
+            fills.append(tuple(v for _, v in cur))
+            cur = []
+        cur.append((t, n))
+    if cur:
+        fills.append(tuple(v for _, v in cur))
+    fills = [f for f in fills if len(f) >= 3]  # real fills, not stray snares
+    check("multiple fills occur over a long song", len(fills) >= 3, f"got {len(fills)} fills")
+    check("fills are not all identical", len(set(fills)) >= 2,
+          f"{len(set(fills))} distinct of {len(fills)} fills")
+
+
 def test_style_switches_between_sections():
     from arranger import ConversionSettings, convert_drum, DRUM_HH_OPEN
-    # A quiet section followed by a busy high section (a "drop") must produce
-    # audibly different drumming - denser, and leaning on the open hi-hat.
     quiet = _melody(4, 3, base=55, start_bar=0)
     loud = _melody(4, 18, base=79, start_bar=4)
     events = sorted(quiet + loud, key=lambda e: e['time'])
@@ -275,9 +317,11 @@ if __name__ == "__main__":
         test_busy_song_uses_toms_and_crash,
         test_sparse_song_stays_minimal,
         test_closed_hats_are_not_sixteenth_spammed,
+        test_kick_follows_the_bassline,
         test_rest_bars_produce_no_drums,
         test_groove_scales_with_speed,
         test_varied_song_uses_all_nine_voices,
+        test_fills_are_varied,
         test_style_switches_between_sections,
     ]:
         fn()

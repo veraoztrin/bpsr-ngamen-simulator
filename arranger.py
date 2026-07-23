@@ -494,13 +494,12 @@ def split_duet(notes, sustains, split_note):
 #     GM-percussion table below onto its closest in-game voice, so the
 #     original drum part is preserved as-is.
 #   - Otherwise (a normal melodic MIDI) _generate_groove() writes a drum-kit
-#     groove. It first splits the song into SECTIONS wherever the melody
-#     shifts - in how busy it is (density) or in register (an octave lift or
-#     drop) - and gives each section its own groove STYLE (ballad / backbeat /
-#     drive / four-on-floor). Bars vary within a section, fills rotate through
-#     several patterns, and section changes (especially "drops" into a busier
-#     or higher part) are marked with crashes - so the beat keeps changing
-#     with the music instead of looping one pattern, and every voice gets used.
+#     groove that listens to the melody: it splits the song into SECTIONS by
+#     density and register (so the beat changes on drops/lifts), locks the
+#     KICK to the melody's bassline (so each bar's groove matches the actual
+#     rhythm instead of a fixed pattern), and drops FILLS at phrase ends drawn
+#     from a rotating palette of tom rolls, snare rolls and syncopated
+#     patterns - so successive bars and fills keep changing with the music.
 
 DRUM_HIT_LEN = 0.09      # seconds a drum tap is held - drums aren't sustained
 DRUM_MIN_GAP = 0.06      # per-voice retrigger floor, so a blast-beat passage
@@ -556,7 +555,7 @@ def _chord_onsets(notes):
     """Collapse near-simultaneous note starts into single onsets.
 
     Returns a sorted list of (time, lowest_pitch) - one entry per musical
-    onset, carrying the lowest pitch of the group.
+    onset, carrying the lowest pitch of the group (used to follow the bass).
     """
     onsets = []
     for n in sorted(notes, key=lambda n: n['start']):
@@ -568,24 +567,75 @@ def _chord_onsets(notes):
     return onsets
 
 
-# Fill patterns: each is a sequence of voices spread across the fill window on
-# a 16th grid. Rotating through them keeps consecutive fills from sounding the
-# same, and together they exercise the snare and all three toms.
-_FILL_PATTERNS = (
-    (DRUM_SNARE, DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM),      # descending
-    (DRUM_FLOOR_TOM, DRUM_TOM_2, DRUM_TOM_1, DRUM_SNARE),      # ascending
-    (DRUM_SNARE, DRUM_SNARE, DRUM_TOM_1, DRUM_FLOOR_TOM),      # snare-led
-    (DRUM_TOM_1, DRUM_FLOOR_TOM, DRUM_TOM_2, DRUM_SNARE),      # tumbling
-)
+# ---------------------------------------------------------------------------
+# Fill palette. Each generator maps a number of 16th steps to a list of
+# (step_index, voice, velocity). They are deliberately different in shape -
+# descending/ascending tom cascades, a building snare roll, tom+snare trades,
+# a galloping (gapped) pattern, doubled hits, and a sparse open fill - so that
+# rotating through them stops every fill from sounding the same.
+# ---------------------------------------------------------------------------
+
+def _fill_cascade_down(steps):
+    seq = (DRUM_SNARE, DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM)
+    return [(s, seq[min(s * len(seq) // steps, len(seq) - 1)],
+             _V_NORMAL if s % 2 == 0 else _V_SOFT) for s in range(steps)]
 
 
-def _emit_fill(hits, start, fill_beats, s16, rotation):
-    """Append a tom-roll fill (one of the rotating patterns)."""
-    seq = _FILL_PATTERNS[rotation % len(_FILL_PATTERNS)]
-    steps = fill_beats * 4
+def _fill_cascade_up(steps):
+    seq = (DRUM_FLOOR_TOM, DRUM_TOM_2, DRUM_TOM_1, DRUM_SNARE)
+    return [(s, seq[min(s * len(seq) // steps, len(seq) - 1)],
+             _V_NORMAL if s % 2 == 0 else _V_SOFT) for s in range(steps)]
+
+
+def _fill_snare_roll(steps):
+    out = []
     for s in range(steps):
-        voice = seq[min(int(s / steps * len(seq)), len(seq) - 1)]
-        hits.append((start + s * s16, voice, _V_NORMAL if s % 2 == 0 else _V_SOFT))
+        frac = s / max(1, steps - 1)
+        vel = _V_GHOST if frac < 0.5 else (_V_SOFT if frac < 0.85 else _V_ACCENT)
+        out.append((s, DRUM_SNARE, vel))
+    return out
+
+
+def _fill_tom_snare(steps):
+    seq = (DRUM_SNARE, DRUM_TOM_1, DRUM_SNARE, DRUM_TOM_2, DRUM_SNARE, DRUM_FLOOR_TOM)
+    return [(s, seq[s % len(seq)], _V_NORMAL if s % 2 == 0 else _V_SOFT)
+            for s in range(steps)]
+
+
+def _fill_gallop(steps):
+    # Groups of three: two hits then a rest - a galloping tom figure.
+    seq = (DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM)
+    out = []
+    for s in range(steps):
+        if s % 3 == 2:
+            continue
+        out.append((s, seq[(s // 3) % len(seq)], _V_NORMAL))
+    return out
+
+
+def _fill_double(steps):
+    seq = (DRUM_TOM_1, DRUM_TOM_1, DRUM_TOM_2, DRUM_TOM_2,
+           DRUM_FLOOR_TOM, DRUM_FLOOR_TOM, DRUM_SNARE, DRUM_SNARE)
+    return [(s, seq[min(s * len(seq) // steps, len(seq) - 1)],
+             _V_NORMAL if s % 2 == 0 else _V_SOFT) for s in range(steps)]
+
+
+def _fill_sparse(steps):
+    # Only on the 8th positions - a more open, less busy fill.
+    picks = (DRUM_FLOOR_TOM, DRUM_SNARE, DRUM_TOM_2, DRUM_SNARE)
+    return [(s, picks[(s // 2) % len(picks)], _V_NORMAL) for s in range(0, steps, 2)]
+
+
+_FILLS = (_fill_cascade_down, _fill_snare_roll, _fill_tom_snare, _fill_cascade_up,
+          _fill_gallop, _fill_double, _fill_sparse)
+
+
+def _emit_fill(hits, start, fill_beats, s16, pick):
+    """Append one fill from the palette (selected by `pick`)."""
+    steps = fill_beats * 4
+    for step, voice, vel in _FILLS[pick % len(_FILLS)](steps):
+        if 0 <= step < steps:
+            hits.append((start + step * s16, voice, vel))
 
 
 def _emit_hats(hits, bt, down, last_beat, half, s16, sixteenths=False):
@@ -604,11 +654,13 @@ def _emit_hats(hits, bt, down, last_beat, half, s16, sixteenths=False):
         hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
 
 
-def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
+def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16, bass_slots):
     """Append one bar of steady groove in the given style.
 
-    `k` is the bar's index within its section; using it to toggle small
-    ornaments keeps successive bars from being identical copies.
+    `k` is the bar's index within its section (used to vary ornaments).
+    `bass_slots` is the set of 8th-note slot indices (0..2*nbeats-1) where the
+    melody plays a low/bass onset; the kick follows those off-beats so the
+    groove locks to the actual song rather than a fixed pattern.
     """
     nb = len(beats)
     for b in range(groove_beats):
@@ -617,42 +669,31 @@ def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
         last_beat = (b == nb - 1)
 
         if style == 'ballad':
-            # Minimal support: kick on 1, gentle snare on 3, quarter hats.
             if b == 0:
                 hits.append((bt, DRUM_KICK, _V_ACCENT))
             if b == 2:
                 hits.append((bt, DRUM_SNARE, _V_SOFT))
             hits.append((bt, DRUM_HH_CLOSED, _V_SOFT))
             if k % 2 == 1 and last_beat:
-                hits.append((bt + half, DRUM_HH_CLOSED, _V_GHOST))  # a little lift
+                hits.append((bt + half, DRUM_HH_CLOSED, _V_GHOST))
 
         elif style == 'backbeat':
-            # Standard rock beat: kick 1 & 3, snare 2 & 4, 8th hats.
             if b == 0 or b == 2:
                 hits.append((bt, DRUM_KICK, _V_ACCENT if down else _V_NORMAL))
             if b % 2 == 1:
                 hits.append((bt, DRUM_SNARE, _V_NORMAL))
             _emit_hats(hits, bt, down, last_beat, half, s16)
-            if k % 2 == 1 and b == 1:
-                hits.append((bt + half, DRUM_KICK, _V_SOFT))          # push on "and of 2"
             if k % 4 == 2 and b == 3:
-                hits.append((bt + half, DRUM_HH_OPEN, _V_NORMAL))     # open-hat lift
+                hits.append((bt + half, DRUM_HH_OPEN, _V_NORMAL))
 
         elif style == 'drive':
-            # Busy, but the energy comes from kick/snare/ghosts, NOT a wall of
-            # 16th hats: 8th hats through the bar, with a short 16th flutter
-            # only on the last beat as a lead-in.
             if b == 0 or b == 2:
                 hits.append((bt, DRUM_KICK, _V_ACCENT if down else _V_NORMAL))
             if b % 2 == 1:
                 hits.append((bt, DRUM_SNARE, _V_NORMAL))
-            # 8th hats; the 16th flutter (lead-in) only on alternating bars so
-            # it stays an accent, not a constant machine-gun.
             _emit_hats(hits, bt, down, last_beat, half, s16, sixteenths=(k % 2 == 1))
-            if b == 2:
-                hits.append((bt + half, DRUM_KICK, _V_SOFT))          # syncopated kick
             if k % 2 == 0 and b == 3:
-                hits.append((bt + s16, DRUM_SNARE, _V_GHOST))         # ghost snare varies
+                hits.append((bt + s16, DRUM_SNARE, _V_GHOST))
             if k % 4 == 2 and b == 1:
                 hits.append((bt + half, DRUM_HH_OPEN, _V_NORMAL))
 
@@ -661,20 +702,30 @@ def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
             if b % 2 == 1:
                 hits.append((bt, DRUM_SNARE, _V_NORMAL))
             hits.append((bt, DRUM_HH_CLOSED, _V_NORMAL if down else _V_SOFT))
-            hits.append((bt + half, DRUM_HH_OPEN, _V_SOFT))           # open hats drive it
+            hits.append((bt + half, DRUM_HH_OPEN, _V_SOFT))
             if k % 4 == 0 and b == 0:
-                hits.append((bt, DRUM_FLOOR_TOM, _V_NORMAL))          # weight on the "1"
-            if k % 2 == 1 and last_beat:
-                hits.append((bt + half, DRUM_KICK, _V_SOFT))
+                hits.append((bt, DRUM_FLOOR_TOM, _V_NORMAL))
+
+    # Kick follows the bassline: add a syncopated kick on the melody's most
+    # prominent off-beat bass hits (on-beats are already the backbone). Capped
+    # at two per bar so it tracks the song without becoming a constant rumble;
+    # the lowest-pitched off-beats win. This is what makes each bar's kick
+    # pattern differ and lock to the actual music.
+    if style != 'ballad':
+        cand = [(slot, pitch) for slot, pitch in bass_slots.items()
+                if slot % 2 == 1 and slot < groove_beats * 2]
+        cand.sort(key=lambda sp: (sp[1], sp[0]))
+        for slot, _pitch in cand[:2]:
+            hits.append((beats[0] + slot * half, DRUM_KICK, _V_SOFT))
 
 
 def _generate_groove(notes, beat_len, beats_per_measure):
-    """Write a section-aware drum-kit groove for a melodic (non-GM-drum) MIDI.
+    """Write a section-aware, melody-following drum-kit groove.
 
     Returns a list of (time, voice, velocity). The song is split into sections
-    by melody density and register; each section gets its own groove style, so
-    the beat changes when the music does. Returns hits locked to the tempo grid
-    (not slaved to individual melody onsets).
+    by density and register; each section gets its own style; the kick tracks
+    the melody's bassline; and fills (varied, from a palette) land at phrase
+    ends. Hits are quantised to the tempo grid, not slaved to every onset.
     """
     if beat_len <= 0:
         return []
@@ -684,6 +735,8 @@ def _generate_groove(notes, beat_len, beats_per_measure):
 
     nbeats = max(1, int(beats_per_measure))
     bar_len = beat_len * nbeats
+    half = beat_len / 2.0
+    s16 = beat_len / 4.0
     t0 = onsets[0][0]
     t_end = max(n['end'] for n in notes)
     n_bars = max(1, int(math.ceil((t_end - t0) / bar_len - 1e-9)))
@@ -700,8 +753,32 @@ def _generate_groove(notes, beat_len, beats_per_measure):
     global_med = all_pitches[len(all_pitches) // 2]
     bar_med = [(sorted(p)[len(p) // 2] if p else None) for p in pitches]
 
+    # Bass 8th-slots per bar: for each 8th position that carries a low onset,
+    # remember the lowest pitch there. The groove later picks only the couple
+    # most prominent off-beats from this, so the kick locks to the bassline
+    # without turning into a constant rumble.
+    bass_slots = [dict() for _ in range(n_bars)]
+    for t, low in onsets:
+        bi = int((t - t0) / bar_len)
+        if not (0 <= bi < n_bars):
+            continue
+        med = bar_med[bi] if bar_med[bi] is not None else global_med
+        if low <= med:
+            slot = max(0, min(int(round((t - (t0 + bi * bar_len)) / half)), 2 * nbeats - 1))
+            if slot not in bass_slots[bi] or low < bass_slots[bi][slot]:
+                bass_slots[bi][slot] = low
+
+    # Phrase-end bars: a rest of >= ~1.5 beats in the melody marks a phrase
+    # boundary, and we place a fill in the bar leading into it.
+    phrase_end = [False] * n_bars
+    otimes = [t for t, _ in onsets]
+    for a, b in zip(otimes, otimes[1:]):
+        if b - a >= beat_len * 1.5:
+            bi = int((a - t0) / bar_len)
+            if 0 <= bi < n_bars:
+                phrase_end[bi] = True
+
     def density_level(bi):
-        """0 sparse, 1 medium, 2 busy, or -1 for an empty (rest) bar."""
         if counts[bi] == 0:
             return -1
         window = [counts[j] for j in (bi - 1, bi, bi + 1) if 0 <= j < n_bars]
@@ -713,7 +790,6 @@ def _generate_groove(notes, beat_len, beats_per_measure):
         return 2
 
     def reg_bucket(bi):
-        """0 low, 1 mid, 2 high - median register vs the song's own median."""
         m = bar_med[bi]
         if m is None:
             return 1
@@ -726,15 +802,13 @@ def _generate_groove(notes, beat_len, beats_per_measure):
     levels = [density_level(bi) for bi in range(n_bars)]
     regs = [reg_bucket(bi) for bi in range(n_bars)]
 
-    # Section key per bar; a rest (-1) is its own break. Smooth away 1-bar
-    # islands so the groove doesn't flip style for a single odd bar.
+    # Section key per bar; a rest (-1) is its own break. Smooth 1-bar islands.
     keys = [None if levels[bi] < 0 else (levels[bi], regs[bi]) for bi in range(n_bars)]
     for bi in range(1, n_bars - 1):
         if keys[bi] is not None and keys[bi - 1] == keys[bi + 1] and keys[bi] != keys[bi - 1] \
                 and keys[bi - 1] is not None:
             keys[bi] = keys[bi - 1]
 
-    # Section boundaries.
     seg_start = [False] * n_bars
     seg_end = [False] * n_bars
     for bi in range(n_bars):
@@ -745,8 +819,6 @@ def _generate_groove(notes, beat_len, beats_per_measure):
         if bi == n_bars - 1 or keys[bi + 1] != keys[bi]:
             seg_end[bi] = True
 
-    half = beat_len / 2.0
-    s16 = beat_len / 4.0
     hits = []
     bar_in_seg = 0
     prev_seg_level = None
@@ -765,7 +837,6 @@ def _generate_groove(notes, beat_len, beats_per_measure):
         base = t0 + bi * bar_len
         beats = [base + b * beat_len for b in range(nbeats)]
 
-        # A "drop" = a section that steps up in energy or lifts in register.
         is_drop = seg_start[bi] and (
             (prev_seg_level is not None and lvl > prev_seg_level) or
             (reg == 2 and (prev_seg_reg is None or prev_seg_reg < 2)))
@@ -779,25 +850,25 @@ def _generate_groove(notes, beat_len, beats_per_measure):
         else:
             style = 'ballad'
 
-        # Crash to mark a new section (brighter crash 2 for an actual drop).
         if seg_start[bi]:
             hits.append((beats[0], DRUM_CRASH_2 if is_drop else DRUM_CRASH_1, _V_ACCENT))
 
-        # Fill on the last bar of a section (lead into the next) or every 4th
-        # bar within a section; heavier fill when the section is busy.
-        want_fill = lvl >= 1 and (seg_end[bi] and bi != n_bars - 1 or bar_in_seg % 4 == 3)
-        fill_beats = (2 if lvl >= 2 else 1) if want_fill else 0
+        # Fills land at real musical seams: a section change, a melodic phrase
+        # gap, or - as a fallback so long uniform sections still breathe - every
+        # 8 bars. Section/phrase-end fills are longer (2 beats) than the fallback.
+        at_seam = (seg_end[bi] and bi != n_bars - 1) or phrase_end[bi]
+        want_fill = lvl >= 1 and (at_seam or bar_in_seg % 8 == 7)
+        fill_beats = (2 if (lvl >= 2 and at_seam) else 1) if want_fill else 0
         groove_beats = nbeats - fill_beats
 
-        _emit_groove_bar(hits, beats, groove_beats, style, bar_in_seg, half, s16)
+        _emit_groove_bar(hits, beats, groove_beats, style, bar_in_seg, half, s16,
+                         bass_slots[bi])
 
         if fill_beats:
+            _emit_fill(hits, beats[groove_beats], fill_beats, s16, fill_rot * 3 + bi)
             fill_rot += 1
-            _emit_fill(hits, beats[groove_beats], fill_beats, s16, fill_rot)
             nxt = bi + 1
             if nxt < n_bars and levels[nxt] >= 0 and not seg_start[nxt]:
-                # land the fill on a crash (unless the next bar already opens a
-                # section, which brings its own crash)
                 hits.append((t0 + nxt * bar_len,
                              DRUM_CRASH_1 if fill_rot % 2 else DRUM_CRASH_2, _V_ACCENT))
 
@@ -812,7 +883,8 @@ def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4):
     """Drum-mode conversion.
 
     Preserves a real GM percussion track (mapped onto the 9 in-game voices),
-    or writes a section-aware groove when the source is melodic.
+    or writes a section-aware, melody-following groove when the source is
+    melodic.
     """
     notes, _sustains = events_to_notes(events)
     if not notes:
