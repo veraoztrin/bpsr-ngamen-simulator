@@ -588,15 +588,33 @@ def _emit_fill(hits, start, fill_beats, s16, rotation):
         hits.append((start + s * s16, voice, _V_NORMAL if s % 2 == 0 else _V_SOFT))
 
 
+def _emit_hats(hits, bt, down, last_beat, half, s16, sixteenths=False):
+    """Append the closed hi-hats for one beat.
+
+    Default is 8th notes (2 per beat) so the closed hat never machine-guns.
+    `sixteenths` adds a short 16th flutter, which the styles use only on the
+    final beat of a bar as a lead-in rather than across the whole bar.
+    """
+    hits.append((bt, DRUM_HH_CLOSED, _V_NORMAL if down else _V_SOFT))
+    if sixteenths and last_beat and s16 >= DRUM_MIN_GAP:
+        hits.append((bt + s16, DRUM_HH_CLOSED, _V_GHOST))
+        hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
+        hits.append((bt + 3 * s16, DRUM_HH_CLOSED, _V_GHOST))
+    else:
+        hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
+
+
 def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
     """Append one bar of steady groove in the given style.
 
     `k` is the bar's index within its section; using it to toggle small
     ornaments keeps successive bars from being identical copies.
     """
+    nb = len(beats)
     for b in range(groove_beats):
         bt = beats[b]
         down = (b == 0)
+        last_beat = (b == nb - 1)
 
         if style == 'ballad':
             # Minimal support: kick on 1, gentle snare on 3, quarter hats.
@@ -605,7 +623,7 @@ def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
             if b == 2:
                 hits.append((bt, DRUM_SNARE, _V_SOFT))
             hits.append((bt, DRUM_HH_CLOSED, _V_SOFT))
-            if k % 2 == 1 and b == len(beats) - 1:
+            if k % 2 == 1 and last_beat:
                 hits.append((bt + half, DRUM_HH_CLOSED, _V_GHOST))  # a little lift
 
         elif style == 'backbeat':
@@ -614,31 +632,28 @@ def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
                 hits.append((bt, DRUM_KICK, _V_ACCENT if down else _V_NORMAL))
             if b % 2 == 1:
                 hits.append((bt, DRUM_SNARE, _V_NORMAL))
-            hits.append((bt, DRUM_HH_CLOSED, _V_NORMAL if down else _V_SOFT))
-            hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
+            _emit_hats(hits, bt, down, last_beat, half, s16)
             if k % 2 == 1 and b == 1:
                 hits.append((bt + half, DRUM_KICK, _V_SOFT))          # push on "and of 2"
             if k % 4 == 2 and b == 3:
                 hits.append((bt + half, DRUM_HH_OPEN, _V_NORMAL))     # open-hat lift
 
         elif style == 'drive':
-            # Busy: kick 1 & 3 + a push, snare 2 & 4, 16th hats, ghost snares.
+            # Busy, but the energy comes from kick/snare/ghosts, NOT a wall of
+            # 16th hats: 8th hats through the bar, with a short 16th flutter
+            # only on the last beat as a lead-in.
             if b == 0 or b == 2:
                 hits.append((bt, DRUM_KICK, _V_ACCENT if down else _V_NORMAL))
             if b % 2 == 1:
                 hits.append((bt, DRUM_SNARE, _V_NORMAL))
-            if s16 >= DRUM_MIN_GAP:
-                for j in range(4):
-                    hits.append((bt + j * s16, DRUM_HH_CLOSED,
-                                 _V_NORMAL if j == 0 else _V_GHOST))
-            else:
-                hits.append((bt, DRUM_HH_CLOSED, _V_NORMAL if down else _V_SOFT))
-                hits.append((bt + half, DRUM_HH_CLOSED, _V_SOFT))
+            # 8th hats; the 16th flutter (lead-in) only on alternating bars so
+            # it stays an accent, not a constant machine-gun.
+            _emit_hats(hits, bt, down, last_beat, half, s16, sixteenths=(k % 2 == 1))
             if b == 2:
                 hits.append((bt + half, DRUM_KICK, _V_SOFT))          # syncopated kick
             if k % 2 == 0 and b == 3:
                 hits.append((bt + s16, DRUM_SNARE, _V_GHOST))         # ghost snare varies
-            if k % 4 == 2 and b == 3:
+            if k % 4 == 2 and b == 1:
                 hits.append((bt + half, DRUM_HH_OPEN, _V_NORMAL))
 
         else:  # 'four' - four-on-floor, the highest-energy / "drop" style
@@ -649,7 +664,7 @@ def _emit_groove_bar(hits, beats, groove_beats, style, k, half, s16):
             hits.append((bt + half, DRUM_HH_OPEN, _V_SOFT))           # open hats drive it
             if k % 4 == 0 and b == 0:
                 hits.append((bt, DRUM_FLOOR_TOM, _V_NORMAL))          # weight on the "1"
-            if k % 2 == 1 and b == len(beats) - 1:
+            if k % 2 == 1 and last_beat:
                 hits.append((bt + half, DRUM_KICK, _V_SOFT))
 
 

@@ -184,6 +184,21 @@ def test_sparse_song_stays_minimal():
           f"got {sorted(voices)}")
 
 
+def test_closed_hats_are_not_sixteenth_spammed():
+    from arranger import ConversionSettings, convert_drum, DRUM_HH_CLOSED
+    # The anti-spam fix: in a busy section closed hi-hats should sit on the
+    # 8th-note grid, not a wall of 16ths. At 180 BPM an 8th is 0.167s and a
+    # 16th is 0.083s; the TYPICAL gap between consecutive closed hats must be
+    # around an 8th (short 16th flutters as lead-ins are still allowed, so we
+    # check the median, not the minimum).
+    out = convert_drum(_melody(8, 16, base=79), ConversionSettings(), orig_bpm=180, beats_per_measure=4)
+    times = sorted(t for t, n in _hits(out) if n == DRUM_HH_CLOSED)
+    gaps = sorted(b - a for a, b in zip(times, times[1:]))
+    median_gap = gaps[len(gaps) // 2] if gaps else 0
+    check("closed hi-hats sit on the 8th grid, not spammed 16ths", median_gap >= 0.12,
+          f"median closed-hat gap {median_gap:.3f}s (8th=0.167, 16th=0.083)")
+
+
 def test_rest_bars_produce_no_drums():
     from arranger import ConversionSettings, convert_drum
     bar = 0.5 * 4  # 2.0s at 120 BPM 4/4
@@ -259,6 +274,7 @@ if __name__ == "__main__":
         test_busy_song_is_busier_than_sparse_song,
         test_busy_song_uses_toms_and_crash,
         test_sparse_song_stays_minimal,
+        test_closed_hats_are_not_sixteenth_spammed,
         test_rest_bars_produce_no_drums,
         test_groove_scales_with_speed,
         test_varied_song_uses_all_nine_voices,
