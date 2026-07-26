@@ -35,6 +35,7 @@ jobs:
           python tests/test_seek.py
           python tests/test_sync.py
           python tests/test_drum.py
+          python tests/test_retrigger.py
 
       - name: Build executable
         run: >

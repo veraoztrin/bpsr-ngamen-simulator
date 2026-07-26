@@ -70,9 +70,24 @@ class BPSRInputSimulator:
         #                 so the game reliably registers the modifier change.
         # shift_hold_ms:  minimum time a modifier state is held before it may
         #                 be toggled again (prevents dropped toggles on fast runs).
+        # retrigger_gap_ms: minimum time a key must be observed UP before it may
+        #                 be pressed again. The game samples the keyboard once
+        #                 per frame, so a release immediately followed by a press
+        #                 reads as one uninterrupted hold - a repeated note
+        #                 (C4 C4 C4 C4) then sounds as a single long C4. The
+        #                 arranger already spaces scheduled playback; this is the
+        #                 runtime backstop for live MIDI passthrough and for keys
+        #                 shared by several soloed channels.
         self.shift_delay_ms = 30
         self.shift_hold_ms = 10
+        self.retrigger_gap_ms = 25
         self._last_shift_change = 0.0
+        self._last_release = {}  # vk_code -> perf_counter() of its last key-up
+        # midi_note -> [vk_code, ...] actually pressed for the notes of that
+        # pitch currently sounding. The octave modifier can change between a
+        # note's press and its release, and re-deriving the key at release time
+        # would then release a *different* key, leaving this one stuck down.
+        self.note_keys = {}
         # Semitone offset added before the piano key lookup, so instruments
         # whose keyboard is the piano layout transposed (e.g. Bass = -2 octaves)
         # press the right key. 0 = piano/guitar.
@@ -113,41 +128,77 @@ class BPSRInputSimulator:
             tap_key(VK_SPACE)
             self.sustain_active = active
 
+    def _await_key_up(self, vk_code):
+        """Block until this key has been up for at least retrigger_gap_ms.
+
+        Without this a release and the following press land microseconds
+        apart and the game never samples the key as up, so the repeat is
+        swallowed and the note just sounds held.
+        """
+        gap = self.retrigger_gap_ms / 1000.0
+        if gap <= 0:
+            return
+        last_up = self._last_release.get(vk_code)
+        if last_up is None:
+            return
+        remaining = gap - (time.perf_counter() - last_up)
+        if remaining > 0:
+            time.sleep(min(remaining, gap))
+
+    def _release_vk(self, vk_code):
+        release_key(vk_code)
+        self._last_release[vk_code] = time.perf_counter()
+
     def press_note(self, midi_note):
-        midi_note = midi_note + self.key_offset
-        target_shift, base_note = self._get_mapping(midi_note)
+        target = midi_note + self.key_offset
+        target_shift, base_note = self._get_mapping(target)
         if base_note is None:
             return # Out of range
-        
+
         self.set_octave_shift(target_shift)
-        
+
         note_name = midi_to_note_name(base_note)
         vk_code = KEY_MAP.get(note_name)
-        if vk_code:
-            refs = self.key_refs.get(vk_code, 0)
-            if refs == 0:
-                press_key(vk_code)
-            else:
-                # Key is already physically held. Release and press again to trigger the new note.
-                release_key(vk_code)
-                time.sleep(0.005)
-                press_key(vk_code)
-            self.key_refs[vk_code] = refs + 1
+        if not vk_code:
+            return
+
+        refs = self.key_refs.get(vk_code, 0)
+        if refs > 0:
+            # Key is already physically held by another sounding note. Let go
+            # first so the game sees a fresh key-down rather than a hold.
+            self._release_vk(vk_code)
+        self._await_key_up(vk_code)
+        press_key(vk_code)
+        self.key_refs[vk_code] = refs + 1
+        # Record the key we actually pressed, keyed by the note as the caller
+        # gave it to us, so release_note() can undo exactly this press even if
+        # the octave modifier has moved on by then.
+        self.note_keys.setdefault(midi_note, []).append(vk_code)
 
     def release_note(self, midi_note):
-        midi_note = midi_note + self.key_offset
-        _, base_note = self._get_mapping(midi_note)
-        if base_note is None:
+        # Prefer the key this note was actually pressed with (FIFO, matching
+        # how the arranger pairs note_on/note_off) over re-deriving it, which
+        # would pick the wrong key whenever the octave zone changed mid-note.
+        stack = self.note_keys.get(midi_note)
+        if stack:
+            vk_code = stack.pop(0)
+            if not stack:
+                del self.note_keys[midi_note]
+        else:
+            # No record of the press - e.g. a note_off left over from before a
+            # seek or release_all. Fall back to deriving the key.
+            _, base_note = self._get_mapping(midi_note + self.key_offset)
+            if base_note is None:
+                return
+            vk_code = KEY_MAP.get(midi_to_note_name(base_note))
+        if not vk_code:
             return
-            
-        note_name = midi_to_note_name(base_note)
-        vk_code = KEY_MAP.get(note_name)
-        if vk_code:
-            refs = self.key_refs.get(vk_code, 0)
-            if refs > 0:
-                self.key_refs[vk_code] = refs - 1
-                if self.key_refs[vk_code] == 0:
-                    release_key(vk_code)
+
+        refs = self.key_refs.get(vk_code, 0)
+        if refs > 0:
+            self.key_refs[vk_code] = refs - 1
+            if self.key_refs[vk_code] == 0:
+                self._release_vk(vk_code)
 
     def _get_mapping(self, midi_note):
         # Check if playable in CURRENT shift first to minimize toggling
@@ -180,5 +231,12 @@ class BPSRInputSimulator:
             
         for vk_code in KEY_MAP.values():
             release_key(vk_code)
-            
+
+        # Everything is up as of now: make the next press of any of these keys
+        # honour the retrigger gap rather than landing on top of its own key-up.
+        now = time.perf_counter()
+        for vk_code in KEY_MAP.values():
+            self._last_release[vk_code] = now
+
         self.key_refs.clear()
+        self.note_keys.clear()

@@ -303,6 +303,19 @@ class App(ctk.CTk):
         ctk.CTkLabel(row4, text="channels by role (melody / accomp / bass)",
                      text_color="gray").pack(side="left", padx=4)
 
+        # Row 5: retrigger gap. How long a key is held UP before the same note
+        # sounds again. Applies to every instrument - drums re-press the same 9
+        # keys constantly - so unlike the rows above it stays visible in Drum
+        # mode and is not added to _drum_hidden_widgets.
+        row5 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        row5.pack(fill="x", padx=10, pady=(0, 8))
+        ctk.CTkLabel(row5, text="Retrigger gap (ms):").pack(side="left")
+        self.retrigger_gap_entry = ctk.CTkEntry(row5, width=45)
+        self.retrigger_gap_entry.insert(0, "25")
+        self.retrigger_gap_entry.pack(side="left", padx=(4, 8))
+        ctk.CTkLabel(row5, text="raise if repeated notes sound like one long note",
+                     text_color="gray").pack(side="left")
+
         # Rows that only make sense for a pitch-based instrument (chord size,
         # note-shaping checkboxes, range/duet/timing, channel auto-split) -
         # hidden in Drum mode, which just auto-generates a beat instead.
@@ -603,6 +616,7 @@ class App(ctk.CTk):
                 "duet_split": self.duet_split_entry.get(),
                 "shift_delay": self.shift_delay_entry.get(),
                 "shift_hold": self.shift_hold_entry.get(),
+                "retrigger_gap": self.retrigger_gap_entry.get(),
                 "autosplit": self.autosplit_var.get(),
                 "autosplit_parts": self.autosplit_seg.get(),
                 "instrument": self.instrument_var.get(),
@@ -648,6 +662,7 @@ class App(ctk.CTk):
         _set_entry(self.duet_split_entry, prefs.get("duet_split"))
         _set_entry(self.shift_delay_entry, prefs.get("shift_delay"))
         _set_entry(self.shift_hold_entry, prefs.get("shift_hold"))
+        _set_entry(self.retrigger_gap_entry, prefs.get("retrigger_gap"))
 
         if prefs.get("max_chord_notes"):
             self.max_chord_seg.set(prefs["max_chord_notes"])
@@ -689,6 +704,7 @@ class App(ctk.CTk):
             instrument_offset=self._inst()["offset"],
             range_low=self._get_note(self.range_low_entry, ABS_LOW),
             range_high=self._get_note(self.range_high_entry, ABS_HIGH),
+            retrigger_gap=max(0.0, self._get_float(self.retrigger_gap_entry, 25)) / 1000.0,
         )
         self.save_prefs()
         return s
@@ -710,6 +726,8 @@ class App(ctk.CTk):
         if self.player.simulator:
             self.player.simulator.shift_delay_ms = self._get_float(self.shift_delay_entry, 30)
             self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
+            self.player.simulator.retrigger_gap_ms = max(
+                0.0, self._get_float(self.retrigger_gap_entry, 25))
             self.player.simulator.key_offset = self._inst()["offset"]
 
         # Drum output is always a single channel - ignore any leftover

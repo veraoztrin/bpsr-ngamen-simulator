@@ -61,6 +61,7 @@ class ConversionSettings:
     thinning_gap: float = 0.030     # min silence between same-pitch repeats
     thinning_min_len: float = 0.020 # drop notes shorter than this when thinning
     phrase_gap: float = 0.150       # silence >= this = phrase boundary
+    retrigger_gap: float = 0.025    # min key-UP time before a key is re-pressed
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +233,49 @@ def thin_notes(notes, min_gap, min_len):
         last_by_pitch[key] = n
     # Pass 2: drop notes still too short to be audible after merging.
     return [n for n in merged if (n['end'] - n['start']) >= min_len]
+
+
+# Never shorten a note below this when making room for a retrigger gap - a
+# key-down/key-up pair closer together than this reads as no press at all.
+MIN_NOTE_LEN = 0.010
+
+
+def enforce_retrigger_gaps(notes, min_gap):
+    """Guarantee real key-UP time between two hits on the same key.
+
+    This app performs by holding and releasing physical keys, so a repeated
+    note only reads as a *repeat* if the key is actually observed to be up in
+    between. Most MIDI is quantised edge-to-edge: the note_off of one C4 sits
+    on the exact timestamp of the next C4's note_on. The player would then
+    dispatch release-then-press microseconds apart, and a game that samples
+    the keyboard once per frame never sees the gap - so C4 C4 C4 C4 comes out
+    as one long C4.
+
+    We fix that at the source by pulling each note's release back to min_gap
+    before the next hit on the same key. Onsets are never moved (that's the
+    musical timing that matters); only the release moves, and the sustain
+    pedal covers the shortened tail in-game anyway.
+
+    Notes are grouped per (channel, pitch) because that is what maps to one
+    physical key for one performer. Same-pitch collisions ACROSS channels
+    (several channels soloed onto one keyboard) are caught at runtime by
+    BPSRInputSimulator's own key-up guard.
+    """
+    if min_gap <= 0:
+        return
+    by_key = {}
+    for n in notes:
+        by_key.setdefault((n['channel'], n['note']), []).append(n)
+    for group in by_key.values():
+        if len(group) < 2:
+            continue
+        group.sort(key=lambda n: n['start'])
+        for cur, nxt in zip(group, group[1:]):
+            latest_end = nxt['start'] - min_gap
+            if cur['end'] > latest_end:
+                # Keep the note pressable even when the repeat is faster than
+                # min_gap; the simulator's runtime guard is the backstop.
+                cur['end'] = max(latest_end, cur['start'] + MIN_NOTE_LEN)
 
 
 def group_chords(notes, window, consistent):
@@ -933,17 +977,20 @@ def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4):
         kept.append([t, voice, vel])
         last_by_voice[voice] = t
 
-    # Trim each tap so it never overlaps the next hit on the SAME voice (that
-    # key is about to be re-pressed), while staying a short tap otherwise.
+    # Trim each tap so the key is genuinely UP before the next hit on the SAME
+    # voice re-presses it - a 5ms blip between release and press is invisible
+    # to a game that polls input per frame, which turns a run of hits on one
+    # voice into a single held key. Otherwise stay a short tap.
+    gap = max(0.0, settings.retrigger_gap)
     next_same = {}
     for item in reversed(kept):
         t, voice, _vel = item
         nxt = next_same.get(voice)
         end = t + DRUM_HIT_LEN
         if nxt is not None:
-            end = min(end, nxt - 0.005)
+            end = min(end, nxt - gap)
         if end <= t:
-            end = t + 0.01
+            end = t + MIN_NOTE_LEN
         item.append(end)
         next_same[voice] = t
 
@@ -1012,5 +1059,11 @@ def convert(events, settings, orig_bpm=120.0):
         sustains = assign_auto_parts(notes, sustains, settings.auto_split_parts)
     elif settings.duet_mode:
         sustains = split_duet(notes, sustains, settings.duet_split_note)
+
+    # 8. Retrigger gaps. Must be LAST: it works on the final pitch of each note
+    # (after folding/melody-lock) and its final channel (after the duet /
+    # auto-split assignment above), since together those decide which physical
+    # key a note lands on and who plays it.
+    enforce_retrigger_gaps(notes, settings.retrigger_gap)
 
     return notes_to_events(notes, sustains, zone_hints)

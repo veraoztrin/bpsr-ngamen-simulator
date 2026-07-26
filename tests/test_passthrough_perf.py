@@ -96,9 +96,50 @@ def test_passthrough():
                 ks.append(('sus', round(e['time'], 6), e['value'], e['channel']))
         return sorted(ks)
 
-    check("default settings = byte-identical event content",
-          key_set(evs) == key_set(out),
+    # Defaults are a pass-through for everything the ear places in time:
+    # onsets, pitch, velocity, channel and the pedal all come out untouched.
+    def subset(events, types):
+        return sorted(k for k in key_set(events) if k[0] in types)
+
+    check("default settings leave onsets and pedal byte-identical",
+          subset(evs, ('on', 'sus')) == subset(out, ('on', 'sus')),
           f"in={len(evs)} out={len(out)}")
+
+    # The one thing defaults DO move is a note's release, and only far enough
+    # to give a repeat of the same key real key-up time (see
+    # arranger.enforce_retrigger_gaps). Releases may only come earlier, never
+    # by more than the gap, and never past their own onset.
+    def by_key(events, kind):
+        d = {}
+        for e in events:
+            if e['type'] == kind:
+                d.setdefault((e['note'], e['channel']), []).append(round(e['time'], 6))
+        for v in d.values():
+            v.sort()
+        return d
+
+    in_offs, out_offs = by_key(evs, 'note_off'), by_key(out, 'note_off')
+    out_ons = by_key(out, 'note_on')
+    check("every note still gets exactly one release",
+          {k: len(v) for k, v in in_offs.items()} == {k: len(v) for k, v in out_offs.items()},
+          f"{sum(map(len, in_offs.values()))} vs {sum(map(len, out_offs.values()))}")
+    moved = [(k, a, b) for k in in_offs
+             for a, b in zip(in_offs[k], out_offs.get(k, [])) if a != b]
+    check("releases only ever move earlier, never later",
+          all(b <= a + 1e-9 for k in in_offs
+              for a, b in zip(in_offs[k], out_offs.get(k, []))), f"{moved[:3]}")
+    too_short = [(k, o, f) for k, offs in out_offs.items()
+                 for o, f in zip(out_ons.get(k, []), offs) if f <= o + 1e-9]
+    check("no release is dragged back past its own onset",
+          not too_short, f"{too_short[:3]}")
+    check("the test data actually exercises the retrigger pass", bool(moved))
+
+    # Turning the gap off restores an exact byte-for-byte pass-through, which
+    # pins down that the retrigger pass is the ONLY thing defaults change.
+    raw = convert(evs, ConversionSettings(retrigger_gap=0.0), orig_bpm=120)
+    check("retrigger_gap=0 = byte-identical event content",
+          key_set(evs) == key_set(raw), f"in={len(evs)} out={len(raw)}")
+
     check("no zone hints injected at defaults",
           not any(e['type'] == 'zone' for e in out))
 
