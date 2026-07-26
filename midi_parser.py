@@ -131,15 +131,18 @@ def parse_midi_full(file_path):
     # Ensure events are sorted
     all_events.sort(key=lambda x: x['time'])
 
-    # Anti-Stack Filter: Remove duplicate note_on events occurring at the exact same time
+    # Anti-Stack Filter: Remove near-simultaneous duplicate note_on events.
+    # Never filter note_off: two overlapping same-pitch notes need two
+    # releases, even if those releases are only 1 ms apart.
     # This prevents sending redundant keystrokes to the OS for poorly quantized chords
     filtered_events = []
     last_event_time = {}  # (type, channel, note) -> time
 
     for ev in all_events:
-        if ev['type'] in ('note_on', 'note_off'):
-            key = (ev['type'], ev.get('channel', 0), ev['note'])
-            if key in last_event_time and abs(ev['time'] - last_event_time[key]) < 0.002:
+        if ev['type'] == 'note_on':
+            key = (ev.get('channel', 0), ev['note'])
+            if (key in last_event_time
+                    and abs(ev['time'] - last_event_time[key]) < 0.002):
                 continue  # Skip stacked duplicate
             last_event_time[key] = ev['time']
 

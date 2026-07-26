@@ -1,0 +1,316 @@
+import base64
+import importlib
+import json
+import os
+import sys
+import threading
+import time
+import types
+
+import mido
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from arranger import (
+    ConversionSettings,
+    apply_melody_lock,
+    assign_auto_parts,
+    convert,
+    thin_notes,
+)
+from midi_parser import parse_midi_full
+from player import MidiPlayer
+
+
+class MockSimulator:
+    def __init__(self):
+        self.log = []
+        self.shift_delay_ms = 0
+        self.shift_hold_ms = 0
+        self.retrigger_gap_ms = 0
+        self.key_offset = 0
+
+    def press_note(self, note):
+        self.log.append(("press", note, threading.get_ident()))
+
+    def release_note(self, note):
+        self.log.append(("release", note, threading.get_ident()))
+
+    def release_all(self):
+        self.log.append(("all", threading.get_ident()))
+
+    def set_sustain(self, value):
+        self.log.append(("sustain", value))
+
+    def set_octave_shift(self, value):
+        self.log.append(("zone", value))
+
+
+def test_pause_resume_never_runs_two_workers():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.08, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 0.16, "type": "note_off", "note": 60, "channel": 0},
+    ], [0])
+
+    player.play()
+    time.sleep(0.01)
+    old_thread = player.thread
+    player.pause()
+    assert not old_thread.is_alive()
+    player.play()
+    time.sleep(0.2)
+
+    assert [x[:2] for x in player.simulator.log].count(("press", 60)) == 1
+    player.stop()
+
+
+def test_stop_interrupts_long_countdown():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.0, "type": "note_on", "note": 60, "channel": 0},
+    ], [0])
+    player.play(delay_seconds=4.0)
+    worker = player.thread
+    started = time.perf_counter()
+    player.stop()
+
+    assert time.perf_counter() - started < 0.5
+    assert not worker.is_alive()
+
+
+def test_seek_keeps_boundary_event_and_sync_countdown():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.0, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 1.0, "type": "note_off", "note": 60, "channel": 0},
+    ], [0])
+
+    player.play(delay_seconds=0.5)
+    player.seek(0.0)
+    assert player.current_event_idx == 0
+    assert player.is_syncing
+    player.stop()
+
+
+def test_seek_replays_sustain_only_from_active_channels():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.1, "type": "sustain", "value": False, "channel": 0},
+        {"time": 0.2, "type": "sustain", "value": True, "channel": 1},
+        {"time": 1.0, "type": "note_on", "note": 60, "channel": 0},
+    ], [0])
+    player.seek(0.5)
+    assert ("sustain", False) in player.simulator.log
+    assert ("sustain", True) not in player.simulator.log
+    player.stop()
+
+
+def test_transpose_and_channel_changes_release_the_pressed_note():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.0, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 0.2, "type": "note_off", "note": 60, "channel": 0},
+    ], [0])
+    player.play()
+    time.sleep(0.03)
+    player.transpose = 12
+    time.sleep(0.22)
+    assert not any(x[:2] == ("release", 72) for x in player.simulator.log)
+    player.stop()
+
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.0, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 0.3, "type": "note_off", "note": 60, "channel": 0},
+    ], [0])
+    player.play()
+    time.sleep(0.03)
+    player.set_active_channels([])
+    assert any(x[:2] == ("release", 60) for x in player.simulator.log)
+    player.stop()
+
+
+def _note(start, end, pitch):
+    return {
+        "start": start, "end": end, "note": pitch,
+        "channel": 0, "velocity": 80,
+    }
+
+
+def test_thinning_uses_retrigger_rate_not_legato_silence():
+    notes = [_note(i * 2.0, i * 2.0 + 2.0, 60) for i in range(4)]
+    assert len(thin_notes(notes, 0.03, 0.02)) == 4
+
+    rapid = [_note(i * 0.015, i * 0.015 + 0.01, 60) for i in range(4)]
+    assert len(thin_notes(rapid, 0.03, 0.005)) == 1
+
+
+def test_melody_lock_selects_best_valid_zone_and_ends_incompatible_hold():
+    chord = [
+        _note(0.0, 0.5, 84),
+        _note(1.0, 1.5, 48),
+        _note(1.0, 1.5, 52),
+        _note(1.0, 1.5, 55),
+        _note(1.0, 1.5, 60),
+    ]
+    _zones, kept = apply_melody_lock(chord, 0.03, "drop")
+    assert sorted(n["note"] for n in kept) == [48, 52, 55, 60, 84]
+
+    held_low = _note(0.0, 2.0, 40)
+    forced_high = _note(1.0, 1.5, 90)
+    apply_melody_lock([held_low, forced_high], 0.03, "drop")
+    assert held_low["end"] == 1.0
+
+
+def test_auto_split_groups_humanized_chord_window():
+    notes = [_note(0.000, 1.0, 60), _note(0.003, 1.0, 72)]
+    assign_auto_parts(notes, [], 2, chord_window=0.03)
+    assert [(n["note"], n["channel"]) for n in notes] == [(60, 1), (72, 0)]
+
+
+def test_disjoint_range_clamps_without_reversing_melody():
+    events = []
+    for i, pitch in enumerate((60, 62, 64, 65, 67, 69, 71, 72)):
+        events.extend([
+            {"time": i, "type": "note_on", "note": pitch,
+             "velocity": 80, "channel": 0},
+            {"time": i + 0.5, "type": "note_off", "note": pitch, "channel": 0},
+        ])
+    out = convert(
+        events,
+        ConversionSettings(
+            proportional_remap=True, range_low=0, range_high=10,
+            reach_low=36, reach_high=95),
+    )
+    pitches = [e["note"] for e in out if e["type"] == "note_on"]
+    assert pitches == sorted(pitches)
+    assert all(36 <= pitch <= 95 for pitch in pitches)
+
+
+def test_parser_keeps_close_note_offs(tmp_path):
+    # Another legacy test temporarily replaces mido.MidiFile on the shared
+    # module object; reload the installed package for this real parser probe.
+    importlib.reload(mido)
+    midi = mido.MidiFile(ticks_per_beat=1000)
+    track = mido.MidiTrack()
+    midi.tracks.append(track)
+    track.append(mido.MetaMessage("set_tempo", tempo=1_000_000, time=0))
+    track.append(mido.Message("note_on", note=60, velocity=80, time=0))
+    track.append(mido.Message("note_on", note=60, velocity=80, time=1000))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=250))
+    track.append(mido.Message("note_off", note=60, velocity=0, time=1))
+    path = tmp_path / "overlap.mid"
+    midi.save(path)
+
+    events = parse_midi_full(path)["events"]
+    assert len([e for e in events if e["type"] == "note_off"]) == 2
+
+
+def _network_module():
+    for name in ("paho", "paho.mqtt", "paho.mqtt.client"):
+        if name not in sys.modules:
+            sys.modules[name] = types.ModuleType(name)
+    sys.modules["paho.mqtt"].client = sys.modules["paho.mqtt.client"]
+    client_module = sys.modules["paho.mqtt.client"]
+    client_module.Client = getattr(client_module, "Client", object)
+    client_module.CallbackAPIVersion = getattr(
+        client_module, "CallbackAPIVersion",
+        types.SimpleNamespace(VERSION2=2))
+    import network_sync
+    return network_sync
+
+
+class FakeNetworkClient:
+    def __init__(self):
+        self.unsubscribed = []
+
+    def unsubscribe(self, topic):
+        self.unsubscribed.append(topic)
+
+
+def _client_manager():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.client_id = "client"
+    manager.client = FakeNetworkClient()
+    manager._configure_room("correct horse battery staple")
+    manager.is_host = False
+    manager.host_id = "host"
+    manager.nickname = "Client"
+    manager.room_state = {
+        "players": [{"client_id": "client", "channels": [0]}],
+        "filename": None,
+    }
+    manager.host_offset = 0.0
+    manager.sync_rtt = None
+    manager.is_synced = False
+    manager._sync_samples = []
+    manager._room_joined_at = time.time()
+    manager._sync_stall_reported = False
+    manager.on_midi_received = None
+    manager.on_state_change = None
+    manager.on_play_cmd = None
+    manager.on_stop_cmd = None
+    manager.on_sync_update = None
+    manager.on_disband = None
+    manager.on_kicked = None
+    return network_sync, manager
+
+
+def _signed_message(manager, payload):
+    payload = dict(payload)
+    payload["_sender"] = "host"
+    payload["_msg_id"] = os.urandom(16).hex()
+    payload["_sig"] = manager._sign(payload)
+    return types.SimpleNamespace(
+        topic=manager._room_topic(),
+        payload=json.dumps(payload).encode("utf-8"))
+
+
+def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch):
+    network_sync, manager = _client_manager()
+    monkeypatch.setattr(network_sync, "_log", lambda _message: None)
+    received = []
+    manager.on_midi_received = lambda name, data: received.append((name, data))
+    encoded = base64.b64encode(b"MThd").decode("ascii")
+
+    unsigned = types.SimpleNamespace(
+        topic=manager._room_topic(),
+        payload=json.dumps({
+            "type": "midi_file", "_sender": "host",
+            "filename": "../../evil.mid", "data": encoded,
+        }).encode("utf-8"))
+    manager._on_message(None, None, unsigned)
+    assert received == []
+
+    manager._on_message(None, None, _signed_message(manager, {
+        "type": "midi_file",
+        "filename": "../../evil.mid",
+        "data": encoded,
+    }))
+    assert received == [("evil.mid", b"MThd")]
+
+    replay = _signed_message(manager, {
+        "type": "midi_file",
+        "filename": "song.mid",
+        "data": encoded,
+    })
+    manager._on_message(None, None, replay)
+    manager._on_message(None, None, replay)
+    assert received.count(("song.mid", b"MThd")) == 1
+
+
+def test_remote_disband_unsubscribes_before_reset():
+    _network_sync, manager = _client_manager()
+    old_topic = manager._room_topic()
+    manager._on_message(
+        None, None, _signed_message(manager, {"type": "disband"}))
+    assert manager.client.unsubscribed == [old_topic]
+    assert manager.room_code is None

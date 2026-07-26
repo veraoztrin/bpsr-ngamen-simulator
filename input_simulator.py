@@ -1,5 +1,7 @@
 import ctypes
 import time
+import threading
+from functools import wraps
 from config import KEY_MAP, VK_LSHIFT, VK_LCONTROL, VK_SPACE, midi_to_note_name
 
 SendInput = ctypes.windll.user32.SendInput
@@ -60,8 +62,18 @@ def tap_key(hexKeyCode, duration=0.01):
     time.sleep(duration)
     release_key(hexKeyCode)
 
+
+def synchronized(method):
+    """Serialize OS-key state shared by playback and live-MIDI callbacks."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
 class BPSRInputSimulator:
     def __init__(self):
+        self._lock = threading.RLock()
         self.current_octave_shift = 0 # 0: normal, 1: High, -1: Low
         self.sustain_active = False
         self.key_refs = {}
@@ -93,6 +105,7 @@ class BPSRInputSimulator:
         # press the right key. 0 = piano/guitar.
         self.key_offset = 0
 
+    @synchronized
     def set_octave_shift(self, target_shift):
         if self.current_octave_shift == target_shift:
             return
@@ -123,6 +136,7 @@ class BPSRInputSimulator:
         if self.shift_delay_ms > 0:
             time.sleep(self.shift_delay_ms / 1000.0)
 
+    @synchronized
     def set_sustain(self, active):
         if self.sustain_active != active:
             tap_key(VK_SPACE)
@@ -149,6 +163,7 @@ class BPSRInputSimulator:
         release_key(vk_code)
         self._last_release[vk_code] = time.perf_counter()
 
+    @synchronized
     def press_note(self, midi_note):
         target = midi_note + self.key_offset
         target_shift, base_note = self._get_mapping(target)
@@ -175,6 +190,7 @@ class BPSRInputSimulator:
         # the octave modifier has moved on by then.
         self.note_keys.setdefault(midi_note, []).append(vk_code)
 
+    @synchronized
     def release_note(self, midi_note):
         # Prefer the key this note was actually pressed with (FIFO, matching
         # how the arranger pairs note_on/note_off) over re-deriving it, which
@@ -219,6 +235,7 @@ class BPSRInputSimulator:
         
         return 0, None
 
+    @synchronized
     def release_all(self):
         if self.current_octave_shift == 1:
             release_key(VK_LSHIFT)

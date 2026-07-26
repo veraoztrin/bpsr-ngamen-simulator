@@ -19,6 +19,7 @@ A plug-and-play desktop application designed to read standard MIDI (`.mid`) file
 - **Autoplay toggle:** When on, playback advances to the next loaded MIDI when a track finishes; when off (the default), it stops and releases all keys at the end of each track. Found next to the play controls in the Solo tab.
 - **Leave / Disband room:** Clients can **Leave Room** at any time (they drop off the host's roster and can join another room); the host can **Disband Lobby** to close the room, which returns every connected player to the disconnected state.
 - **Peer-to-peer clock sync:** In multiplayer, each client measures its clock offset directly against the host over the network (NTP-style ping/pong), instead of relying on an external time server that firewalls often block. The lobby shows a live "Synced ±X ms" accuracy readout, and **Ready** stays locked until the clock is aligned — so players start together, not seconds apart. A per-player **Sync nudge (ms)** knob lets you dial out the last few milliseconds of residual offset (from network path asymmetry or input latency) by ear — set it once for your connection.
+- **Signed private rooms:** Leaving the room field blank generates a high-entropy room credential. Share the full credential privately with the other players; only a one-way hash appears in the public broker topic, and every room command/file is signed. Short legacy room codes are intentionally rejected.
 
 ## Conversion Settings (v0.4)
 

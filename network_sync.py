@@ -4,11 +4,19 @@ import base64
 import uuid
 import os
 import threading
+import hashlib
+import hmac
+import ntpath
+from collections import deque
 import paho.mqtt.client as mqtt
 
 BROKER = "broker.hivemq.com"
 PORT = 1883
 BASE_TOPIC = "bpsr_bard/room"
+MAX_MIDI_BYTES = 5 * 1024 * 1024
+MAX_MIDI_B64_CHARS = ((MAX_MIDI_BYTES + 2) // 3) * 4
+MAX_MESSAGE_BYTES = MAX_MIDI_B64_CHARS + 64 * 1024
+MIN_ROOM_CREDENTIAL_LENGTH = 16
 
 # The release build runs with PyInstaller's --windowed flag (no console), so
 # print() output disappears into the void for every real user. Mirror it to a
@@ -83,6 +91,11 @@ class NetworkManager:
         self.client_id = str(uuid.uuid4())
         self.nickname = "Player"
         self.room_code = None
+        self._room_secret = None
+        self._room_topic_id = None
+        self.host_id = None
+        self._seen_message_ids = set()
+        self._seen_message_order = deque()
         self.is_host = False
 
         # Peer-to-peer clock sync (replaces the old one-shot external NTP,
@@ -134,6 +147,8 @@ class NetworkManager:
         return time.time() + self.host_offset
 
     def connect(self):
+        if self.running:
+            return
         self.running = True
         try:
             self.client.connect(BROKER, PORT, 60)
@@ -194,6 +209,8 @@ class NetworkManager:
                        "id": self._sync_id, "t0": time.time()})
 
     def disconnect(self):
+        if not self.running:
+            return
         self.running = False
         self.client.loop_stop()
         self.client.disconnect()
@@ -202,6 +219,11 @@ class NetworkManager:
         """Return to the not-in-a-room state (keeps the MQTT connection so the
         user can host or join again)."""
         self.room_code = None
+        self._room_secret = None
+        self._room_topic_id = None
+        self.host_id = None
+        self._seen_message_ids = set()
+        self._seen_message_order = deque()
         self.is_host = False
         self.room_state = {"players": [], "filename": None}
         self.host_offset = 0.0
@@ -216,7 +238,7 @@ class NetworkManager:
         they're removed from the roster; the room itself stays open."""
         if not self.room_code:
             return
-        topic = f"{BASE_TOPIC}/{self.room_code}"
+        topic = self._room_topic()
         try:
             if not self.is_host:
                 self._publish({"type": "leave", "client_id": self.client_id})
@@ -232,15 +254,16 @@ class NetworkManager:
             return
         try:
             self._publish({"type": "disband"})
-            self.client.unsubscribe(f"{BASE_TOPIC}/{self.room_code}")
+            self.client.unsubscribe(self._room_topic())
         except Exception as e:
             _log(f"Error disbanding room: {e}")
         self._reset_room_state()
 
     def host_room(self, room_code, nickname):
-        self.room_code = room_code.upper()
+        self._configure_room(room_code)
         self.nickname = nickname
         self.is_host = True
+        self.host_id = self.client_id
         self._room_joined_at = time.time()
         self._sync_stall_reported = False
         self.room_state = {
@@ -251,9 +274,10 @@ class NetworkManager:
         self._broadcast_state()
 
     def join_room(self, room_code, nickname):
-        self.room_code = room_code.upper()
+        self._configure_room(room_code)
         self.nickname = nickname
         self.is_host = False
+        self.host_id = None
         self._room_joined_at = time.time()
         self._sync_stall_reported = False
         self._subscribe()
@@ -300,8 +324,13 @@ class NetworkManager:
             return
         self.room_state["filename"] = filename
         try:
+            size = os.path.getsize(file_path)
+            if size > MAX_MIDI_BYTES:
+                raise ValueError(
+                    f"MIDI is too large to share ({size} bytes; "
+                    f"limit is {MAX_MIDI_BYTES})")
             with open(file_path, "rb") as f:
-                data = base64.b64encode(f.read()).decode('utf-8')
+                data = base64.b64encode(f.read()).decode('ascii')
             
             self._publish({
                 "type": "midi_file",
@@ -336,12 +365,83 @@ class NetworkManager:
         })
 
     def _subscribe(self):
-        topic = f"{BASE_TOPIC}/{self.room_code}"
-        self.client.subscribe(topic)
+        self.client.subscribe(self._room_topic())
 
     def _publish(self, payload_dict):
-        topic = f"{BASE_TOPIC}/{self.room_code}"
-        self.client.publish(topic, json.dumps(payload_dict))
+        if not self.room_code:
+            return
+        payload = dict(payload_dict)
+        payload["_sender"] = self.client_id
+        payload["_msg_id"] = uuid.uuid4().hex
+        secret = getattr(self, "_room_secret", None)
+        if secret:
+            payload["_sig"] = self._sign(payload)
+        self.client.publish(self._room_topic(), json.dumps(payload))
+
+    def _configure_room(self, credential):
+        credential = credential.strip()
+        if len(credential) < MIN_ROOM_CREDENTIAL_LENGTH:
+            raise ValueError(
+                f"Room credential must be at least "
+                f"{MIN_ROOM_CREDENTIAL_LENGTH} characters")
+        self.room_code = credential
+        self._room_secret = hashlib.sha256(
+            ("bpsr-room-secret:" + credential).encode("utf-8")).digest()
+        # The secret itself never appears in the public MQTT topic.
+        self._room_topic_id = hashlib.sha256(
+            ("bpsr-room-topic:" + credential).encode("utf-8")
+        ).hexdigest()[:24]
+        self._seen_message_ids = set()
+        self._seen_message_order = deque()
+
+    def _room_topic(self):
+        topic_id = getattr(self, "_room_topic_id", None)
+        if not topic_id:
+            # Compatibility for old in-process test doubles. Real rooms always
+            # go through _configure_room().
+            topic_id = self.room_code
+        return f"{BASE_TOPIC}/{topic_id}"
+
+    def _sign(self, payload):
+        unsigned = {k: v for k, v in payload.items() if k != "_sig"}
+        encoded = json.dumps(
+            unsigned, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False).encode("utf-8")
+        return hmac.new(self._room_secret, encoded, hashlib.sha256).hexdigest()
+
+    def _verify(self, payload):
+        secret = getattr(self, "_room_secret", None)
+        if not secret:
+            return True
+        supplied = payload.get("_sig")
+        return isinstance(supplied, str) and hmac.compare_digest(
+            supplied, self._sign(payload))
+
+    def _accept_message_id(self, payload):
+        """Reject replayed signed packets while keeping bounded memory."""
+        msg_id = payload.get("_msg_id")
+        if not isinstance(msg_id, str) or len(msg_id) != 32:
+            return False
+        try:
+            int(msg_id, 16)
+        except ValueError:
+            return False
+        if msg_id in self._seen_message_ids:
+            return False
+        self._seen_message_ids.add(msg_id)
+        self._seen_message_order.append(msg_id)
+        while len(self._seen_message_order) > 4096:
+            expired = self._seen_message_order.popleft()
+            self._seen_message_ids.discard(expired)
+        return True
+
+    def _unsubscribe_current(self):
+        if not self.room_code:
+            return
+        try:
+            self.client.unsubscribe(self._room_topic())
+        except Exception as e:
+            _log(f"Error unsubscribing from room: {e}")
 
     def _broadcast_state(self):
         if self.is_host:
@@ -409,8 +509,48 @@ class NetworkManager:
 
     def _on_message(self, client, userdata, msg):
         try:
+            if not self.room_code:
+                return
+            if hasattr(msg, "topic") and msg.topic != self._room_topic():
+                return
+            if len(msg.payload) > MAX_MESSAGE_BYTES:
+                _log("Ignored an oversized room message")
+                return
             payload = json.loads(msg.payload.decode('utf-8'))
+            if not isinstance(payload, dict) or not self._verify(payload):
+                _log("Ignored an unsigned or invalidly signed room message")
+                return
             msg_type = payload.get("type")
+            sender = payload.get("_sender")
+            if getattr(self, "_room_secret", None) and not isinstance(sender, str):
+                return
+            if (getattr(self, "_room_secret", None)
+                    and not self._accept_message_id(payload)):
+                return
+
+            # Bind claimed client IDs to the authenticated sender identity.
+            claimed = payload.get("client_id")
+            if (msg_type in {"join", "leave", "heartbeat", "ready"}
+                    and sender and claimed != sender):
+                return
+            if msg_type == "sync_ping" and sender and payload.get("from") != sender:
+                return
+
+            host_only = {
+                "sync_pong", "state", "midi_file", "play", "stop",
+                "disband", "kick",
+            }
+            if msg_type in host_only:
+                expected_host = self.client_id if self.is_host else self.host_id
+                # The first signed state establishes the host identity from the
+                # first roster entry. Subsequent host commands must match it.
+                if not self.is_host and self.host_id is None and msg_type == "state":
+                    players = payload.get("state", {}).get("players", [])
+                    if players:
+                        self.host_id = players[0].get("client_id")
+                        expected_host = self.host_id
+                if expected_host and sender and sender != expected_host:
+                    return
 
             # --- Peer clock sync handshake (handled before everything else) ---
             if msg_type == "sync_ping":
@@ -442,6 +582,7 @@ class NetworkManager:
             # Host closed the room -> clients reset to disconnected.
             if msg_type == "disband":
                 if self.room_code and not self.is_host:
+                    self._unsubscribe_current()
                     self._reset_room_state()
                     if self.on_disband:
                         self.on_disband()
@@ -451,6 +592,7 @@ class NetworkManager:
             if msg_type == "kick":
                 if (self.room_code and not self.is_host
                         and payload.get("client_id") == self.client_id):
+                    self._unsubscribe_current()
                     self._reset_room_state()
                     if self.on_kicked:
                         self.on_kicked()
@@ -502,12 +644,25 @@ class NetworkManager:
             else:
                 # Client processing
                 if msg_type == "state":
-                    self.room_state = payload["state"]
+                    state = payload["state"]
+                    if not isinstance(state, dict) or not isinstance(
+                            state.get("players"), list):
+                        return
+                    self.room_state = state
                     if self.on_state_change:
                         self.on_state_change(self.room_state)
                 elif msg_type == "midi_file":
-                    data = base64.b64decode(payload["data"])
-                    filename = payload["filename"]
+                    encoded = payload["data"]
+                    if not isinstance(encoded, str) or len(encoded) > MAX_MIDI_B64_CHARS:
+                        raise ValueError("Received MIDI exceeds the size limit")
+                    data = base64.b64decode(encoded, validate=True)
+                    if len(data) > MAX_MIDI_BYTES:
+                        raise ValueError("Received MIDI exceeds the size limit")
+                    filename = ntpath.basename(str(payload["filename"]))
+                    if (not filename
+                            or os.path.splitext(filename)[1].lower()
+                            not in {".mid", ".midi"}):
+                        raise ValueError("Received file is not a MIDI file")
                     if self.on_midi_received:
                         self.on_midi_received(filename, data)
 

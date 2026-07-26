@@ -13,7 +13,6 @@
 
 import math
 from dataclasses import dataclass
-from itertools import groupby
 
 # The nine fixed in-game drum voices are defined once in config (the actual
 # keys the game's Drum instrument sounds); import them here so the drum
@@ -187,6 +186,8 @@ def proportional_remap(notes, lo, hi):
     """
     if not notes:
         return
+    if lo > hi:
+        lo, hi = hi, lo
     pitches = [n['note'] for n in notes]
     song_lo, song_hi = min(pitches), max(pitches)
     span = song_hi - song_lo
@@ -219,18 +220,23 @@ def proportional_remap(notes, lo, hi):
 
 def thin_notes(notes, min_gap, min_len):
     """Merge machine-gun same-pitch repeats and drop micro-notes."""
-    # Pass 1: merge re-triggers that come faster than min_gap after the
-    # previous same-pitch note ends (they'd just be dropped keystrokes in-game).
+    # Pass 1: merge re-triggers whose ONSETS are genuinely machine-gun fast.
+    # Measuring silence after the previous note incorrectly merges ordinary
+    # legato repeats at every tempo because quantized MIDI commonly has zero
+    # silence between a note-off and the next note-on.
     merged = []
     last_by_pitch = {}  # (channel, note) -> last kept note dict
+    last_onset = {}
     for n in sorted(notes, key=lambda x: (x['start'], x['note'])):
         key = (n['channel'], n['note'])
         prev = last_by_pitch.get(key)
-        if prev is not None and n['start'] - prev['end'] < min_gap:
+        if prev is not None and n['start'] - last_onset[key] < min_gap:
             prev['end'] = max(prev['end'], n['end'])
+            last_onset[key] = n['start']
             continue
         merged.append(n)
         last_by_pitch[key] = n
+        last_onset[key] = n['start']
     # Pass 2: drop notes still too short to be audible after merging.
     return [n for n in merged if (n['end'] - n['start']) >= min_len]
 
@@ -440,19 +446,37 @@ def apply_melody_lock(notes, chord_window, mode='drop'):
         if not valid:
             valid = [0]
 
-        if current_zone in valid:
-            chosen = current_zone            # hysteresis: don't toggle needlessly
-        else:
-            def fit(z):
-                lo, hi = ZONE_RANGES[z]
-                return sum(1 for n in group if lo <= n['note'] <= hi)
-            chosen = max(valid, key=lambda z: (fit(z), -abs(z - current_zone), z == 0))
+        sounding = active + group
+
+        def fit(z):
+            lo, hi = ZONE_RANGES[z]
+            return sum(1 for n in sounding if lo <= n['note'] <= hi)
+
+        # Keep hysteresis only as a tie-breaker. Previously, merely being
+        # valid for the melody pinned the old zone even when another valid
+        # zone preserved an entire chord.
+        chosen = max(
+            valid,
+            key=lambda z: (fit(z), z == current_zone, z == 0,
+                           -abs(z - current_zone)))
 
         if chosen != current_zone:
             zone_hints.append({'time': gstart, 'value': chosen})
             current_zone = chosen
 
         lo, hi = ZONE_RANGES[chosen]
+        # A forced zone change can make an already-ringing accompaniment note
+        # impossible. End it at the boundary instead of changing modifiers
+        # underneath a physically held key.
+        for n in list(active):
+            if not (lo <= n['note'] <= hi):
+                if n['start'] + MIN_NOTE_LEN <= gstart:
+                    n['end'] = min(n['end'], gstart)
+                elif n in kept:
+                    # Too young to shorten into a pressable note without
+                    # crossing the modifier boundary; omit it altogether.
+                    kept.remove(n)
+                active.remove(n)
         for n in group:
             if lo <= n['note'] <= hi:
                 kept.append(n); active.append(n)
@@ -469,7 +493,7 @@ def apply_melody_lock(notes, chord_window, mode='drop'):
     return zone_hints, kept
 
 
-def assign_auto_parts(notes, sustains, n_parts=2):
+def assign_auto_parts(notes, sustains, n_parts=2, chord_window=0.030):
     """Auto-categorize notes into channels by musical role (skyline split).
 
         channel 0 = melody       (highest voice)
@@ -488,8 +512,8 @@ def assign_auto_parts(notes, sustains, n_parts=2):
 
     ordered = sorted(notes, key=lambda n: n['start'])
     active = []
-    for t, grp in groupby(ordered, key=lambda n: n['start']):
-        grp = list(grp)
+    for grp in group_chords(ordered, max(0.0, chord_window), False):
+        t = min(n['start'] for n in grp)
         active = [a for a in active if a['end'] > t]
         active.extend(grp)
         hi = max(a['note'] for a in active)
@@ -1025,6 +1049,13 @@ def convert(events, settings, orig_bpm=120.0):
     reach_lo, reach_hi = settings.reach_low, settings.reach_high
     lo = max(reach_lo, min(settings.range_low, settings.range_high))
     hi = min(reach_hi, max(settings.range_low, settings.range_high))
+    if lo > hi:
+        # The requested range does not intersect the instrument at all. Clamp
+        # to the nearest reachable edge rather than creating a negative scale.
+        if max(settings.range_low, settings.range_high) < reach_lo:
+            lo = hi = reach_lo
+        else:
+            lo = hi = reach_hi
     if settings.proportional_remap:
         proportional_remap(notes, lo, hi)
     else:
@@ -1056,7 +1087,8 @@ def convert(events, settings, orig_bpm=120.0):
 
     # 7. Channel assignment (auto-split by role supersedes the fixed duet split)
     if settings.auto_split:
-        sustains = assign_auto_parts(notes, sustains, settings.auto_split_parts)
+        sustains = assign_auto_parts(
+            notes, sustains, settings.auto_split_parts, settings.chord_window)
     elif settings.duet_mode:
         sustains = split_duet(notes, sustains, settings.duet_split_note)
 

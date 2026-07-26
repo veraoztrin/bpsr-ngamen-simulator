@@ -2,13 +2,15 @@ import customtkinter as ctk
 from tkinter import filedialog
 import json
 import os
-import random
+import secrets
 import tempfile
 from midi_parser import parse_midi_full, get_channels_info, guess_channel_instrument
 from arranger import ConversionSettings, convert, convert_drum, ABS_LOW, ABS_HIGH
 from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
 from player import MidiPlayer
-from network_sync import NetworkManager
+from network_sync import (
+    NetworkManager, MAX_MIDI_BYTES, MIN_ROOM_CREDENTIAL_LENGTH,
+)
 from live_midi import LiveMidiListener
 try:
     from hotkeys import GlobalHotkeys, VK_F9, VK_F10, VK_F11
@@ -48,8 +50,10 @@ class App(ctk.CTk):
         self.channel_programs = {}   # channel -> GM program number, from the raw MIDI
         self.beats_per_measure = 4
         self.channels = []
+        self.channel_vars = []
         self.host_checkbox_vars = {}
         self.my_ready_status = False
+        self._received_temp_files = set()
         
         self.playlist = [] # list of dicts: {"name": str, "path": str}
         self.current_song_idx = -1
@@ -333,7 +337,7 @@ class App(ctk.CTk):
     def on_transpose(self, val):
         val = int(val)
         self.transpose_label.configure(text=f"Transpose: {val:+d}")
-        self.player.transpose = val
+        self.player.set_transpose(val)
 
     def _inst(self):
         return INSTRUMENTS.get(self.instrument_var.get(), INSTRUMENTS["Piano"])
@@ -381,7 +385,8 @@ class App(ctk.CTk):
         
         self.nick_entry = ctk.CTkEntry(self.conn_frame, placeholder_text="Nickname")
         self.nick_entry.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
-        self.room_entry = ctk.CTkEntry(self.conn_frame, placeholder_text="Room Code")
+        self.room_entry = ctk.CTkEntry(
+            self.conn_frame, placeholder_text="Room Credential")
         self.room_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
         
         self.host_btn = ctk.CTkButton(self.conn_frame, text="Host Room", command=self.host_room)
@@ -489,7 +494,9 @@ class App(ctk.CTk):
         # On natural finish the player already released all keys; with autoplay
         # off we simply stop here instead of loading the next track.
         is_playing_now = self.player.is_playing
-        if self.was_playing and not is_playing_now and not self.player.stop_requested:
+        if (self.was_playing and not is_playing_now
+                and not self.player.stop_requested
+                and not self.player.is_paused):
             if self.autoplay_var.get():
                 self.next_song(autoplay=True)
 
@@ -531,6 +538,8 @@ class App(ctk.CTk):
             self.channels = []
             self.channel_programs = {}
             self.song_info_label.configure(text="")
+            self.player.load_events([], [])
+            self.build_solo_channel_ui()
         else:
             self.current_song_idx = min(self.current_song_idx, len(self.playlist) - 1)
 
@@ -670,6 +679,9 @@ class App(ctk.CTk):
             self.autosplit_seg.set(prefs["autosplit_parts"])
         self.autosplit_var.set(bool(prefs.get("autosplit", False)))
         self.autoplay_var.set(bool(prefs.get("autoplay", False)))
+        # Re-apply after every field has been restored. The instrument callback
+        # above runs before the timing entries are populated.
+        self.reconvert()
 
     def build_settings(self):
         """Collect the conversion panel state into a ConversionSettings."""
@@ -711,9 +723,23 @@ class App(ctk.CTk):
 
     def reconvert(self):
         """Re-run the conversion pipeline on the raw MIDI with current settings."""
-        if not self.raw_events:
-            return
         settings = self.build_settings()
+
+        # Apply input timing knobs + the instrument's key offset even when no
+        # song is loaded; live-MIDI-only users rely on restored preferences.
+        if self.player.simulator:
+            self.player.simulator.shift_delay_ms = self._get_float(self.shift_delay_entry, 30)
+            self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
+            self.player.simulator.retrigger_gap_ms = max(
+                0.0, self._get_float(self.retrigger_gap_entry, 25))
+            self.player.simulator.key_offset = self._inst()["offset"]
+
+        if not self.raw_events:
+            self.events = []
+            self.channels = []
+            self.build_solo_channel_ui()
+            self.player.load_events([], [])
+            return
         is_drum = self._inst().get("is_drum", False)
         if is_drum:
             self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm,
@@ -721,14 +747,6 @@ class App(ctk.CTk):
         else:
             self.events = convert(self.raw_events, settings, orig_bpm=self.orig_bpm)
         self.channels = get_channels_info(self.events)
-
-        # Apply input timing knobs + the instrument's key offset
-        if self.player.simulator:
-            self.player.simulator.shift_delay_ms = self._get_float(self.shift_delay_entry, 30)
-            self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
-            self.player.simulator.retrigger_gap_ms = max(
-                0.0, self._get_float(self.retrigger_gap_entry, 25))
-            self.player.simulator.key_offset = self._inst()["offset"]
 
         # Drum output is always a single channel - ignore any leftover
         # duet/auto-split state from before the instrument was switched, so
@@ -803,11 +821,17 @@ class App(ctk.CTk):
 
     def host_room(self):
         nick = self.nick_entry.get() or "Host"
-        # Random per-session code when left blank - a fixed "1234" fallback
-        # meant two unrelated hosts who both leave the field empty would land
-        # on the *exact same* public MQTT topic (broker.hivemq.com is shared
-        # by anyone) and see/hear each other's rooms.
-        room = self.room_entry.get() or f"{random.randint(1000, 9999)}"
+        # This credential doubles as the room's message-signing secret. Keep it
+        # high entropy; only a hash appears in the public MQTT topic.
+        room = self.room_entry.get().strip() or secrets.token_urlsafe(18)
+        if len(room) < MIN_ROOM_CREDENTIAL_LENGTH:
+            self.status_label.configure(
+                text=f"Room credential must be at least "
+                     f"{MIN_ROOM_CREDENTIAL_LENGTH} characters.",
+                text_color="red")
+            return
+        self.room_entry.delete(0, "end")
+        self.room_entry.insert(0, room)
         try:
             self.network.connect()
         except Exception as e:
@@ -824,8 +848,12 @@ class App(ctk.CTk):
 
     def join_room(self):
         nick = self.nick_entry.get() or "Player"
-        room = self.room_entry.get()
-        if not room:
+        room = self.room_entry.get().strip()
+        if len(room) < MIN_ROOM_CREDENTIAL_LENGTH:
+            self.status_label.configure(
+                text=f"Enter the full room credential (at least "
+                     f"{MIN_ROOM_CREDENTIAL_LENGTH} characters).",
+                text_color="red")
             return
         try:
             self.network.connect()
@@ -978,6 +1006,22 @@ class App(ctk.CTk):
 
         self.host_checkbox_vars = {}
 
+        if not self.network.is_host:
+            me = next((p for p in state.get("players", [])
+                       if p.get("client_id") == self.network.client_id), None)
+            if me is not None:
+                ready = bool(me.get("ready", False))
+                self.my_ready_status = ready
+                if ready:
+                    self.ready_btn.configure(
+                        text="âœ… Ready!", fg_color="green",
+                        hover_color="darkgreen")
+                elif self.network.is_synced:
+                    self.ready_btn.configure(
+                        state="normal", text="I'm Ready!",
+                        fg_color=["#3a7ebf", "#1f538d"],
+                        hover_color=["#325882", "#14375e"])
+
         for p in state["players"]:
             frame = ctk.CTkFrame(self.lobby_frame)
             frame.pack(fill="x", pady=5, padx=5)
@@ -1055,10 +1099,22 @@ class App(ctk.CTk):
         self.player.play(delay_seconds=delay)
 
     def _save_and_load_midi(self, filename, data):
-        temp_dir = tempfile.gettempdir()
-        file_path = os.path.join(temp_dir, filename)
-        with open(file_path, "wb") as f:
+        filename = os.path.basename(str(filename).replace("\\", "/"))
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in {".mid", ".midi"} or not filename:
+            self.status_label.configure(
+                text="Rejected a received non-MIDI file.", text_color="red")
+            return
+        if len(data) > MAX_MIDI_BYTES:
+            self.status_label.configure(
+                text="Rejected an oversized received MIDI.", text_color="red")
+            return
+        temp_file = tempfile.NamedTemporaryFile(
+            mode="wb", prefix="bpsr_received_", suffix=ext, delete=False)
+        file_path = temp_file.name
+        with temp_file as f:
             f.write(data)
+        self._received_temp_files.add(file_path)
         
         # In client mode, we just override current song view (or add to playlist)
         # We will clear playlist and set this as the only song for the client
@@ -1076,6 +1132,11 @@ class App(ctk.CTk):
         self.player.stop()
         self.live_midi.stop_listening()
         self.network.disconnect()
+        for path in self._received_temp_files:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         super().destroy()
 
 if __name__ == "__main__":
