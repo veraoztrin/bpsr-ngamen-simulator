@@ -76,6 +76,7 @@ def make_sim(gap_ms=0):
     isim.press_key = lambda vk: log.append(('DOWN', VK_NAME.get(vk, hex(vk))))
     isim.release_key = lambda vk: log.append(('UP', VK_NAME.get(vk, hex(vk))))
     sim = isim.BPSRInputSimulator()
+    sim.focus_guard_enabled = False
     sim.retrigger_gap_ms = gap_ms
     sim.shift_delay_ms = 0
     sim.shift_hold_ms = 0
@@ -263,6 +264,17 @@ def test_runtime_gap_is_enforced():
     check("press waits out the remaining key-up time", elapsed >= 0.015,
           f"waited {elapsed * 1000:.1f}ms")
     sim.release_note(60)
+
+
+def test_focus_guard_blocks_key_down_outside_target():
+    print("[foreground-window safety]")
+    sim, log = make_sim()
+    sim.focus_guard_enabled = True
+    sim.target_window_text = "Blue Protocol"
+    sim.foreground_window_title = lambda: "Notes - Personal"
+    sim.press_note(60)
+    check("wrong foreground window blocks input", log == [], f"got {log}")
+    check("blocked press is not reference-counted", sim.key_refs == {})
 
 
 def test_stray_note_off_is_safe():

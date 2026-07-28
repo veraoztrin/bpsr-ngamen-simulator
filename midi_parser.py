@@ -1,7 +1,11 @@
 import mido
+import os
 
 DEFAULT_BPM = 120.0
 DEFAULT_BEATS_PER_MEASURE = 4
+MAX_LOCAL_MIDI_BYTES = 20 * 1024 * 1024
+MAX_MIDI_EVENTS = 500_000
+MAX_MIDI_DURATION_SECONDS = 6 * 60 * 60
 
 # Standard General MIDI Level 1 program families. GM groups its 128 patches
 # into 16 families of 8 consecutive program numbers each - e.g. programs
@@ -59,6 +63,10 @@ def parse_midi_full(file_path):
     Types can be 'note_on', 'note_off', 'sustain'
     """
     try:
+        if (os.path.exists(file_path)
+                and os.path.getsize(file_path) > MAX_LOCAL_MIDI_BYTES):
+            raise ValueError(
+                f"MIDI exceeds the {MAX_LOCAL_MIDI_BYTES // (1024 * 1024)} MiB limit")
         mid = mido.MidiFile(file_path)
     except Exception as e:
         print(f"Error loading MIDI: {e}")
@@ -74,6 +82,14 @@ def parse_midi_full(file_path):
     # msg.time is the delta time in seconds since the last yielded message.
     for msg in mid:
         current_time += msg.time
+        if (len(all_events) >= MAX_MIDI_EVENTS
+                or current_time > MAX_MIDI_DURATION_SECONDS):
+            print("Error loading MIDI: event-count or duration safety limit exceeded")
+            return {
+                'events': [], 'bpm': DEFAULT_BPM,
+                'beats_per_measure': DEFAULT_BEATS_PER_MEASURE,
+                'channel_programs': {},
+            }
 
         if msg.type == 'set_tempo':
             # Remember the FIRST tempo as the song's nominal BPM.

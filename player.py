@@ -1,5 +1,6 @@
 import time
 import threading
+import math
 try:
     from input_simulator import BPSRInputSimulator
 except Exception:
@@ -103,6 +104,13 @@ class MidiPlayer:
         with self._state_lock:
             if self.is_playing:
                 return
+        try:
+            delay_seconds = float(delay_seconds)
+        except (TypeError, ValueError):
+            delay_seconds = 0.0
+        if not math.isfinite(delay_seconds):
+            delay_seconds = 0.0
+        delay_seconds = min(max(delay_seconds, 0.0), 30.0)
         self._cancel_worker()
         with self._state_lock:
             if self.is_paused:
@@ -224,6 +232,9 @@ class MidiPlayer:
                 break
             now = time.perf_counter()
             diff = target_time - now
+            if not math.isfinite(diff):
+                cancel.set()
+                break
             if diff <= 0:
                 break
             if diff > self.sleep_threshold:

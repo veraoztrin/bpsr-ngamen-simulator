@@ -1,9 +1,11 @@
 import customtkinter as ctk
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 import json
 import os
 import secrets
 import tempfile
+import math
+import threading
 from midi_parser import parse_midi_full, get_channels_info, guess_channel_instrument
 from arranger import ConversionSettings, convert, convert_drum, ABS_LOW, ABS_HIGH
 from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
@@ -29,7 +31,8 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Blue Protocol MIDI Bard Player - Multiplayer")
-        self.geometry("720x900")
+        self.geometry("820x940")
+        self.minsize(720, 700)
         self.player = MidiPlayer()
         self.live_midi = LiveMidiListener(self.player.simulator)
         self.network = NetworkManager(
@@ -53,7 +56,10 @@ class App(ctk.CTk):
         self.channel_vars = []
         self.host_checkbox_vars = {}
         self.my_ready_status = False
+        self._known_room_players = set()
         self._received_temp_files = set()
+        self._parse_generation = 0
+        self._closing = False
         
         self.playlist = [] # list of dicts: {"name": str, "path": str}
         self.current_song_idx = -1
@@ -125,7 +131,13 @@ class App(ctk.CTk):
         # Global hotkeys: work even while the game window has focus.
         # Callbacks fire on the listener thread -> marshal onto the Tk loop.
         self.hotkeys = None
-        if GlobalHotkeys:
+        if GlobalHotkeys and self.global_hotkeys_var.get():
+            self._start_global_hotkeys()
+
+        self.update_led_loop()
+
+    def _start_global_hotkeys(self):
+        if GlobalHotkeys and self.hotkeys is None:
             self.hotkeys = GlobalHotkeys({
                 VK_F9:  lambda: self.after(0, self.hotkey_play),    # start / resume
                 VK_F10: lambda: self.after(0, self.player.pause),   # pause
@@ -133,7 +145,12 @@ class App(ctk.CTk):
             })
             self.hotkeys.start()
 
-        self.update_led_loop()
+    def toggle_global_hotkeys(self):
+        if self.global_hotkeys_var.get():
+            self._start_global_hotkeys()
+        elif self.hotkeys:
+            self.hotkeys.stop()
+            self.hotkeys = None
 
     def hotkey_play(self):
         # F9 starts playback, or resumes it when paused.
@@ -155,6 +172,10 @@ class App(ctk.CTk):
         self.device_var = ctk.StringVar(value="None")
         self.device_menu = ctk.CTkOptionMenu(self.live_midi_frame, values=devices, variable=self.device_var, command=self.on_midi_device_select)
         self.device_menu.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.refresh_devices_btn = ctk.CTkButton(
+            self.live_midi_frame, text="Refresh", width=70,
+            command=self.refresh_midi_devices)
+        self.refresh_devices_btn.grid(row=0, column=2, padx=(0, 10), pady=10)
 
         # Play Controls
         self.control_frame = ctk.CTkFrame(self.tab_solo)
@@ -320,6 +341,32 @@ class App(ctk.CTk):
         ctk.CTkLabel(row5, text="raise if repeated notes sound like one long note",
                      text_color="gray").pack(side="left")
 
+        safety_row = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        safety_row.pack(fill="x", padx=10, pady=(0, 8))
+        self.focus_guard_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            safety_row, text="Only send keys when this window is focused:",
+            variable=self.focus_guard_var, command=self.reconvert).pack(side="left")
+        self.target_window_entry = ctk.CTkEntry(safety_row, width=150)
+        self.target_window_entry.insert(0, "Blue Protocol")
+        self.target_window_entry.pack(side="left", padx=6)
+        self.global_hotkeys_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(
+            safety_row, text="Global F9–F11",
+            variable=self.global_hotkeys_var,
+            command=self.toggle_global_hotkeys).pack(side="left", padx=8)
+        ctk.CTkLabel(safety_row, text="Start delay:").pack(side="left")
+        self.solo_delay_entry = ctk.CTkEntry(safety_row, width=40)
+        self.solo_delay_entry.insert(0, "2")
+        self.solo_delay_entry.pack(side="left", padx=4)
+        ctk.CTkButton(
+            safety_row, text="Reset settings", width=100,
+            command=self.reset_settings).pack(side="right")
+
+        self.settings_error_label = ctk.CTkLabel(
+            self.conv_frame, text="", text_color="#ff6b6b")
+        self.settings_error_label.pack(fill="x", padx=10, pady=(0, 6))
+
         # Rows that only make sense for a pitch-based instrument (chord size,
         # note-shaping checkboxes, range/duet/timing, channel auto-split) -
         # hidden in Drum mode, which just auto-generates a beat instead.
@@ -374,6 +421,42 @@ class App(ctk.CTk):
         else:
             self.live_midi.start_listening(choice)
 
+    def refresh_midi_devices(self):
+        current = self.device_var.get()
+        devices = ["None"] + self.live_midi.get_devices()
+        self.device_menu.configure(values=devices)
+        if current not in devices:
+            self.device_var.set("None")
+            self.live_midi.stop_listening()
+
+    def reset_settings(self):
+        defaults = {
+            self.bpm_entry: "",
+            self.speed_entry: "1.0",
+            self.range_low_entry: midi_to_note_name(self._inst()["low"]),
+            self.range_high_entry: midi_to_note_name(self._inst()["high"]),
+            self.duet_split_entry: "C4",
+            self.shift_delay_entry: "30",
+            self.shift_hold_entry: "10",
+            self.retrigger_gap_entry: "25",
+            self.solo_delay_entry: "2",
+        }
+        for entry, value in defaults.items():
+            entry.delete(0, "end")
+            entry.insert(0, value)
+        for var in self.conv_vars.values():
+            var.set(False)
+        self.max_chord_seg.set("5")
+        self.autosplit_var.set(False)
+        self.autosplit_seg.set("2")
+        self.autoplay_var.set(False)
+        self.focus_guard_var.set(True)
+        self.global_hotkeys_var.set(True)
+        self.toggle_global_hotkeys()
+        self.target_window_entry.delete(0, "end")
+        self.target_window_entry.insert(0, "Blue Protocol")
+        self.reconvert()
+
     def setup_multi_tab(self):
         self.tab_multi.grid_columnconfigure(0, weight=1)
         self.tab_multi.grid_rowconfigure(2, weight=1)
@@ -388,6 +471,10 @@ class App(ctk.CTk):
         self.room_entry = ctk.CTkEntry(
             self.conn_frame, placeholder_text="Room Credential")
         self.room_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
+        self.copy_room_btn = ctk.CTkButton(
+            self.conn_frame, text="Copy", width=55,
+            command=self.copy_room_credential)
+        self.copy_room_btn.grid(row=0, column=2, padx=(0, 5), pady=5)
         
         self.host_btn = ctk.CTkButton(self.conn_frame, text="Host Room", command=self.host_room)
         self.host_btn.grid(row=1, column=0, padx=5, pady=5, sticky="ew")
@@ -481,7 +568,17 @@ class App(ctk.CTk):
         self._refresh_progress_bar()  # instant feedback, don't wait for the next 200ms tick
 
     def update_led_loop(self):
-        if self.player.is_syncing:
+        simulator = self.player.simulator
+        focus_blocked = bool(
+            self.player.is_playing and simulator
+            and simulator.focus_guard_enabled and not simulator.is_target_focused())
+        if focus_blocked:
+            if (simulator.key_refs or simulator.sustain_active
+                    or simulator.current_octave_shift):
+                simulator.release_all()
+            self.led_label.configure(
+                text="🟠 Focus game", text_color="orange")
+        elif self.player.is_syncing:
             self.led_label.configure(text="🟡 Syncing...", text_color="yellow")
         elif self.player.is_playing:
             self.led_label.configure(text="🟢 Playing", text_color="green")
@@ -528,6 +625,7 @@ class App(ctk.CTk):
         no way to clear out songs once loaded)."""
         if not (0 <= self.current_song_idx < len(self.playlist)):
             return
+        self._parse_generation += 1
         self.player.stop()
         del self.playlist[self.current_song_idx]
 
@@ -581,35 +679,60 @@ class App(ctk.CTk):
             song = self.playlist[self.current_song_idx]
             self.song_var.set(song["name"])
             self.player.stop()
-            self._parse_and_load(song["path"])
-            
-            if autoplay:
-                self.play_solo()
+            self._parse_and_load(
+                song["path"], on_loaded=self.play_solo if autoplay else None)
             
             if self.network.room_code and self.network.is_host:
                 self.network.share_midi(song["path"], song["name"])
             if self.network.room_code:
                 self._update_lobby_ui(self.network.room_state)
 
-    def _parse_and_load(self, file_path):
-        parsed = parse_midi_full(file_path)
+    def _parse_and_load(self, file_path, on_loaded=None):
+        """Parse potentially large files without freezing Tk's event loop."""
+        self._parse_generation += 1
+        generation = self._parse_generation
+        self.player.stop()
+        self.raw_events = []
+        self.events = []
+        self.player.load_events([], [])
+        self.song_info_label.configure(text="Loading and checking MIDI…")
+        if self.network.room_code and not self.network.is_host:
+            if self.my_ready_status:
+                self.network.send_ready_status(False)
+            self.my_ready_status = False
+            self.ready_btn.configure(state="disabled", text="Loading MIDI…")
+
+        def worker():
+            parsed = parse_midi_full(file_path)
+            if not self._closing:
+                self.after(0, self._finish_parse, generation, parsed, on_loaded)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_parse(self, generation, parsed, on_loaded=None):
+        if generation != self._parse_generation:
+            return
         self.raw_events = parsed['events']
         self.orig_bpm = parsed['bpm']
         self.beats_per_measure = parsed['beats_per_measure']
         self.channel_programs = parsed.get('channel_programs', {})
         self.song_info_label.configure(
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4")
-        self.reconvert()
+        if not self.raw_events:
+            self.settings_error_label.configure(
+                text="The file has no playable MIDI notes or could not be parsed.")
+        if self.reconvert() and on_loaded:
+            on_loaded()
+        if (self.network.room_code and not self.network.is_host
+                and self.network.is_synced and self.raw_events):
+            self.ready_btn.configure(state="normal", text="I'm Ready!")
 
     def _get_float(self, entry, default):
         try:
-            return float(entry.get().replace(",", "."))
+            value = float(entry.get().replace(",", "."))
+            return value if math.isfinite(value) else default
         except (ValueError, AttributeError):
             return default
-
-    def _get_note(self, entry, default):
-        val = note_name_to_midi(entry.get())
-        return val if val is not None else default
 
     def save_prefs(self):
         """Persist the conversion panel so it survives closing the app
@@ -630,6 +753,10 @@ class App(ctk.CTk):
                 "autosplit_parts": self.autosplit_seg.get(),
                 "instrument": self.instrument_var.get(),
                 "autoplay": self.autoplay_var.get(),
+                "focus_guard": self.focus_guard_var.get(),
+                "target_window": self.target_window_entry.get(),
+                "global_hotkeys": self.global_hotkeys_var.get(),
+                "solo_delay": self.solo_delay_entry.get(),
             }
             os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
             with open(PREFS_PATH, "w", encoding="utf-8") as f:
@@ -679,23 +806,54 @@ class App(ctk.CTk):
             self.autosplit_seg.set(prefs["autosplit_parts"])
         self.autosplit_var.set(bool(prefs.get("autosplit", False)))
         self.autoplay_var.set(bool(prefs.get("autoplay", False)))
+        self.focus_guard_var.set(bool(prefs.get("focus_guard", True)))
+        self.global_hotkeys_var.set(bool(prefs.get("global_hotkeys", True)))
+        _set_entry(
+            self.target_window_entry,
+            prefs.get("target_window", "Blue Protocol"))
+        _set_entry(self.solo_delay_entry, prefs.get("solo_delay", "2"))
         # Re-apply after every field has been restored. The instrument callback
         # above runs before the timing entries are populated.
         self.reconvert()
 
     def build_settings(self):
         """Collect the conversion panel state into a ConversionSettings."""
-        bpm_text = self.bpm_entry.get().strip()
-        bpm_override = None
-        if bpm_text:
+        def finite_float(entry, label, low, high, allow_blank=False):
+            text = entry.get().strip().replace(",", ".")
+            if allow_blank and not text:
+                return None
             try:
-                bpm_override = float(bpm_text.replace(",", "."))
+                value = float(text)
             except ValueError:
-                pass
+                raise ValueError(f"{label} must be a number.")
+            if not math.isfinite(value) or not low <= value <= high:
+                raise ValueError(f"{label} must be between {low:g} and {high:g}.")
+            return value
+
+        def midi_note(entry, label):
+            value = note_name_to_midi(entry.get())
+            if value is None or not 0 <= value <= 127:
+                raise ValueError(
+                    f"{label} must be a note such as C4 or a MIDI number from 0 to 127.")
+            return value
+
+        bpm_override = finite_float(
+            self.bpm_entry, "BPM", 20, 400, allow_blank=True)
+        speed = finite_float(self.speed_entry, "Speed", 0.1, 4)
+        range_low = midi_note(self.range_low_entry, "Range start")
+        range_high = midi_note(self.range_high_entry, "Range end")
+        duet_split = midi_note(self.duet_split_entry, "Duet split")
+        shift_delay = finite_float(
+            self.shift_delay_entry, "Shift delay", 0, 500)
+        shift_hold = finite_float(
+            self.shift_hold_entry, "Shift hold", 0, 500)
+        retrigger_ms = finite_float(
+            self.retrigger_gap_entry, "Retrigger gap", 0, 500)
+        finite_float(self.solo_delay_entry, "Start delay", 0, 10)
 
         s = ConversionSettings(
             bpm_override=bpm_override,
-            speed=max(0.1, self._get_float(self.speed_entry, 1.0)),
+            speed=speed,
             max_chord_notes=int(self.max_chord_seg.get()),
             note_thinning=self.conv_vars["note_thinning"].get(),
             cull_low_priority=self.conv_vars["cull_low_priority"].get(),
@@ -707,39 +865,48 @@ class App(ctk.CTk):
             melody_lock=self.conv_vars["melody_lock"].get(),
             melody_lock_mode='drop',
             duet_mode=self.conv_vars["duet_mode"].get(),
-            duet_split_note=self._get_note(self.duet_split_entry, 60),
+            duet_split_note=duet_split,
             auto_split=self.autosplit_var.get(),
             auto_split_parts=int(self.autosplit_seg.get()),
             disable_sustain=self.conv_vars["disable_sustain"].get(),
             reach_low=self._inst()["low"],
             reach_high=self._inst()["high"],
             instrument_offset=self._inst()["offset"],
-            range_low=self._get_note(self.range_low_entry, ABS_LOW),
-            range_high=self._get_note(self.range_high_entry, ABS_HIGH),
-            retrigger_gap=max(0.0, self._get_float(self.retrigger_gap_entry, 25)) / 1000.0,
+            range_low=range_low,
+            range_high=range_high,
+            retrigger_gap=retrigger_ms / 1000.0,
         )
+        s._shift_delay_ms = shift_delay
+        s._shift_hold_ms = shift_hold
         self.save_prefs()
         return s
 
     def reconvert(self):
         """Re-run the conversion pipeline on the raw MIDI with current settings."""
-        settings = self.build_settings()
+        try:
+            settings = self.build_settings()
+        except ValueError as exc:
+            self.settings_error_label.configure(text=str(exc))
+            return False
+        self.settings_error_label.configure(text="")
 
         # Apply input timing knobs + the instrument's key offset even when no
         # song is loaded; live-MIDI-only users rely on restored preferences.
         if self.player.simulator:
-            self.player.simulator.shift_delay_ms = self._get_float(self.shift_delay_entry, 30)
-            self.player.simulator.shift_hold_ms = self._get_float(self.shift_hold_entry, 10)
-            self.player.simulator.retrigger_gap_ms = max(
-                0.0, self._get_float(self.retrigger_gap_entry, 25))
+            self.player.simulator.shift_delay_ms = settings._shift_delay_ms
+            self.player.simulator.shift_hold_ms = settings._shift_hold_ms
+            self.player.simulator.retrigger_gap_ms = settings.retrigger_gap * 1000.0
             self.player.simulator.key_offset = self._inst()["offset"]
+            self.player.simulator.focus_guard_enabled = self.focus_guard_var.get()
+            self.player.simulator.target_window_text = (
+                self.target_window_entry.get().strip() or "Blue Protocol")
 
         if not self.raw_events:
             self.events = []
             self.channels = []
             self.build_solo_channel_ui()
             self.player.load_events([], [])
-            return
+            return True
         is_drum = self._inst().get("is_drum", False)
         if is_drum:
             self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm,
@@ -755,9 +922,18 @@ class App(ctk.CTk):
                                    auto=(settings.auto_split and not is_drum),
                                    parts=settings.auto_split_parts)
         self.player.load_events(self.events, self.channels)
+        raw_notes = sum(
+            ev.get("type") == "note_on" for ev in self.raw_events)
+        output_notes = sum(
+            ev.get("type") == "note_on" for ev in self.events)
+        duration = self.events[-1]["time"] if self.events else 0
+        self.song_info_label.configure(
+            text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4 · "
+                 f"{output_notes}/{raw_notes} notes · {duration:.1f}s")
 
         if self.network.room_code:
             self._update_lobby_ui(self.network.room_state)
+        return True
 
     def _channel_ranges(self):
         """Lowest/highest MIDI note per channel in the converted events."""
@@ -815,44 +991,72 @@ class App(ctk.CTk):
     def play_solo(self):
         self.update_solo_channels()
         if self.events:
-            self.player.play()
+            text = self.solo_delay_entry.get().strip().replace(",", ".")
+            try:
+                delay = float(text)
+            except ValueError:
+                delay = -1
+            if not math.isfinite(delay) or not 0 <= delay <= 10:
+                self.settings_error_label.configure(
+                    text="Start delay must be between 0 and 10 seconds.")
+                return
+            if self.player.simulator and self.player.simulator.is_target_focused():
+                delay = 0.0
+            self.player.play(delay_seconds=delay)
 
     # --- Networking ---
+
+    def copy_room_credential(self):
+        room = self.room_entry.get().strip()
+        if not room:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(room)
+        self.status_label.configure(
+            text="Room invitation copied to clipboard.", text_color="green")
 
     def host_room(self):
         nick = self.nick_entry.get() or "Host"
         # This credential doubles as the room's message-signing secret. Keep it
         # high entropy; only a hash appears in the public MQTT topic.
-        room = self.room_entry.get().strip() or secrets.token_urlsafe(18)
+        room = self.room_entry.get().strip() or secrets.token_urlsafe(24)
         if len(room) < MIN_ROOM_CREDENTIAL_LENGTH:
             self.status_label.configure(
                 text=f"Room credential must be at least "
                      f"{MIN_ROOM_CREDENTIAL_LENGTH} characters.",
                 text_color="red")
             return
-        self.room_entry.delete(0, "end")
-        self.room_entry.insert(0, room)
         try:
             self.network.connect()
         except Exception as e:
             self.status_label.configure(text=f"Couldn't connect: {e}", text_color="red")
             return
-        self.network.host_room(room, nick)
-        self.status_label.configure(text=f"Hosting Room: {room} | Waiting for players...", text_color="green")
+        try:
+            room = self.network.host_room(room, nick)
+        except ValueError as exc:
+            self.status_label.configure(text=str(exc), text_color="red")
+            return
+        self.room_entry.delete(0, "end")
+        self.room_entry.insert(0, room)
+        self.status_label.configure(
+            text="Hosting securely. Copy the invitation to your players.",
+            text_color="green")
         self.sync_label.configure(text="🕐 Clock: host (reference)", text_color="gray")
         self.sync_play_btn.configure(state="normal")
         self.sync_stop_btn.configure(state="normal")
         self.disband_btn.configure(state="normal")
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
+        if 0 <= self.current_song_idx < len(self.playlist):
+            song = self.playlist[self.current_song_idx]
+            self.network.share_midi(song["path"], song["name"])
 
     def join_room(self):
         nick = self.nick_entry.get() or "Player"
         room = self.room_entry.get().strip()
-        if len(room) < MIN_ROOM_CREDENTIAL_LENGTH:
+        if not room.startswith("bpsr2."):
             self.status_label.configure(
-                text=f"Enter the full room credential (at least "
-                     f"{MIN_ROOM_CREDENTIAL_LENGTH} characters).",
+                text="Enter the complete bpsr2 room invitation from the host.",
                 text_color="red")
             return
         try:
@@ -860,8 +1064,13 @@ class App(ctk.CTk):
         except Exception as e:
             self.status_label.configure(text=f"Couldn't connect: {e}", text_color="red")
             return
-        self.network.join_room(room, nick)
-        self.status_label.configure(text=f"Joined Room: {room}", text_color="green")
+        try:
+            self.network.join_room(room, nick)
+        except ValueError as exc:
+            self.status_label.configure(text=str(exc), text_color="red")
+            return
+        self.status_label.configure(
+            text="Joined secure room.", text_color="green")
         self.sync_label.configure(text="🕐 Syncing clock…", text_color="orange")
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
@@ -870,6 +1079,7 @@ class App(ctk.CTk):
         # can start a song before the timing is aligned.
         self.ready_btn.configure(state="disabled", text="Syncing clock…")
         self.my_ready_status = False
+        self._known_room_players = set()
 
     def leave_room(self):
         self.network.leave_room()
@@ -915,6 +1125,7 @@ class App(ctk.CTk):
         self.disband_btn.configure(state="disabled")
         self.leave_btn.configure(state="disabled")
         self.my_ready_status = False
+        self._known_room_players = set()
         for widget in self.lobby_frame.winfo_children():
             widget.destroy()
 
@@ -938,7 +1149,20 @@ class App(ctk.CTk):
     # --- Callbacks from NetworkManager (Run in background thread, schedule UI updates) ---
 
     def on_network_state(self, state):
-        self.after(0, self._update_lobby_ui, state)
+        self.after(0, self._handle_network_state, state)
+
+    def _handle_network_state(self, state):
+        player_ids = {
+            p.get("client_id") for p in state.get("players", [])
+            if isinstance(p, dict)
+        }
+        newcomers = player_ids - self._known_room_players - {self.network.client_id}
+        self._known_room_players = player_ids
+        if (newcomers and self.network.is_host
+                and 0 <= self.current_song_idx < len(self.playlist)):
+            song = self.playlist[self.current_song_idx]
+            self.network.share_midi(song["path"], song["name"])
+        self._update_lobby_ui(state)
 
     def on_network_play(self, global_start_time, my_channels):
         self.after(0, self._trigger_play, global_start_time, my_channels)
@@ -1090,7 +1314,7 @@ class App(ctk.CTk):
 
         delay = global_start_time - self.network.get_global_time()
         # Manual calibration nudge (ms): +later / -earlier.
-        nudge = self._get_float(self.nudge_entry, 0.0) / 1000.0
+        nudge = min(max(self._get_float(self.nudge_entry, 0.0), -500), 500) / 1000.0
         delay += nudge
         if delay < 0:
             delay = 0.0  # start immediately if the target moment already passed
@@ -1109,6 +1333,13 @@ class App(ctk.CTk):
             self.status_label.configure(
                 text="Rejected an oversized received MIDI.", text_color="red")
             return
+        if not messagebox.askyesno(
+                "Accept shared MIDI?",
+                f"The authenticated host shared “{filename}” "
+                f"({len(data) / 1024:.1f} KiB).\n\nLoad it now?"):
+            self.status_label.configure(
+                text="Shared MIDI declined.", text_color="gray")
+            return
         temp_file = tempfile.NamedTemporaryFile(
             mode="wb", prefix="bpsr_received_", suffix=ext, delete=False)
         file_path = temp_file.name
@@ -1126,6 +1357,8 @@ class App(ctk.CTk):
         self._parse_and_load(file_path)
 
     def destroy(self):
+        self._closing = True
+        self._parse_generation += 1
         self.save_prefs()  # catch any change that never triggered a reconvert
         if self.hotkeys:
             self.hotkeys.stop()

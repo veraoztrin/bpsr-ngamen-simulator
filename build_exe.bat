@@ -2,7 +2,7 @@
 REM Builds the standalone BPSR_MIDI_Player.exe into the dist\ folder.
 REM Requires Python 3.8+ with the app dependencies already installed.
 
-py -m pip install pyinstaller
+py -m pip install pyinstaller==6.16.0
 py -m PyInstaller --onefile --windowed --name BPSR_MIDI_Player ^
   --collect-all customtkinter ^
   --hidden-import mido.backends.rtmidi ^

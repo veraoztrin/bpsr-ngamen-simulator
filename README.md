@@ -19,13 +19,15 @@ A plug-and-play desktop application designed to read standard MIDI (`.mid`) file
 - **Autoplay toggle:** When on, playback advances to the next loaded MIDI when a track finishes; when off (the default), it stops and releases all keys at the end of each track. Found next to the play controls in the Solo tab.
 - **Leave / Disband room:** Clients can **Leave Room** at any time (they drop off the host's roster and can join another room); the host can **Disband Lobby** to close the room, which returns every connected player to the disconnected state.
 - **Peer-to-peer clock sync:** In multiplayer, each client measures its clock offset directly against the host over the network (NTP-style ping/pong), instead of relying on an external time server that firewalls often block. The lobby shows a live "Synced ±X ms" accuracy readout, and **Ready** stays locked until the clock is aligned — so players start together, not seconds apart. A per-player **Sync nudge (ms)** knob lets you dial out the last few milliseconds of residual offset (from network path asymmetry or input latency) by ear — set it once for your connection.
-- **Signed private rooms:** Leaving the room field blank generates a high-entropy room credential. Share the full credential privately with the other players; only a one-way hash appears in the public broker topic, and every room command/file is signed. Short legacy room codes are intentionally rejected.
+- **Authenticated private rooms:** Leaving the room field blank generates a high-entropy `bpsr2` invitation that pins the host's Ed25519 public key. Every participant has a separate signing identity, host-only commands cannot be forged by another room member, and replayed packets are rejected.
+- **Encrypted multiplayer:** MQTT uses certificate-validated TLS on port 8883. Shared MIDI files carry a SHA-256 checksum and require confirmation before replacing a client's playlist.
+- **Focus safety:** Key-down events are blocked unless a window whose title contains `Blue Protocol` is focused. The target text and global F9–F11 hotkeys can be changed or disabled in the Solo tab.
 
 ## Conversion Settings (v0.4)
 
 The Solo tab includes a conversion panel that re-transcribes the loaded MIDI on the fly. Toggle options and hit **↻ Re-convert** (checkboxes apply instantly):
 
-- **Instrument:** Choose the in-game instrument before (or after) loading a MIDI. **Piano** (default) uses the full keyboard range (C2–B6) and behaves exactly as before. **Guitar** fits everything into E2–B4. **Bass** fits into E1–B2 — the in-game bass keyboard is the piano layout transposed down two octaves, so the app applies a matching key offset and the notes come out at the right pitch. Selecting an instrument sets the **Range** to its playable window, and all notes are transcribed/octave-folded to fit; you can still fine-tune the Range afterward. Each instrument is one line in `config.py`'s `INSTRUMENTS` table (`low`/`high` sounding range + `offset` if its keyboard is transposed from the piano's).
+- **Instrument:** Choose the in-game instrument before (or after) loading a MIDI. **Piano** (default) uses the full keyboard range (C2–B6) and behaves exactly as before. **Guitar** fits everything into E2–B4. **Bass** fits into E1–B2 — the in-game bass keyboard is the piano layout transposed down three octaves, so the app applies a matching key offset and the notes come out at the right pitch. Selecting an instrument sets the **Range** to its playable window, and all notes are transcribed/octave-folded to fit; you can still fine-tune the Range afterward. Each instrument is one line in `config.py`'s `INSTRUMENTS` table (`low`/`high` sounding range + `offset` if its keyboard is transposed from the piano's).
 
 - **BPM (override):** Play the song at a different tempo than the file's original (shown next to the panel title, along with the time signature).
 - **Speed:** Simple playback speed multiplier (e.g. `0.5` = half speed, `2.0` = double).
@@ -56,12 +58,13 @@ You have two options to run this application:
 
 ### Option 2: Run from Source
 1. Clone this repository.
-2. Install Python 3.8+
+2. Install Python 3.11+
 3. Install the dependencies:
    ```bash
    pip install -r requirements.txt
    ```
-   *(Dependencies: `mido`, `customtkinter`)*
+   *(Dependencies include `mido`, `customtkinter`, `paho-mqtt`, and
+   `cryptography`; `python-rtmidi` enables optional live-keyboard input.)*
 4. Run the app:
    ```bash
    python main.py

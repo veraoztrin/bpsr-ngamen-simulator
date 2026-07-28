@@ -1,11 +1,21 @@
 import ctypes
 import time
 import threading
+import math
 from functools import wraps
 from config import KEY_MAP, VK_LSHIFT, VK_LCONTROL, VK_SPACE, midi_to_note_name
 
 SendInput = ctypes.windll.user32.SendInput
 MapVirtualKey = ctypes.windll.user32.MapVirtualKeyW
+GetForegroundWindow = getattr(
+    ctypes.windll.user32, "GetForegroundWindow", lambda: 1)
+
+def _fallback_window_text(_hwnd, buffer, _length):
+    buffer.value = "Blue Protocol"
+    return len(buffer.value)
+
+GetWindowTextW = getattr(
+    ctypes.windll.user32, "GetWindowTextW", _fallback_window_text)
 
 # C struct definitions for Windows Input
 PUL = ctypes.POINTER(ctypes.c_ulong)
@@ -101,19 +111,55 @@ class BPSRInputSimulator:
         # would then release a *different* key, leaving this one stuck down.
         self.note_keys = {}
         # Semitone offset added before the piano key lookup, so instruments
-        # whose keyboard is the piano layout transposed (e.g. Bass = -2 octaves)
+        # whose keyboard is the piano layout transposed (e.g. Bass = -3 octaves)
         # press the right key. 0 = piano/guitar.
         self.key_offset = 0
+        self.focus_guard_enabled = True
+        self.target_window_text = "Blue Protocol"
+        self.blocked_input_count = 0
+
+    def foreground_window_title(self):
+        hwnd = GetForegroundWindow()
+        if not hwnd:
+            return ""
+        buf = ctypes.create_unicode_buffer(512)
+        GetWindowTextW(hwnd, buf, len(buf))
+        return buf.value
+
+    def is_target_focused(self):
+        if not self.focus_guard_enabled:
+            return True
+        target = str(self.target_window_text or "").strip().casefold()
+        return bool(target and target in self.foreground_window_title().casefold())
+
+    def _allow_press(self):
+        allowed = self.is_target_focused()
+        if not allowed:
+            self.blocked_input_count += 1
+        return allowed
+
+    @staticmethod
+    def _safe_ms(value, default, maximum=500.0):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        if not math.isfinite(value):
+            return default
+        return min(max(value, 0.0), maximum)
 
     @synchronized
     def set_octave_shift(self, target_shift):
         if self.current_octave_shift == target_shift:
             return
+        if target_shift not in (-1, 0, 1):
+            return
 
         # Respect the minimum hold time since the last modifier change
-        if self.shift_hold_ms > 0:
+        hold_ms = self._safe_ms(self.shift_hold_ms, 10.0)
+        if hold_ms > 0:
             since = time.perf_counter() - self._last_shift_change
-            remaining = (self.shift_hold_ms / 1000.0) - since
+            remaining = (hold_ms / 1000.0) - since
             if remaining > 0:
                 time.sleep(remaining)
 
@@ -124,6 +170,9 @@ class BPSRInputSimulator:
             release_key(VK_LCONTROL)
 
         # Press the new modifier
+        if target_shift != 0 and not self._allow_press():
+            self.current_octave_shift = 0
+            return
         if target_shift == 1:
             press_key(VK_LSHIFT)
         elif target_shift == -1:
@@ -133,12 +182,15 @@ class BPSRInputSimulator:
         self._last_shift_change = time.perf_counter()
 
         # Give the game time to register the modifier before the next note
-        if self.shift_delay_ms > 0:
-            time.sleep(self.shift_delay_ms / 1000.0)
+        delay_ms = self._safe_ms(self.shift_delay_ms, 30.0)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
 
     @synchronized
     def set_sustain(self, active):
         if self.sustain_active != active:
+            if active and not self._allow_press():
+                return
             tap_key(VK_SPACE)
             self.sustain_active = active
 
@@ -149,7 +201,7 @@ class BPSRInputSimulator:
         apart and the game never samples the key as up, so the repeat is
         swallowed and the note just sounds held.
         """
-        gap = self.retrigger_gap_ms / 1000.0
+        gap = self._safe_ms(self.retrigger_gap_ms, 25.0) / 1000.0
         if gap <= 0:
             return
         last_up = self._last_release.get(vk_code)
@@ -165,6 +217,8 @@ class BPSRInputSimulator:
 
     @synchronized
     def press_note(self, midi_note):
+        if not self._allow_press():
+            return
         target = midi_note + self.key_offset
         target_shift, base_note = self._get_mapping(target)
         if base_note is None:

@@ -1,5 +1,6 @@
 import base64
 import importlib
+import hashlib
 import json
 import os
 import sys
@@ -8,6 +9,8 @@ import time
 import types
 
 import mido
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -238,11 +241,25 @@ class FakeNetworkClient:
 def _client_manager():
     network_sync = _network_module()
     manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
-    manager.client_id = "client"
+    client_private = Ed25519PrivateKey.generate()
+    client_public = client_private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    manager._identity_private = client_private
+    manager._identity_public_raw = client_public
+    manager._identity_public_text = manager._b64url(client_public)
+    manager.client_id = hashlib.sha256(client_public).hexdigest()[:32]
     manager.client = FakeNetworkClient()
-    manager._configure_room("correct horse battery staple")
+    host_private = Ed25519PrivateKey.generate()
+    host_public = host_private.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    credential = (
+        "bpsr2.correct-horse-battery-staple."
+        + manager._b64url(host_public))
+    manager._configure_room(credential)
     manager.is_host = False
-    manager.host_id = "host"
+    manager.host_id = hashlib.sha256(host_public).hexdigest()[:32]
+    manager._test_host_private = host_private
+    manager._test_host_public = host_public
     manager.nickname = "Client"
     manager.room_state = {
         "players": [{"client_id": "client", "channels": [0]}],
@@ -266,9 +283,16 @@ def _client_manager():
 
 def _signed_message(manager, payload):
     payload = dict(payload)
-    payload["_sender"] = "host"
+    payload["_sender"] = manager.host_id
     payload["_msg_id"] = os.urandom(16).hex()
+    payload["_sender_pub"] = manager._b64url(manager._test_host_public)
+    payload["_proto"] = 2
     payload["_sig"] = manager._sign(payload)
+    unsigned = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")
+    payload["_sender_sig"] = manager._b64url(
+        manager._test_host_private.sign(unsigned))
     return types.SimpleNamespace(
         topic=manager._room_topic(),
         payload=json.dumps(payload).encode("utf-8"))
@@ -294,6 +318,7 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
         "type": "midi_file",
         "filename": "../../evil.mid",
         "data": encoded,
+        "sha256": hashlib.sha256(b"MThd").hexdigest(),
     }))
     assert received == [("evil.mid", b"MThd")]
 
@@ -301,6 +326,7 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
         "type": "midi_file",
         "filename": "song.mid",
         "data": encoded,
+        "sha256": hashlib.sha256(b"MThd").hexdigest(),
     })
     manager._on_message(None, None, replay)
     manager._on_message(None, None, replay)
@@ -314,3 +340,40 @@ def test_remote_disband_unsubscribes_before_reset():
         None, None, _signed_message(manager, {"type": "disband"}))
     assert manager.client.unsubscribed == [old_topic]
     assert manager.room_code is None
+
+
+def test_room_member_cannot_forge_host_command():
+    network_sync, manager = _client_manager()
+    received = []
+    manager.on_stop_cmd = lambda: received.append("stop")
+    payload = {
+        "type": "stop",
+        "_sender": manager.client_id,
+        "_msg_id": os.urandom(16).hex(),
+        "_sender_pub": manager._identity_public_text,
+        "_proto": network_sync.PROTOCOL_VERSION,
+    }
+    payload["_sig"] = manager._sign(payload)
+    unsigned = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False).encode("utf-8")
+    payload["_sender_sig"] = manager._b64url(
+        manager._identity_private.sign(unsigned))
+    msg = types.SimpleNamespace(
+        topic=manager._room_topic(),
+        payload=json.dumps(payload).encode("utf-8"))
+
+    manager._on_message(None, None, msg)
+    assert received == []
+
+
+def test_non_finite_network_start_is_rejected():
+    _network_sync, manager = _client_manager()
+    played = []
+    manager.on_play_cmd = lambda *args: played.append(args)
+    message = _signed_message(manager, {
+        "type": "play",
+        "start_time": float("nan"),
+    })
+    manager._on_message(None, None, message)
+    assert played == []

@@ -130,11 +130,13 @@ def _make_manager():
         def disconnect(self): pass
         def subscribe(self, *a, **k): pass
         def unsubscribe(self, *a, **k): published.append(("unsub", a[0] if a else None))
-        def publish(self, topic, payload): published.append(("pub", topic, payload))
+        def publish(self, topic, payload, qos=0):
+            published.append(("pub", topic, payload))
 
     nm = NetworkManager.__new__(NetworkManager)
     # minimal attributes used by the methods under test
     nm.client_id = "cid"
+    nm._identity_public_text = "test-public"
     nm.client = FakeClient()
     nm.room_code = None
     nm.is_host = False
