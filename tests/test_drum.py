@@ -30,6 +30,15 @@ def _note(time, dur, note, channel=0, velocity=64):
     ]
 
 
+def _note_beat(time, dur, note, beat, end_beat, channel=0, velocity=64):
+    return [
+        {'time': time, 'beat': beat, 'type': 'note_on', 'note': note,
+         'velocity': velocity, 'channel': channel},
+        {'time': time + dur, 'beat': end_beat, 'type': 'note_off',
+         'note': note, 'channel': channel},
+    ]
+
+
 def _hits(events):
     """Collapse an event list back to a sorted (time, note) hit list."""
     return sorted((round(e['time'], 4), e['note']) for e in events if e['type'] == 'note_on')
@@ -302,6 +311,123 @@ def test_style_switches_between_sections():
           DRUM_HH_OPEN in late, f"late voices {sorted(set(late))}")
 
 
+def test_pickup_does_not_move_the_bar_grid():
+    from arranger import ConversionSettings, convert_drum, DRUM_HH_CLOSED
+    events = []
+    for index in range(9):
+        beat = 0.5 + index
+        events += _note_beat(beat * 0.5, 0.1, 60 + beat % 3,
+                             float(beat), beat + 0.2)
+    events.sort(key=lambda event: event['time'])
+    out = convert_drum(
+        events, ConversionSettings(drum_hat_density='quarter'),
+        orig_bpm=120, beats_per_measure=4)
+    hats = [time for time, voice in _hits(out) if voice == DRUM_HH_CLOSED]
+    check("a pickup does not redefine where the next bar starts",
+          hats and all(abs((time / 0.5) - round(time / 0.5)) < 1e-6
+                       for time in hats),
+          f"hat times {hats}")
+
+
+def test_sustained_music_keeps_later_bars_active():
+    from arranger import ConversionSettings, convert_drum
+    events = _note_beat(0.0, 8.0, 60, 0.0, 16.0)
+    out = convert_drum(events, ConversionSettings(), orig_bpm=120)
+    later = [event for event in out
+             if event['type'] == 'note_on' and event['time'] >= 6.0]
+    check("a sustained passage keeps accompaniment active in later bars",
+          bool(later), "no hits in the fourth bar")
+
+
+def test_chord_size_is_not_rhythm_density():
+    from arranger import ConversionSettings, convert_drum
+    one_note = []
+    ten_notes = []
+    for beat in (0.0, 4.0, 8.0, 12.0):
+        one_note += _note_beat(beat * 0.5, 0.1, 60, beat, beat + 0.2)
+        for pitch in range(50, 60):
+            ten_notes += _note_beat(
+                beat * 0.5, 0.1, pitch, beat, beat + 0.2)
+    one_note.sort(key=lambda event: event['time'])
+    ten_notes.sort(key=lambda event: event['time'])
+    settings = ConversionSettings(drum_fill_frequency=0)
+    simple = len(_hits(convert_drum(one_note, settings, orig_bpm=120)))
+    chord = len(_hits(convert_drum(ten_notes, settings, orig_bpm=120)))
+    check("a large chord counts as one rhythmic onset",
+          chord == simple, f"single={simple}, chord={chord}")
+
+
+def test_drum_source_modes_are_distinct():
+    from arranger import ConversionSettings, convert_drum, DRUM_KICK
+    source = (_note_beat(0.0, 0.03, 36, 0.0, 0.06, channel=9)
+              + _note_beat(2.0, 0.03, 36, 4.0, 4.06, channel=9))
+    source.sort(key=lambda event: event['time'])
+    preserved = _hits(convert_drum(
+        source, ConversionSettings(drum_source_mode='preserve')))
+    augmented = _hits(convert_drum(
+        source, ConversionSettings(drum_source_mode='augment')))
+    generated = _hits(convert_drum(
+        source, ConversionSettings(drum_source_mode='generate')))
+    check("Preserve keeps the authored percussion",
+          preserved == [(0.0, DRUM_KICK), (2.0, DRUM_KICK)],
+          f"got {preserved}")
+    check("Augment fills missing kit roles", len(augmented) > len(preserved),
+          f"preserve={len(preserved)}, augment={len(augmented)}")
+    check("Generate replaces the source pattern", generated != preserved,
+          f"got {generated}")
+
+
+def test_tempo_map_controls_generated_hit_timing():
+    from arranger import ConversionSettings, convert_drum, DRUM_HH_CLOSED
+    events = _note_beat(0.0, 6.0, 60, 0.0, 8.0)
+    out = convert_drum(
+        events, ConversionSettings(drum_hat_density='quarter'),
+        orig_bpm=120,
+        tempo_map=[{'beat': 0.0, 'bpm': 120.0},
+                   {'beat': 4.0, 'bpm': 60.0}])
+    hats = [time for time, voice in _hits(out) if voice == DRUM_HH_CLOSED]
+    check("tempo changes move the musical grid in real time",
+          3.0 in hats, f"hat times {hats}")
+
+
+def test_three_four_meter_uses_three_beat_bars():
+    from arranger import ConversionSettings, convert_drum, DRUM_CRASH_1
+    events = _note_beat(0.0, 3.0, 60, 0.0, 6.0)
+    out = convert_drum(
+        events, ConversionSettings(drum_hat_density='quarter'),
+        orig_bpm=120, beats_per_measure=3,
+        time_signature_map=[
+            {'beat': 0.0, 'numerator': 3, 'denominator': 4}])
+    crashes = [time for time, voice in _hits(out) if voice == DRUM_CRASH_1]
+    all_times = [time for time, _voice in _hits(out)]
+    check("3/4 conversion stays inside its six-beat source",
+          all(time <= 3.0 + 1e-6 for time in all_times), f"times {all_times}")
+    check("3/4 starts on its real downbeat", crashes and crashes[0] == 0.0,
+          f"crashes {crashes}")
+
+
+def test_unknown_gm_percussion_is_ignored():
+    from arranger import ConversionSettings, convert_drum
+    out = convert_drum(
+        _note(0.0, 0.03, 10, channel=9),
+        ConversionSettings(drum_source_mode='preserve'))
+    check("unknown GM percussion does not become a fake hi-hat",
+          _hits(out) == [], f"got {_hits(out)}")
+
+
+def test_user_minimum_spacing_is_honoured():
+    from arranger import ConversionSettings, convert_drum
+    events = (_note(0.0, 0.02, 36, channel=9)
+              + _note(0.1, 0.02, 36, channel=9))
+    events.sort(key=lambda event: event['time'])
+    out = convert_drum(
+        events,
+        ConversionSettings(drum_source_mode='preserve',
+                           drum_min_spacing=0.15))
+    check("custom drum spacing filters physically impossible repeats",
+          len(_hits(out)) == 1, f"got {_hits(out)}")
+
+
 if __name__ == "__main__":
     for fn in [
         test_empty_input_is_safe,
@@ -323,6 +449,14 @@ if __name__ == "__main__":
         test_varied_song_uses_all_nine_voices,
         test_fills_are_varied,
         test_style_switches_between_sections,
+        test_pickup_does_not_move_the_bar_grid,
+        test_sustained_music_keeps_later_bars_active,
+        test_chord_size_is_not_rhythm_density,
+        test_drum_source_modes_are_distinct,
+        test_tempo_map_controls_generated_hit_timing,
+        test_three_four_meter_uses_three_beat_bars,
+        test_unknown_gm_percussion_is_ignored,
+        test_user_minimum_spacing_is_honoured,
     ]:
         fn()
     print(f"\n{PASS} passed, {FAIL} failed")

@@ -15,6 +15,7 @@ kernel32 = ctypes.windll.kernel32
 
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+MOD_NOREPEAT = 0x4000
 
 # Common VK codes for convenience
 VK_F9 = 0x78
@@ -43,44 +44,68 @@ class GlobalHotkeys:
         self.thread = None
         self.thread_id = None
         self._started = threading.Event()
+        self.registered = False
+        self.failed_keys = []
 
     def start(self):
-        if self.thread is not None:
-            return
+        if self.thread is not None and self.thread.is_alive():
+            return self.registered
+        self._started.clear()
+        self.registered = False
+        self.failed_keys = []
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
         self._started.wait(timeout=2.0)
+        return self.registered
 
     def _run(self):
         # RegisterHotKey must be called on the same thread that runs
         # the message loop.
-        self.thread_id = kernel32.GetCurrentThreadId()
         ids = {}
-        for i, (vk, cb) in enumerate(self.bindings.items(), start=1):
-            if user32.RegisterHotKey(None, i, 0, vk):
-                ids[i] = cb
-            else:
-                print(f"Warning: could not register global hotkey VK=0x{vk:02X} "
-                      f"(already in use by another app?)")
-        self._started.set()
+        try:
+            self.thread_id = kernel32.GetCurrentThreadId()
+            for i, (vk, cb) in enumerate(self.bindings.items(), start=1):
+                if user32.RegisterHotKey(None, i, MOD_NOREPEAT, vk):
+                    ids[i] = cb
+                else:
+                    self.failed_keys.append(vk)
+                    print(
+                        f"Warning: could not register global hotkey VK=0x{vk:02X} "
+                        f"(already in use by another app?)")
 
-        msg = MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY:
-                cb = ids.get(msg.wParam)
-                if cb:
-                    try:
-                        cb()
-                    except Exception as e:
-                        print(f"Hotkey callback error: {e}")
+            # Partial registration is confusing (for example Stop works but
+            # Play does not), so expose hotkeys only when the full set succeeds.
+            if self.failed_keys:
+                return
+            self.registered = True
+            self._started.set()
 
-        for i in ids:
-            user32.UnregisterHotKey(None, i)
+            msg = MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY:
+                    cb = ids.get(msg.wParam)
+                    if cb:
+                        try:
+                            cb()
+                        except Exception as e:
+                            print(f"Hotkey callback error: {e}")
+        finally:
+            for hotkey_id in ids:
+                user32.UnregisterHotKey(None, hotkey_id)
+            self.registered = False
+            self.thread_id = None
+            self._started.set()
 
     def stop(self):
-        if self.thread_id is not None:
-            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
-        if self.thread is not None:
-            self.thread.join(timeout=1.0)
-        self.thread = None
-        self.thread_id = None
+        thread = self.thread
+        thread_id = self.thread_id
+        if thread_id is not None:
+            user32.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
+        if thread is not None:
+            thread.join(timeout=1.0)
+        stopped = thread is None or not thread.is_alive()
+        if stopped:
+            self.thread = None
+            self.thread_id = None
+            self.registered = False
+        return stopped

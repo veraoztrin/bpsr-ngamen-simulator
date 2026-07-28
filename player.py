@@ -24,6 +24,13 @@ class MidiPlayer:
         # (channel, source_note) -> transposed notes actually pressed.  Releases
         # must use this snapshot, not the current transpose/channel selection.
         self._active_notes = {}
+        # Sustain is physically one Space key, but MIDI pedal state belongs to
+        # each channel. Keep every channel's logical state so muting one part
+        # cannot release a pedal that another active part still owns.
+        self._sustain_by_channel = set()
+        # Zone hints are global. release_all() physically resets the modifier,
+        # so retain the requested zone for pause/focus-loss restoration.
+        self._current_zone = 0
         self.current_event_idx = 0
         self.start_time = 0.0
         self.pause_time = 0.0
@@ -49,6 +56,11 @@ class MidiPlayer:
             self._active_notes.clear()
             if self.simulator:
                 self.simulator.release_all()
+                if self.is_playing:
+                    if value == 0:
+                        self.simulator.set_octave_shift(self._current_zone)
+                    self.simulator.set_sustain(bool(
+                        self._sustain_by_channel & self.active_channels))
 
     @property
     def is_syncing(self):
@@ -65,8 +77,10 @@ class MidiPlayer:
         if self.is_syncing:
             return 0.0
         if self.is_paused:
-            return self.pause_time - self.start_time
-        return time.perf_counter() - self.start_time
+            position = self.pause_time - self.start_time
+        else:
+            position = time.perf_counter() - self.start_time
+        return max(0.0, min(self.get_total_time(), position))
 
     def load_events(self, events, active_channels=None):
         self.stop()
@@ -80,14 +94,39 @@ class MidiPlayer:
         channels = set(channels)
         releases = []
         with self._state_lock:
+            sustain_before = bool(
+                self._sustain_by_channel & self.active_channels)
             removed = self.active_channels - channels
             self.active_channels = channels
+            sustain_after = bool(
+                self._sustain_by_channel & self.active_channels)
             for key in list(self._active_notes):
                 if key[0] in removed:
                     releases.extend(self._active_notes.pop(key))
         if self.simulator:
             for note in releases:
                 self.simulator.release_note(note)
+            if sustain_before != sustain_after:
+                self.simulator.set_sustain(sustain_after)
+
+    def release_output_state(self):
+        """Release physical keys while retaining resumable pedal/zone state."""
+        with self._state_lock:
+            self._active_notes.clear()
+        if self.simulator:
+            self.simulator.release_all()
+
+    def restore_output_state(self):
+        """Restore global MIDI state after pause or temporary focus loss."""
+        if not self.simulator:
+            return
+        with self._state_lock:
+            zone = self._current_zone
+            sustain = bool(self._sustain_by_channel & self.active_channels)
+            transpose = self.transpose
+        if transpose == 0:
+            self.simulator.set_octave_shift(zone)
+        self.simulator.set_sustain(sustain)
 
     def _cancel_worker(self):
         """Stop and join the current worker using a per-thread cancellation event."""
@@ -115,6 +154,9 @@ class MidiPlayer:
         with self._state_lock:
             if self.is_paused:
                 self.is_paused = False
+                self.restore_output_state()
+                # Restoring Shift/Ctrl can intentionally wait for the game's
+                # modifier timing. Count that as paused time, not song time.
                 self.start_time += time.perf_counter() - self.pause_time
             else:
                 if not self.events:
@@ -162,27 +204,28 @@ class MidiPlayer:
         # held, without resetting current_event_idx the way stop() does.
         self.stop_requested = True
         self._cancel_worker()
-        if self.simulator:
-            self.simulator.release_all()
-        self._active_notes.clear()
+        self.release_output_state()
 
-        last_sustain, last_zone, idx = 0, 0, 0
+        sustain_by_channel, last_zone, idx = set(), 0, 0
         for i, ev in enumerate(self.events):
             # Events exactly on the target belong to the resumed playback.
             if ev['time'] >= target_time:
                 break
             idx = i + 1
-            if (ev['type'] == 'sustain'
-                    and ev.get('channel', 0) in self.active_channels):
-                last_sustain = ev['value']
+            if ev['type'] == 'sustain':
+                channel = ev.get('channel', 0)
+                if ev['value']:
+                    sustain_by_channel.add(channel)
+                else:
+                    sustain_by_channel.discard(channel)
             elif ev['type'] == 'zone':
                 last_zone = ev['value']
         self.current_event_idx = idx
+        with self._state_lock:
+            self._sustain_by_channel = sustain_by_channel
+            self._current_zone = last_zone
 
-        if self.simulator:
-            if self.transpose == 0:
-                self.simulator.set_octave_shift(last_zone)
-            self.simulator.set_sustain(bool(last_sustain))
+        self.restore_output_state()
 
         self.stop_requested = False
         now = time.perf_counter()
@@ -211,9 +254,7 @@ class MidiPlayer:
             self.is_playing = False
             self.pause_time = time.perf_counter()
             self._cancel_worker()
-            if self.simulator:
-                self.simulator.release_all()
-            self._active_notes.clear()
+            self.release_output_state()
 
     def stop(self):
         self.stop_requested = True
@@ -224,6 +265,8 @@ class MidiPlayer:
             self.simulator.release_all()
         with self._state_lock:
             self._active_notes.clear()
+            self._sustain_by_channel.clear()
+            self._current_zone = 0
             self.current_event_idx = 0
 
     def _accurate_delay(self, target_time, cancel):
@@ -262,6 +305,7 @@ class MidiPlayer:
                 if ev['type'] == 'zone':
                     # Pre-emptive octave zone hint from the arranger
                     # (phrase-gap shifting): toggle the modifier during silence.
+                    self._current_zone = ev['value']
                     if self.simulator and self.transpose == 0:
                         self.simulator.set_octave_shift(ev['value'])
                 elif 'channel' in ev:
@@ -279,8 +323,14 @@ class MidiPlayer:
                                 del self._active_notes[key]
                             self.simulator.release_note(played_note)
                     elif ev['type'] == 'sustain':
-                        if ev['channel'] in self.active_channels and self.simulator:
-                            self.simulator.set_sustain(ev['value'])
+                        channel = ev['channel']
+                        if ev['value']:
+                            self._sustain_by_channel.add(channel)
+                        else:
+                            self._sustain_by_channel.discard(channel)
+                        if self.simulator:
+                            self.simulator.set_sustain(bool(
+                                self._sustain_by_channel & self.active_channels))
 
             self.current_event_idx += 1
 
@@ -289,3 +339,5 @@ class MidiPlayer:
             if self.simulator:
                 self.simulator.release_all()
             self._active_notes.clear()
+            self._sustain_by_channel.clear()
+            self._current_zone = 0

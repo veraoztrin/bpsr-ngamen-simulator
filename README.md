@@ -15,7 +15,7 @@ A plug-and-play desktop application designed to read standard MIDI (`.mid`) file
 - **Sustain Support:** Fully supports MIDI Sustain Pedal events (CC64), toggling the in-game `[Space]` bar.
 - **Modern GUI:** Built with `customtkinter` for a beautiful dark-mode interface.
 - **Channel Selector:** Mute or solo specific tracks inside a MIDI file (e.g., mute the drum track).
-- **Global Hotkeys:** `F9` = play / resume, `F10` = pause, `F11` = stop — they work even while the game window is focused, so no more alt-tab dance.
+- **Global Hotkeys:** `F9` = play / resume, `F10` = pause, `F11` = stop — they work even while the game window is focused, so no more alt-tab dance. Registration is all-or-nothing, suppresses held-key auto-repeat, and shows an in-app warning if another program already owns any of the keys.
 - **Autoplay toggle:** When on, playback advances to the next loaded MIDI when a track finishes; when off (the default), it stops and releases all keys at the end of each track. Found next to the play controls in the Solo tab.
 - **Leave / Disband room:** Clients can **Leave Room** at any time (they drop off the host's roster and can join another room); the host can **Disband Lobby** to close the room, which returns every connected player to the disconnected state.
 - **Peer-to-peer clock sync:** In multiplayer, each client measures its clock offset directly against the host over the network (NTP-style ping/pong), instead of relying on an external time server that firewalls often block. The lobby shows a live "Synced ±X ms" accuracy readout, and **Ready** stays locked until the clock is aligned — so players start together, not seconds apart. A per-player **Sync nudge (ms)** knob lets you dial out the last few milliseconds of residual offset (from network path asymmetry or input latency) by ear — set it once for your connection.
@@ -46,6 +46,18 @@ The Solo tab includes a conversion panel that re-transcribes the loaded MIDI on 
 - **Range:** Allowed output range (note names like `C2`–`B7`, or raw MIDI numbers). Notes outside are octave-shifted to fit.
 - **Shift delay / hold (ms):** Timing for the octave modifier keys — delay after toggling before the next note fires, and minimum hold before re-toggling. Raise the delay if high/low notes play at the wrong octave in-game.
 - **Retrigger gap (ms):** How long a key is held *up* before the same note sounds again. Most MIDI is quantized edge-to-edge, so a repeated note's release lands on the exact timestamp of the next note's press — and because the game samples the keyboard once per frame, it never sees the key come up and plays `C4 C4 C4 C4` as one long `C4`. The gap pulls each release back far enough for the repeat to register; only the release moves, never the onset. Raise it if repeated notes still slur together, lower it if fast repeated passages sound too clipped. Applies to every instrument, Drum included.
+
+### Drum conversion
+
+Selecting **Drum** reveals percussion controls instead of pitch-range and chord settings:
+
+- **Drum source:** **Auto** safely preserves an authored GM channel-10 drum track and generates a groove when none exists. **Preserve** forces source-only mapping, **Augment** keeps it while filling missing kit roles, and **Generate** replaces it.
+- **Style / Intensity:** Auto, Rock, Pop, Ballad, or Dance. Intensity changes the number and placement of hits rather than merely changing their volume.
+- **Fills / Hats / Bass follow:** Set the fill interval, quarter/eighth/sixteenth hat backbone, and how strongly off-beat source onsets influence the kick.
+- **Swing / Quantize:** Swing generated subdivisions; optionally pull preserved GM hits toward the grid without discarding their original timing by default.
+- **Minimum spacing:** A same-drum retrigger limit in milliseconds. `0` uses the safe automatic value derived from the app's retrigger gap.
+
+The arranger follows the MIDI's complete tempo and time-signature maps, keeps pickups on the correct bar grid, supports meters such as 3/4 and 6/8, treats a chord as one rhythmic onset, and uses sustained-note occupancy so held passages do not become accidental silence.
 
 ## Setup & Installation
 

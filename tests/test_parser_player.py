@@ -82,6 +82,27 @@ def test_parser():
     check("default bpm 120", parsed['bpm'] == 120.0)
     check("default 4 beats", parsed['beats_per_measure'] == 4)
 
+    # Retain the complete musical timeline for meter-aware drum conversion.
+    StubMidiFile.script = [
+        StubMsg('set_tempo', time=0.0, tempo=500000),
+        StubMsg('note_on', time=0.5, note=60, velocity=64, channel=0),
+        StubMsg('set_tempo', time=0.5, tempo=1000000),
+        StubMsg('time_signature', time=1.0, numerator=6, denominator=8),
+        StubMsg('note_off', time=0.0, note=60, channel=0),
+    ]
+    parsed = midi_parser.parse_midi_full("fake.mid")
+    check("events retain absolute musical beats",
+          abs(parsed['events'][0]['beat'] - 1.0) < 1e-6
+          and abs(parsed['events'][-1]['beat'] - 3.0) < 1e-6,
+          f"got {[event.get('beat') for event in parsed['events']]}")
+    check("tempo changes are retained",
+          parsed['tempo_map'][-1] == {'beat': 2.0, 'bpm': 60.0},
+          f"got {parsed['tempo_map']}")
+    check("meter denominator is retained",
+          parsed['time_signature_map'][-1] == {
+              'beat': 3.0, 'numerator': 6, 'denominator': 8},
+          f"got {parsed['time_signature_map']}")
+
 
 # --- end-to-end playback with mock simulator -------------------------------
 

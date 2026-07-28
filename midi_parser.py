@@ -7,6 +7,45 @@ MAX_LOCAL_MIDI_BYTES = 20 * 1024 * 1024
 MAX_MIDI_EVENTS = 500_000
 MAX_MIDI_DURATION_SECONDS = 6 * 60 * 60
 
+
+def _timed_messages(mid):
+    """Yield (message, absolute_seconds, absolute_quarter_note_beats).
+
+    Real MidiFile objects expose tracks and ticks_per_beat, which lets drum
+    conversion retain the musical grid through tempo changes. Lightweight test
+    doubles fall back to mido's already-seconds iterator.
+    """
+    tempo = 500000
+    seconds = 0.0
+    beat = 0.0
+    tracks = getattr(mid, "tracks", None)
+    ticks_per_beat = getattr(mid, "ticks_per_beat", None)
+    if tracks is not None and ticks_per_beat:
+        for msg in mido.merge_tracks(tracks):
+            delta_ticks = msg.time
+            seconds += mido.tick2second(delta_ticks, ticks_per_beat, tempo)
+            beat += delta_ticks / ticks_per_beat
+            yield msg, seconds, beat
+            if msg.type == "set_tempo" and msg.tempo > 0:
+                tempo = msg.tempo
+        return
+
+    for msg in mid:
+        delta_seconds = msg.time
+        seconds += delta_seconds
+        beat += delta_seconds / (tempo / 1_000_000.0)
+        yield msg, seconds, beat
+        if msg.type == "set_tempo" and msg.tempo > 0:
+            tempo = msg.tempo
+
+
+def _append_map_point(points, point):
+    """Replace a same-beat map event; otherwise append it."""
+    if points and abs(points[-1]["beat"] - point["beat"]) < 1e-9:
+        points[-1] = point
+    else:
+        points.append(point)
+
 # Standard General MIDI Level 1 program families. GM groups its 128 patches
 # into 16 families of 8 consecutive program numbers each - e.g. programs
 # 0-7 are all pianos, 24-31 are all guitars, etc. We label channels with the
@@ -70,18 +109,26 @@ def parse_midi_full(file_path):
         mid = mido.MidiFile(file_path)
     except Exception as e:
         print(f"Error loading MIDI: {e}")
-        return {'events': [], 'bpm': DEFAULT_BPM, 'beats_per_measure': DEFAULT_BEATS_PER_MEASURE}
+        return {
+            'events': [], 'bpm': DEFAULT_BPM,
+            'beats_per_measure': DEFAULT_BEATS_PER_MEASURE,
+            'tempo_map': [{'beat': 0.0, 'bpm': DEFAULT_BPM}],
+            'time_signature_map': [
+                {'beat': 0.0, 'numerator': 4, 'denominator': 4}],
+        }
 
     all_events = []
     current_time = 0.0
     bpm = None
     beats_per_measure = None
     channel_programs = {}  # channel -> first Program Change number seen (GM patch 0-127)
+    tempo_map = [{'beat': 0.0, 'bpm': DEFAULT_BPM}]
+    time_signature_map = [
+        {'beat': 0.0, 'numerator': 4, 'denominator': 4}]
 
     # Iterating over MidiFile yields messages in exact chronological playback order.
     # msg.time is the delta time in seconds since the last yielded message.
-    for msg in mid:
-        current_time += msg.time
+    for msg, current_time, current_beat in _timed_messages(mid):
         if (len(all_events) >= MAX_MIDI_EVENTS
                 or current_time > MAX_MIDI_DURATION_SECONDS):
             print("Error loading MIDI: event-count or duration safety limit exceeded")
@@ -89,16 +136,28 @@ def parse_midi_full(file_path):
                 'events': [], 'bpm': DEFAULT_BPM,
                 'beats_per_measure': DEFAULT_BEATS_PER_MEASURE,
                 'channel_programs': {},
+                'tempo_map': tempo_map,
+                'time_signature_map': time_signature_map,
             }
 
         if msg.type == 'set_tempo':
             # Remember the FIRST tempo as the song's nominal BPM.
             if bpm is None and msg.tempo > 0:
                 bpm = 60000000.0 / msg.tempo
+            if msg.tempo > 0:
+                _append_map_point(tempo_map, {
+                    'beat': current_beat,
+                    'bpm': 60000000.0 / msg.tempo,
+                })
 
         elif msg.type == 'time_signature':
             if beats_per_measure is None:
                 beats_per_measure = msg.numerator
+            _append_map_point(time_signature_map, {
+                'beat': current_beat,
+                'numerator': max(1, int(msg.numerator)),
+                'denominator': max(1, int(msg.denominator)),
+            })
 
         elif msg.type == 'program_change':
             # Keep the first patch a channel is set to - some songs re-send
@@ -114,7 +173,8 @@ def parse_midi_full(file_path):
                     'time': current_time,
                     'type': 'note_off',
                     'note': msg.note,
-                    'channel': msg.channel
+                    'channel': msg.channel,
+                    'beat': current_beat,
                 })
             else:
                 all_events.append({
@@ -122,7 +182,8 @@ def parse_midi_full(file_path):
                     'type': 'note_on',
                     'note': msg.note,
                     'velocity': msg.velocity,
-                    'channel': msg.channel
+                    'channel': msg.channel,
+                    'beat': current_beat,
                 })
 
         elif msg.type == 'note_off':
@@ -130,7 +191,8 @@ def parse_midi_full(file_path):
                 'time': current_time,
                 'type': 'note_off',
                 'note': msg.note,
-                'channel': msg.channel
+                'channel': msg.channel,
+                'beat': current_beat,
             })
 
         elif msg.type == 'control_change' and hasattr(msg, 'control') and msg.control == 64:
@@ -141,7 +203,8 @@ def parse_midi_full(file_path):
                 'time': current_time,
                 'type': 'sustain',
                 'value': is_on,
-                'channel': msg.channel
+                'channel': msg.channel,
+                'beat': current_beat,
             })
 
     # Ensure events are sorted
@@ -169,6 +232,8 @@ def parse_midi_full(file_path):
         'bpm': bpm if bpm is not None else DEFAULT_BPM,
         'beats_per_measure': beats_per_measure if beats_per_measure is not None else DEFAULT_BEATS_PER_MEASURE,
         'channel_programs': channel_programs,
+        'tempo_map': tempo_map,
+        'time_signature_map': time_signature_map,
     }
 
 

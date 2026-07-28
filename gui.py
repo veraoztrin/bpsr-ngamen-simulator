@@ -50,6 +50,9 @@ class App(ctk.CTk):
         self.events = []
         self.raw_events = []          # untouched parse result (conversion source)
         self.orig_bpm = 120.0
+        self.tempo_map = [{'beat': 0.0, 'bpm': 120.0}]
+        self.time_signature_map = [
+            {'beat': 0.0, 'numerator': 4, 'denominator': 4}]
         self.channel_programs = {}   # channel -> GM program number, from the raw MIDI
         self.beats_per_measure = 4
         self.channels = []
@@ -64,6 +67,7 @@ class App(ctk.CTk):
         self.playlist = [] # list of dicts: {"name": str, "path": str}
         self.current_song_idx = -1
         self.was_playing = False
+        self._focus_was_blocked = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -138,19 +142,29 @@ class App(ctk.CTk):
 
     def _start_global_hotkeys(self):
         if GlobalHotkeys and self.hotkeys is None:
-            self.hotkeys = GlobalHotkeys({
+            candidate = GlobalHotkeys({
                 VK_F9:  lambda: self.after(0, self.hotkey_play),    # start / resume
                 VK_F10: lambda: self.after(0, self.player.pause),   # pause
                 VK_F11: lambda: self.after(0, self.player.stop),    # stop entirely
             })
-            self.hotkeys.start()
+            if candidate.start():
+                self.hotkeys = candidate
+            else:
+                candidate.stop()
+                self.global_hotkeys_var.set(False)
+                self.settings_error_label.configure(
+                    text="F9–F11 could not be registered. Another app may be using them.")
 
     def toggle_global_hotkeys(self):
         if self.global_hotkeys_var.get():
             self._start_global_hotkeys()
         elif self.hotkeys:
-            self.hotkeys.stop()
-            self.hotkeys = None
+            if self.hotkeys.stop():
+                self.hotkeys = None
+            else:
+                self.global_hotkeys_var.set(True)
+                self.settings_error_label.configure(
+                    text="Global hotkeys are still stopping; try again in a moment.")
 
     def hotkey_play(self):
         # F9 starts playback, or resumes it when paused.
@@ -328,6 +342,61 @@ class App(ctk.CTk):
         ctk.CTkLabel(row4, text="channels by role (melody / accomp / bass)",
                      text_color="gray").pack(side="left", padx=4)
 
+        # Drum-specific controls. They replace the pitch/chord controls when
+        # Drum is selected, while BPM, speed, retrigger and safety remain useful.
+        self.drum_controls_frame = ctk.CTkFrame(
+            self.conv_frame, fg_color="transparent")
+        drum_row1 = ctk.CTkFrame(self.drum_controls_frame, fg_color="transparent")
+        drum_row1.pack(fill="x", pady=(8, 0))
+        drum_row2 = ctk.CTkFrame(self.drum_controls_frame, fg_color="transparent")
+        drum_row2.pack(fill="x", pady=(6, 8))
+
+        self.drum_source_var = ctk.StringVar(value="Auto")
+        self.drum_style_var = ctk.StringVar(value="Auto")
+        self.drum_hat_var = ctk.StringVar(value="Eighth")
+        ctk.CTkLabel(drum_row1, text="Drum source:").pack(side="left")
+        ctk.CTkOptionMenu(
+            drum_row1, values=["Auto", "Preserve", "Augment", "Generate"],
+            variable=self.drum_source_var, width=105,
+            command=lambda _value: self.reconvert()).pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row1, text="Style:").pack(side="left")
+        ctk.CTkOptionMenu(
+            drum_row1, values=["Auto", "Rock", "Pop", "Ballad", "Dance"],
+            variable=self.drum_style_var, width=90,
+            command=lambda _value: self.reconvert()).pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row1, text="Intensity:").pack(side="left")
+        self.drum_intensity_entry = ctk.CTkEntry(drum_row1, width=45)
+        self.drum_intensity_entry.insert(0, "1.0")
+        self.drum_intensity_entry.pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row1, text="Fill every (bars):").pack(side="left")
+        self.drum_fill_entry = ctk.CTkEntry(drum_row1, width=40)
+        self.drum_fill_entry.insert(0, "8")
+        self.drum_fill_entry.pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row1, text="Hats:").pack(side="left")
+        ctk.CTkOptionMenu(
+            drum_row1, values=["Quarter", "Eighth", "Sixteenth"],
+            variable=self.drum_hat_var, width=105,
+            command=lambda _value: self.reconvert()).pack(side="left", padx=4)
+
+        ctk.CTkLabel(drum_row2, text="Bass follow (%):").pack(side="left")
+        self.drum_bass_follow_entry = ctk.CTkEntry(drum_row2, width=45)
+        self.drum_bass_follow_entry.insert(0, "100")
+        self.drum_bass_follow_entry.pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row2, text="Swing (%):").pack(side="left")
+        self.drum_swing_entry = ctk.CTkEntry(drum_row2, width=45)
+        self.drum_swing_entry.insert(0, "0")
+        self.drum_swing_entry.pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row2, text="Quantize (%):").pack(side="left")
+        self.drum_quantize_entry = ctk.CTkEntry(drum_row2, width=45)
+        self.drum_quantize_entry.insert(0, "0")
+        self.drum_quantize_entry.pack(side="left", padx=(4, 12))
+        ctk.CTkLabel(drum_row2, text="Min spacing (ms):").pack(side="left")
+        self.drum_spacing_entry = ctk.CTkEntry(drum_row2, width=45)
+        self.drum_spacing_entry.insert(0, "0")
+        self.drum_spacing_entry.pack(side="left", padx=(4, 8))
+        ctk.CTkLabel(
+            drum_row2, text="0 = automatic", text_color="gray").pack(side="left")
+
         # Row 5: retrigger gap. How long a key is held UP before the same note
         # sounds again. Applies to every instrument - drums re-press the same 9
         # keys constantly - so unlike the rows above it stays visible in Drum
@@ -377,6 +446,7 @@ class App(ctk.CTk):
             self._drum_hidden_widgets.append((row, {"fill": "x", "padx": 10, "pady": (8, 0)}))
         self._drum_hidden_widgets.append((self.row3, {"fill": "x", "padx": 10, "pady": 8}))
         self._drum_hidden_widgets.append((self.row4, {"fill": "x", "padx": 10, "pady": (0, 8)}))
+        self.drum_controls_frame.pack_forget()
 
         self.channel_frame = ctk.CTkScrollableFrame(self.tab_solo, label_text="Solo Active Channels")
         self.channel_frame.grid(row=3, column=0, padx=10, pady=10, sticky="nsew")
@@ -402,12 +472,16 @@ class App(ctk.CTk):
                 widget.pack_forget()
             else:
                 widget.pack(**pack_kwargs)
+        if is_drum:
+            self.drum_controls_frame.pack(
+                fill="x", padx=10, pady=(0, 0), before=self.retrigger_gap_entry.master)
+        else:
+            self.drum_controls_frame.pack_forget()
 
         if rng:
             if is_drum:
                 self.instrument_hint.configure(
-                    text="writes a full-kit groove that follows the song's "
-                         "sections & bassline; a real drum track is kept as-is")
+                    text="preserve, enhance, or generate a meter-aware groove")
             else:
                 lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
                 self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
@@ -439,6 +513,12 @@ class App(ctk.CTk):
             self.shift_delay_entry: "30",
             self.shift_hold_entry: "10",
             self.retrigger_gap_entry: "25",
+            self.drum_intensity_entry: "1.0",
+            self.drum_fill_entry: "8",
+            self.drum_bass_follow_entry: "100",
+            self.drum_swing_entry: "0",
+            self.drum_quantize_entry: "0",
+            self.drum_spacing_entry: "0",
             self.solo_delay_entry: "2",
         }
         for entry, value in defaults.items():
@@ -449,6 +529,9 @@ class App(ctk.CTk):
         self.max_chord_seg.set("5")
         self.autosplit_var.set(False)
         self.autosplit_seg.set("2")
+        self.drum_source_var.set("Auto")
+        self.drum_style_var.set("Auto")
+        self.drum_hat_var.set("Eighth")
         self.autoplay_var.set(False)
         self.focus_guard_var.set(True)
         self.global_hotkeys_var.set(True)
@@ -575,9 +658,14 @@ class App(ctk.CTk):
         if focus_blocked:
             if (simulator.key_refs or simulator.sustain_active
                     or simulator.current_octave_shift):
-                simulator.release_all()
+                self.player.release_output_state()
             self.led_label.configure(
                 text="🟠 Focus game", text_color="orange")
+        elif self._focus_was_blocked and self.player.is_playing:
+            # Focus safety released the pedal/modifier state. Reapply it once
+            # the game regains focus; in-progress notes stay released.
+            self.player.restore_output_state()
+            self.led_label.configure(text="🟢 Playing", text_color="green")
         elif self.player.is_syncing:
             self.led_label.configure(text="🟡 Syncing...", text_color="yellow")
         elif self.player.is_playing:
@@ -585,6 +673,7 @@ class App(ctk.CTk):
         else:
             self.led_label.configure(text="🔴 Stopped", text_color="gray")
 
+        self._focus_was_blocked = focus_blocked
         self._refresh_progress_bar()
 
         # Auto-advance song if finished naturally (only when Autoplay is on).
@@ -715,6 +804,11 @@ class App(ctk.CTk):
         self.raw_events = parsed['events']
         self.orig_bpm = parsed['bpm']
         self.beats_per_measure = parsed['beats_per_measure']
+        self.tempo_map = parsed.get(
+            'tempo_map', [{'beat': 0.0, 'bpm': self.orig_bpm}])
+        self.time_signature_map = parsed.get('time_signature_map', [{
+            'beat': 0.0, 'numerator': self.beats_per_measure, 'denominator': 4
+        }])
         self.channel_programs = parsed.get('channel_programs', {})
         self.song_info_label.configure(
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4")
@@ -749,6 +843,15 @@ class App(ctk.CTk):
                 "shift_delay": self.shift_delay_entry.get(),
                 "shift_hold": self.shift_hold_entry.get(),
                 "retrigger_gap": self.retrigger_gap_entry.get(),
+                "drum_source": self.drum_source_var.get(),
+                "drum_style": self.drum_style_var.get(),
+                "drum_intensity": self.drum_intensity_entry.get(),
+                "drum_fills": self.drum_fill_entry.get(),
+                "drum_hats": self.drum_hat_var.get(),
+                "drum_bass_follow": self.drum_bass_follow_entry.get(),
+                "drum_swing": self.drum_swing_entry.get(),
+                "drum_quantize": self.drum_quantize_entry.get(),
+                "drum_spacing": self.drum_spacing_entry.get(),
                 "autosplit": self.autosplit_var.get(),
                 "autosplit_parts": self.autosplit_seg.get(),
                 "instrument": self.instrument_var.get(),
@@ -799,6 +902,16 @@ class App(ctk.CTk):
         _set_entry(self.shift_delay_entry, prefs.get("shift_delay"))
         _set_entry(self.shift_hold_entry, prefs.get("shift_hold"))
         _set_entry(self.retrigger_gap_entry, prefs.get("retrigger_gap"))
+        self.drum_source_var.set(prefs.get("drum_source", "Auto"))
+        self.drum_style_var.set(prefs.get("drum_style", "Auto"))
+        self.drum_hat_var.set(prefs.get("drum_hats", "Eighth"))
+        _set_entry(self.drum_intensity_entry, prefs.get("drum_intensity", "1.0"))
+        _set_entry(self.drum_fill_entry, prefs.get("drum_fills", "8"))
+        _set_entry(
+            self.drum_bass_follow_entry, prefs.get("drum_bass_follow", "100"))
+        _set_entry(self.drum_swing_entry, prefs.get("drum_swing", "0"))
+        _set_entry(self.drum_quantize_entry, prefs.get("drum_quantize", "0"))
+        _set_entry(self.drum_spacing_entry, prefs.get("drum_spacing", "0"))
 
         if prefs.get("max_chord_notes"):
             self.max_chord_seg.set(prefs["max_chord_notes"])
@@ -840,15 +953,38 @@ class App(ctk.CTk):
         bpm_override = finite_float(
             self.bpm_entry, "BPM", 20, 400, allow_blank=True)
         speed = finite_float(self.speed_entry, "Speed", 0.1, 4)
-        range_low = midi_note(self.range_low_entry, "Range start")
-        range_high = midi_note(self.range_high_entry, "Range end")
-        duet_split = midi_note(self.duet_split_entry, "Duet split")
-        shift_delay = finite_float(
-            self.shift_delay_entry, "Shift delay", 0, 500)
-        shift_hold = finite_float(
-            self.shift_hold_entry, "Shift hold", 0, 500)
         retrigger_ms = finite_float(
             self.retrigger_gap_entry, "Retrigger gap", 0, 500)
+        is_drum = self._inst().get("is_drum", False)
+        if is_drum:
+            range_low, range_high = self._inst()["low"], self._inst()["high"]
+            duet_split = 60
+            shift_delay, shift_hold = 30.0, 10.0
+            drum_intensity = finite_float(
+                self.drum_intensity_entry, "Drum intensity", 0.25, 2)
+            drum_fills = finite_float(
+                self.drum_fill_entry, "Fill frequency", 0, 32)
+            if drum_fills != int(drum_fills):
+                raise ValueError("Fill frequency must be a whole number.")
+            drum_bass_follow = finite_float(
+                self.drum_bass_follow_entry, "Bass follow", 0, 100)
+            drum_swing = finite_float(
+                self.drum_swing_entry, "Swing", 0, 50)
+            drum_quantize = finite_float(
+                self.drum_quantize_entry, "Quantize", 0, 100)
+            drum_spacing = finite_float(
+                self.drum_spacing_entry, "Minimum spacing", 0, 500)
+        else:
+            range_low = midi_note(self.range_low_entry, "Range start")
+            range_high = midi_note(self.range_high_entry, "Range end")
+            duet_split = midi_note(self.duet_split_entry, "Duet split")
+            shift_delay = finite_float(
+                self.shift_delay_entry, "Shift delay", 0, 500)
+            shift_hold = finite_float(
+                self.shift_hold_entry, "Shift hold", 0, 500)
+            drum_intensity, drum_fills = 1.0, 8
+            drum_bass_follow, drum_swing = 100.0, 0.0
+            drum_quantize, drum_spacing = 0.0, 0.0
         finite_float(self.solo_delay_entry, "Start delay", 0, 10)
 
         s = ConversionSettings(
@@ -875,6 +1011,15 @@ class App(ctk.CTk):
             range_low=range_low,
             range_high=range_high,
             retrigger_gap=retrigger_ms / 1000.0,
+            drum_source_mode=self.drum_source_var.get().lower(),
+            drum_style=self.drum_style_var.get().lower(),
+            drum_intensity=drum_intensity,
+            drum_fill_frequency=int(drum_fills),
+            drum_hat_density=self.drum_hat_var.get().lower(),
+            drum_bass_follow=drum_bass_follow / 100.0,
+            drum_swing=drum_swing / 100.0,
+            drum_quantize=drum_quantize / 100.0,
+            drum_min_spacing=drum_spacing / 1000.0,
         )
         s._shift_delay_ms = shift_delay
         s._shift_hold_ms = shift_hold
@@ -910,7 +1055,9 @@ class App(ctk.CTk):
         is_drum = self._inst().get("is_drum", False)
         if is_drum:
             self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm,
-                                       beats_per_measure=self.beats_per_measure)
+                                       beats_per_measure=self.beats_per_measure,
+                                       tempo_map=self.tempo_map,
+                                       time_signature_map=self.time_signature_map)
         else:
             self.events = convert(self.raw_events, settings, orig_bpm=self.orig_bpm)
         self.channels = get_channels_info(self.events)

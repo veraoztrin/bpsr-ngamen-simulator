@@ -120,6 +120,9 @@ def _make_manager():
     # NetworkManager creates an mqtt Client (stubbed to `object`) and calls
     # _sync_ntp via ntplib (stubbed). Patch the bits leave/disband touch.
     from network_sync import NetworkManager
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    import hashlib
     published = []
 
     class FakeClient:
@@ -135,8 +138,12 @@ def _make_manager():
 
     nm = NetworkManager.__new__(NetworkManager)
     # minimal attributes used by the methods under test
-    nm.client_id = "cid"
-    nm._identity_public_text = "test-public"
+    nm._identity_private = Ed25519PrivateKey.generate()
+    public_raw = nm._identity_private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw)
+    nm._identity_public_text = nm._b64url(public_raw)
+    nm.client_id = hashlib.sha256(public_raw).hexdigest()[:32]
     nm.client = FakeClient()
     nm.room_code = None
     nm.is_host = False
@@ -184,16 +191,26 @@ def test_host_removes_leaver():
     nm, pub = _make_manager()
     nm.room_code = "R"
     nm.is_host = True
+    peer, peer_pub = _make_manager()
+    shared_secret = b"test-room-secret"
+    nm._room_secret = shared_secret
+    nm._expected_host_public_raw = nm._b64url_decode(nm._identity_public_text)
+    nm._seen_message_ids = set()
+    from collections import deque
+    nm._seen_message_order = deque()
+    peer._room_secret = shared_secret
+    peer.room_code = "R"
     nm.room_state = {"players": [
-        {"client_id": "cid", "nickname": "Host", "channels": [], "ready": True},
-        {"client_id": "p2", "nickname": "Bob", "channels": [], "ready": False},
+        {"client_id": nm.client_id, "nickname": "Host", "channels": [], "ready": True},
+        {"client_id": peer.client_id, "nickname": "Bob", "channels": [], "ready": False},
     ], "filename": None}
-    # simulate receiving a 'leave' from p2
+    # Simulate a properly authenticated leave from the second identity.
+    peer._publish({"type": "leave", "client_id": peer.client_id})
     import types
-    msg = types.SimpleNamespace(payload=b'{"type":"leave","client_id":"p2"}')
+    msg = types.SimpleNamespace(payload=peer_pub[-1][2].encode("utf-8"))
     nm._on_message(None, None, msg)
     ids = [p["client_id"] for p in nm.room_state["players"]]
-    check("leaving player removed from roster", ids == ["cid"], f"got {ids}")
+    check("leaving player removed from roster", ids == [nm.client_id], f"got {ids}")
 
 
 if __name__ == "__main__":

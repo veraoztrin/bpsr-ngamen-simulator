@@ -12,6 +12,7 @@
 # as an event list at the end.
 
 import math
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
 
 # The nine fixed in-game drum voices are defined once in config (the actual
@@ -61,6 +62,15 @@ class ConversionSettings:
     thinning_min_len: float = 0.020 # drop notes shorter than this when thinning
     phrase_gap: float = 0.150       # silence >= this = phrase boundary
     retrigger_gap: float = 0.025    # min key-UP time before a key is re-pressed
+    drum_source_mode: str = 'auto'  # auto | preserve | augment | generate
+    drum_style: str = 'auto'        # auto | rock | pop | ballad | dance
+    drum_intensity: float = 1.0     # 0.25..2.0
+    drum_fill_frequency: int = 8    # fallback fill every N bars; 0 disables
+    drum_hat_density: str = 'eighth'# quarter | eighth | sixteenth
+    drum_bass_follow: float = 1.0   # 0..1
+    drum_swing: float = 0.0         # 0..0.5 of the second grid division
+    drum_quantize: float = 0.0      # 0..1, mainly for preserved GM drums
+    drum_min_spacing: float = 0.0   # seconds; 0 derives from retrigger_gap
 
 
 # ---------------------------------------------------------------------------
@@ -82,13 +92,17 @@ def events_to_notes(events):
                 'note': ev['note'],
                 'velocity': ev.get('velocity', 64),
                 'channel': ev.get('channel', 0),
+                'start_beat': ev.get('beat'),
+                'end_beat': None,
             }
             open_notes.setdefault((n['channel'], n['note']), []).append(n)
             notes.append(n)
         elif ev['type'] == 'note_off':
             stack = open_notes.get((ev.get('channel', 0), ev['note']))
             if stack:
-                stack.pop(0)['end'] = t
+                matched = stack.pop(0)
+                matched['end'] = t
+                matched['end_beat'] = ev.get('beat')
         elif ev['type'] == 'sustain':
             sustains.append({'time': t, 'value': ev['value'],
                              'channel': ev.get('channel', 0)})
@@ -555,19 +569,11 @@ def split_duet(notes, sustains, split_note):
 # The in-game "Drum" instrument responds on 9 fixed on-screen keys, each a
 # distinct percussion voice (D4..A5 - see config.DRUM_NOTES); every other key
 # is silent. A straight pitch-based 1:1 conversion would drop almost the whole
-# song, so Drum gets its own conversion path with two modes:
-#
-#   - If the MIDI already has a real percussion track (General MIDI channel
-#     9, i.e. "channel 10" in most DAWs), each note is routed through the
-#     GM-percussion table below onto its closest in-game voice, so the
-#     original drum part is preserved as-is.
-#   - Otherwise (a normal melodic MIDI) _generate_groove() writes a drum-kit
-#     groove that listens to the melody: it splits the song into SECTIONS by
-#     density and register (so the beat changes on drops/lifts), locks the
-#     KICK to the melody's bassline (so each bar's groove matches the actual
-#     rhythm instead of a fixed pattern), and drops FILLS at phrase ends drawn
-#     from a rotating palette of tom rolls, snare rolls and syncopated
-#     patterns - so successive bars and fills keep changing with the music.
+# song, so Drum gets a separate Preserve / Augment / Generate path. Auto keeps
+# authored GM channel-10 percussion and generates when none exists. Generated
+# parts use the MIDI's beat, tempo and meter maps; onset count and sustained
+# occupancy determine activity without treating the members of one chord as
+# separate rhythmic events.
 
 DRUM_HIT_LEN = 0.09      # seconds a drum tap is held - drums aren't sustained
 DRUM_MIN_GAP = 0.06      # per-voice retrigger floor, so a blast-beat passage
@@ -583,7 +589,7 @@ _V_ACCENT, _V_NORMAL, _V_SOFT, _V_GHOST = 118, 100, 82, 55
 # voice (drum-like -> toms, short metallic/shaker ticks -> closed hi-hat,
 # sustained metallic -> open hi-hat). The game has no ride cymbal, so rides
 # fold onto the closed hi-hat (their usual steady-timekeeping role). Anything
-# not listed defaults to the closed hi-hat (see _gm_drum_bucket).
+# not listed is ignored rather than turned into a misleading hi-hat.
 _GM_TO_VOICE = {
     # kick
     35: DRUM_KICK, 36: DRUM_KICK,
@@ -616,7 +622,9 @@ _GM_TO_VOICE = {
 
 def _gm_drum_bucket(note):
     """Closest in-game drum voice for a GM percussion note (channel 10)."""
-    return _GM_TO_VOICE.get(note, DRUM_HH_CLOSED)
+    # Unknown percussion notes are ignored. Treating every unknown value as a
+    # closed hi-hat can turn vendor-specific percussion into a hat machine-gun.
+    return _GM_TO_VOICE.get(note)
 
 
 def _chord_onsets(notes):
@@ -947,7 +955,372 @@ def _generate_groove(notes, beat_len, beats_per_measure):
     return hits
 
 
-def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4):
+class _DrumTimeline:
+    """Convert absolute quarter-note beats to scaled playback seconds."""
+
+    def __init__(self, tempo_map, default_bpm, factor):
+        points = tempo_map or [{'beat': 0.0, 'bpm': default_bpm}]
+        cleaned = []
+        for point in points:
+            beat = max(0.0, float(point.get('beat', 0.0)))
+            bpm = float(point.get('bpm', default_bpm) or default_bpm)
+            if bpm > 0:
+                cleaned.append((beat, bpm))
+        cleaned.sort()
+        if not cleaned or cleaned[0][0] > 0:
+            cleaned.insert(0, (0.0, default_bpm))
+        self.points = cleaned
+        self.factor = factor
+
+    def seconds(self, beat):
+        beat = max(0.0, float(beat))
+        total = 0.0
+        for index, (start, bpm) in enumerate(self.points):
+            if start >= beat:
+                break
+            end = beat
+            if index + 1 < len(self.points):
+                end = min(end, self.points[index + 1][0])
+            if end > start:
+                total += (end - start) * 60.0 / bpm
+            if end >= beat:
+                break
+        return total * self.factor
+
+
+def _drum_note_beats(notes, timeline, default_bpm, factor):
+    """Fill beat metadata for legacy callers and synthetic tests."""
+    seconds_per_beat = (60.0 / default_bpm) * factor
+    for note in notes:
+        if note.get('start_beat') is None:
+            note['start_beat'] = note['start'] / max(seconds_per_beat, 1e-9)
+        if note.get('end_beat') is None:
+            note['end_beat'] = max(
+                note['start_beat'],
+                note['start_beat'] + (note['end'] - note['start']) /
+                max(seconds_per_beat, 1e-9),
+            )
+
+
+def _drum_bars(end_beat, time_signature_map, default_numerator):
+    """Build meter-aware bars as (start, end, numerator, denominator)."""
+    points = time_signature_map or [{
+        'beat': 0.0, 'numerator': default_numerator, 'denominator': 4
+    }]
+    cleaned = []
+    for point in points:
+        cleaned.append((
+            max(0.0, float(point.get('beat', 0.0))),
+            max(1, int(point.get('numerator', default_numerator))),
+            max(1, int(point.get('denominator', 4))),
+        ))
+    cleaned.sort()
+    if not cleaned or cleaned[0][0] > 0:
+        cleaned.insert(0, (0.0, max(1, int(default_numerator)), 4))
+
+    bars = []
+    for index, (section_start, numerator, denominator) in enumerate(cleaned):
+        section_end = end_beat
+        if index + 1 < len(cleaned):
+            section_end = min(section_end, cleaned[index + 1][0])
+        bar_beats = numerator * 4.0 / denominator
+        cursor = section_start
+        while cursor < section_end - 1e-9:
+            bar_end = min(cursor + bar_beats, section_end)
+            bars.append((cursor, bar_end, numerator, denominator))
+            cursor = bar_end
+        if section_end >= end_beat:
+            break
+    return bars
+
+
+def _drum_bar_analysis(notes, bars):
+    """Measure rhythmic activity without mistaking chord size for density."""
+    if not bars:
+        return []
+    starts = [bar[0] for bar in bars]
+    ends = [bar[1] for bar in bars]
+    onsets_by_bar = [[] for _bar in bars]
+    velocities_by_bar = [[] for _bar in bars]
+    max_overlap = [0.0 for _bar in bars]
+    full_bar_delta = [0 for _ in range(len(bars) + 1)]
+
+    for note in notes:
+        ns = float(note['start_beat'])
+        ne = max(ns, float(note['end_beat']))
+        onset_bar = bisect_right(starts, ns) - 1
+        if (0 <= onset_bar < len(bars)
+                and starts[onset_bar] <= ns < ends[onset_bar]):
+            onsets_by_bar[onset_bar].append(ns)
+            velocities_by_bar[onset_bar].append(note.get('velocity', 64))
+
+        first = bisect_right(ends, ns)
+        last = bisect_left(starts, ne) - 1
+        first = max(0, first)
+        last = min(len(bars) - 1, last)
+        if first > last:
+            continue
+        max_overlap[first] = max(
+            max_overlap[first], min(ne, ends[first]) - max(ns, starts[first]))
+        if last != first:
+            max_overlap[last] = max(
+                max_overlap[last], min(ne, ends[last]) - max(ns, starts[last]))
+            if first + 1 < last:
+                full_bar_delta[first + 1] += 1
+                full_bar_delta[last] -= 1
+
+    full_depth = 0
+    analysis = []
+    for index, (start, end, numerator, denominator) in enumerate(bars):
+        full_depth += full_bar_delta[index]
+        nominal_bar_beats = numerator * 4.0 / denominator
+        onsets = onsets_by_bar[index]
+        velocities = velocities_by_bar[index]
+        onset_groups = []
+        for onset in sorted(onsets):
+            if not onset_groups or onset - onset_groups[-1] > 0.06:
+                onset_groups.append(onset)
+        occupancy = 1.0 if full_depth else max_overlap[index] / max(
+            nominal_bar_beats, 1e-9)
+        rhythmic_rate = len(onset_groups) / max(nominal_bar_beats, 1e-9)
+        active = occupancy > 0.08 or bool(onset_groups)
+        if not active:
+            level = -1
+        elif rhythmic_rate < 0.55:
+            level = 0
+        elif rhythmic_rate < 1.3:
+            level = 1
+        else:
+            level = 2
+        analysis.append({
+            'active': active,
+            'level': level,
+            'occupancy': occupancy,
+            'onsets': onset_groups,
+            'velocity': sum(velocities) / len(velocities) if velocities else 64,
+        })
+    return analysis
+
+
+def _swing_beat(beat, division, amount):
+    if amount <= 0 or division <= 0:
+        return beat
+    slot = int(round(beat / division))
+    if slot % 2:
+        return beat + division * min(0.5, amount)
+    return beat
+
+
+def _add_beat_hit(hits, timeline, beat, voice, velocity, swing=0.0,
+                  swing_division=0.5):
+    beat = _swing_beat(beat, swing_division, swing)
+    hits.append((timeline.seconds(beat), voice, int(max(1, min(127, velocity)))))
+
+
+def _meter_backbeats(numerator, denominator):
+    """Return strong kick/snare positions in quarter-note beat units."""
+    bar_beats = numerator * 4.0 / denominator
+    if denominator == 8 and numerator % 3 == 0:
+        pulse = 1.5
+        kicks = [0.0]
+        snares = [pulse] if numerator >= 6 else []
+    elif numerator == 3:
+        kicks, snares = [0.0], [1.0, 2.0]
+    elif numerator == 2:
+        kicks, snares = [0.0], [1.0]
+    elif numerator == 5:
+        kicks, snares = [0.0, 3.0], [2.0, 4.0]
+    elif numerator == 7 and denominator == 8:
+        kicks, snares = [0.0, 2.0], [1.0, 3.0]
+    else:
+        kicks = [beat for beat in (0.0, 2.0) if beat < bar_beats]
+        snares = [beat for beat in (1.0, 3.0) if beat < bar_beats]
+    return (
+        bar_beats,
+        [beat for beat in kicks if 0 <= beat < bar_beats],
+        [beat for beat in snares if 0 <= beat < bar_beats],
+    )
+
+
+def _generate_groove_v2(notes, timeline, bars, settings):
+    """Generate a meter-aware groove driven by onset and occupancy activity."""
+    if not notes or not bars:
+        return []
+    analysis = _drum_bar_analysis(notes, bars)
+    first_onset = min(float(note['start_beat']) for note in notes)
+    hits = []
+    fill_rotation = 0
+    style_setting = (settings.drum_style or 'auto').lower()
+    hat_setting = (settings.drum_hat_density or 'eighth').lower()
+    intensity = max(0.25, min(2.0, float(settings.drum_intensity)))
+    fill_every = max(0, int(settings.drum_fill_frequency))
+
+    for index, ((start, end, numerator, denominator), info) in enumerate(
+            zip(bars, analysis)):
+        if not info['active']:
+            continue
+        level = info['level']
+        style = style_setting
+        if style == 'auto':
+            style = ('ballad', 'pop', 'rock')[max(0, min(2, level))]
+        bar_beats, kicks, snares = _meter_backbeats(numerator, denominator)
+
+        # Intensity changes arrangement density, not merely velocity.
+        if intensity < 0.65:
+            snares = snares[:1]
+            kicks = kicks[:1]
+        elif intensity >= 1.35 and bar_beats >= 2:
+            kicks = sorted(set(kicks + [bar_beats / 2.0]))
+        if style == 'dance':
+            kicks = [b for b in range(int(math.ceil(bar_beats))) if b < bar_beats]
+        elif style == 'ballad':
+            kicks = kicks[:1]
+        elif style == 'rock' and bar_beats >= 4:
+            kicks = sorted(set(kicks + [3.0]))
+        elif style == 'pop' and bar_beats >= 3:
+            kicks = sorted(set(kicks + [2.5]))
+
+        previous_level = analysis[index - 1]['level'] if index else -1
+        if index == 0 or previous_level != level:
+            crash = DRUM_CRASH_2 if level >= 2 else DRUM_CRASH_1
+            _add_beat_hit(hits, timeline, start, crash, _V_ACCENT)
+        for offset in kicks:
+            _add_beat_hit(hits, timeline, start + offset, DRUM_KICK,
+                          _V_ACCENT if offset == 0 else _V_NORMAL)
+        for offset in snares:
+            _add_beat_hit(hits, timeline, start + offset, DRUM_SNARE, _V_NORMAL)
+
+        if hat_setting == 'quarter':
+            hat_step = 1.0
+        elif hat_setting == 'sixteenth':
+            hat_step = 0.25
+        else:
+            hat_step = 0.5
+        if intensity < 0.55 or level == 0:
+            hat_step = max(1.0, hat_step)
+        elif intensity > 1.6:
+            hat_step = min(0.25, hat_step)
+        offset = 0.0
+        slot = 0
+        while offset < bar_beats - 1e-9:
+            voice = DRUM_HH_OPEN if style == 'dance' and slot % 4 == 2 else DRUM_HH_CLOSED
+            _add_beat_hit(
+                hits, timeline, start + offset, voice,
+                _V_NORMAL if slot % 2 == 0 else _V_SOFT,
+                settings.drum_swing, hat_step,
+            )
+            # High-activity sections gain real subdivisions while retaining
+            # an eighth-note closed-hat backbone.
+            if level >= 2 and intensity >= 0.8 and hat_step >= 0.5:
+                _add_beat_hit(
+                    hits, timeline, start + offset + hat_step / 2.0,
+                    DRUM_HH_OPEN, _V_GHOST, settings.drum_swing, hat_step / 2.0)
+            offset += hat_step
+            slot += 1
+
+        # Follow a limited number of genuine off-beat musical onsets.
+        follow_count = int(round(max(0.0, min(1.0, settings.drum_bass_follow)) * 2))
+        offbeats = []
+        for onset in info['onsets']:
+            local = onset - start
+            if abs(local - round(local)) > 0.12:
+                offbeats.append(onset)
+        for onset in offbeats[:follow_count]:
+            _add_beat_hit(hits, timeline, onset, DRUM_KICK, _V_SOFT)
+
+        seam = index + 1 < len(analysis) and analysis[index + 1]['level'] != level
+        periodic = fill_every and (index + 1) % fill_every == 0
+        if level >= 1 and intensity >= 0.8 and (seam or periodic):
+            fill_len = min(1.0, bar_beats)
+            fill_start = end - fill_len
+            step = 0.25 if intensity >= 1.25 else 0.5
+            voices = (DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM, DRUM_SNARE)
+            fill_pos = fill_start
+            fi = 0
+            while fill_pos < end - 1e-9:
+                _add_beat_hit(hits, timeline, fill_pos,
+                              voices[(fill_rotation + fi) % len(voices)], _V_NORMAL)
+                fill_pos += step
+                fi += 1
+            fill_rotation += 1
+
+    # A pickup may begin after beat zero. Preserve the grid, but do not play
+    # accompaniment before the source starts or extend it past the source end.
+    first_time = timeline.seconds(first_onset)
+    last_time = timeline.seconds(max(float(note['end_beat']) for note in notes))
+    return [hit for hit in hits
+            if first_time - 1e-9 <= hit[0] <= last_time + 1e-9]
+
+
+def _gm_voice_family(voice):
+    if voice == DRUM_KICK:
+        return 'kick'
+    if voice == DRUM_SNARE:
+        return 'snare'
+    if voice in (DRUM_HH_CLOSED, DRUM_HH_OPEN):
+        return 'hat'
+    if voice in (DRUM_CRASH_1, DRUM_CRASH_2):
+        return 'cymbal'
+    return 'tom'
+
+
+def _map_gm_hits(notes, timeline, settings):
+    """Map GM drums while retaining source timing unless quantize is requested."""
+    hits = []
+    quantize = max(0.0, min(1.0, float(settings.drum_quantize)))
+    for note in notes:
+        voice = _gm_drum_bucket(note['note'])
+        if voice is None:
+            continue
+        source_beat = float(note['start_beat'])
+        if quantize:
+            grid = 0.25
+            target = round(source_beat / grid) * grid
+            source_beat += (target - source_beat) * quantize
+            source_beat = _swing_beat(source_beat, 0.5, settings.drum_swing)
+        hits.append((timeline.seconds(source_beat), voice, note['velocity']))
+
+    # Only collapse effectively simultaneous duplicates of the same voice.
+    hits.sort(key=lambda hit: (hit[0], hit[1]))
+    collapsed = []
+    for hit in hits:
+        if collapsed and hit[1] == collapsed[-1][1] and hit[0] - collapsed[-1][0] < 0.005:
+            if hit[2] > collapsed[-1][2]:
+                collapsed[-1] = hit
+        else:
+            collapsed.append(hit)
+    return collapsed
+
+
+def _choose_drum_source_mode(requested, original_hits, bars, timeline):
+    requested = (requested or 'auto').lower()
+    if requested in ('preserve', 'augment', 'generate'):
+        return requested
+    if not original_hits:
+        return 'generate'
+    # Auto is deliberately conservative: if the author supplied percussion,
+    # keep it. "Augment" is an explicit opt-in because adding parts can change
+    # the musical intent even when a source track looks incomplete.
+    return 'preserve'
+
+
+def _augment_hits(original, generated):
+    """Add only generated voice families missing near an original groove."""
+    if not original:
+        return generated
+    output = list(original)
+    for candidate in generated:
+        time, voice, _velocity = candidate
+        family = _gm_voice_family(voice)
+        if any(abs(time - existing[0]) < 0.08 and
+               _gm_voice_family(existing[1]) == family for existing in output):
+            continue
+        output.append(candidate)
+    return output
+
+
+def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4,
+                 tempo_map=None, time_signature_map=None):
     """Drum-mode conversion.
 
     Preserves a real GM percussion track (mapped onto the 9 in-game voices),
@@ -970,33 +1343,41 @@ def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4):
             n['end'] *= factor
 
     orig_bpm_safe = orig_bpm if orig_bpm and orig_bpm > 0 else 120.0
-    beat_len = (60.0 / orig_bpm_safe) * factor
+    timeline = _DrumTimeline(tempo_map, orig_bpm_safe, factor)
+    _drum_note_beats(notes, timeline, orig_bpm_safe, factor)
+    end_beat = max(float(note['end_beat']) for note in notes)
+    bars = _drum_bars(end_beat, time_signature_map, beats_per_measure)
 
-    has_gm_drum_track = any(n['channel'] == 9 for n in notes)
-
-    hits = []  # (time, voice, velocity)
-    if has_gm_drum_track:
-        drum_notes = [n for n in notes if n['channel'] == 9]
-        for g in group_chords(drum_notes, settings.chord_window, settings.consistent_windows):
-            best = {}
-            for n in g:
-                voice = _gm_drum_bucket(n['note'])
-                if voice not in best or n['velocity'] > best[voice]['velocity']:
-                    best[voice] = n
-            t = min(n['start'] for n in g)
-            for voice, n in best.items():
-                hits.append((t, voice, n['velocity']))
+    drum_notes = [note for note in notes if note['channel'] == 9]
+    melodic_notes = [note for note in notes if note['channel'] != 9]
+    original_hits = _map_gm_hits(drum_notes, timeline, settings)
+    if drum_notes and (settings.drum_source_mode or 'auto').lower() == 'auto':
+        mode = 'preserve'
     else:
-        hits = _generate_groove(notes, beat_len, beats_per_measure)
+        mode = _choose_drum_source_mode(
+            settings.drum_source_mode, original_hits, bars, timeline)
+    groove_source = melodic_notes or notes
+    generated_hits = _generate_groove_v2(groove_source, timeline, bars, settings)
+    if mode == 'preserve':
+        hits = original_hits
+    elif mode == 'augment':
+        hits = _augment_hits(original_hits, generated_hits)
+    else:
+        hits = generated_hits
 
     # Per-voice retrigger floor: drop hits arriving too soon after the last
     # hit on the same voice (keeps fast passages from becoming a key-mash).
-    hits.sort(key=lambda h: h[0])
+    hits.sort(key=lambda h: (h[0], h[1]))
     last_by_voice = {}
     kept = []
+    min_spacing = max(
+        DRUM_MIN_GAP,
+        MIN_NOTE_LEN + max(0.0, settings.retrigger_gap),
+        max(0.0, float(settings.drum_min_spacing)),
+    )
     for t, voice, vel in hits:
         prev = last_by_voice.get(voice)
-        if prev is not None and t - prev < DRUM_MIN_GAP:
+        if prev is not None and t - prev < min_spacing:
             continue
         kept.append([t, voice, vel])
         last_by_voice[voice] = t
