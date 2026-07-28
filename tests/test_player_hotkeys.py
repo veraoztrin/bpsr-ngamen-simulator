@@ -55,6 +55,17 @@ class StatefulSimulator:
         self.current_octave_shift = 0
 
 
+class FocusSimulator(StatefulSimulator):
+    def __init__(self):
+        super().__init__()
+        self.focus_guard_enabled = True
+        self.target_window_text = "Blue Protocol"
+        self.focused = False
+
+    def is_target_focused(self):
+        return self.focused
+
+
 def _state_events():
     return [
         {"time": 0.0, "type": "zone", "value": 1},
@@ -98,6 +109,33 @@ def test_pause_during_countdown_never_shows_negative_time():
     player.play()
     check("resuming a paused countdown preserves the countdown",
           player.is_syncing, f"start={player.start_time}")
+    player.stop()
+
+
+def test_play_waits_for_game_focus_without_skipping():
+    player = MidiPlayer()
+    player.simulator = FocusSimulator()
+    player.load_events([
+        {"time": 0.0, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 0.2, "type": "note_off", "note": 60, "channel": 0},
+    ], [0])
+    player.play()
+    time.sleep(0.06)
+    check("playback waits when focus safety blocks the game",
+          player.is_playing and player.is_focus_waiting
+          and ("press", 60) not in player.simulator.log,
+          f"log={player.simulator.log}")
+    check("the song clock stays at the first event while focus is blocked",
+          player.get_current_time() < 0.02,
+          f"time={player.get_current_time()}")
+
+    player.simulator.focused = True
+    deadline = time.time() + 1.0
+    while ("press", 60) not in player.simulator.log and time.time() < deadline:
+        time.sleep(0.01)
+    check("playback starts from the first note when game focus returns",
+          ("press", 60) in player.simulator.log,
+          f"log={player.simulator.log}")
     player.stop()
 
 
@@ -193,6 +231,15 @@ class FakeUser32:
         return 1
 
 
+class FakePollingUser32(FakeUser32):
+    def __init__(self, fail_vk):
+        super().__init__(fail_vk=fail_vk)
+        self.down = set()
+
+    def GetAsyncKeyState(self, vk):
+        return 0x8000 if vk in self.down else 0
+
+
 def test_hotkey_registration_dispatch_and_shutdown():
     original_user32, original_kernel32 = hotkeys.user32, hotkeys.kernel32
     fake = FakeUser32()
@@ -243,13 +290,46 @@ def test_partial_hotkey_registration_is_rejected():
         hotkeys.kernel32 = original_kernel32
 
 
+def test_conflicted_hotkeys_fall_back_to_edge_polling():
+    original_user32, original_kernel32 = hotkeys.user32, hotkeys.kernel32
+    fake = FakePollingUser32(fail_vk=hotkeys.VK_F10)
+    fired = []
+    try:
+        hotkeys.user32 = fake
+        hotkeys.kernel32 = FakeKernel32()
+        listener = hotkeys.GlobalHotkeys({
+            hotkeys.VK_F9: lambda: fired.append("play"),
+            hotkeys.VK_F10: lambda: fired.append("pause"),
+            hotkeys.VK_F11: lambda: fired.append("stop"),
+        })
+        started = listener.start()
+        mode = listener.mode
+        fake.down.add(hotkeys.VK_F9)
+        time.sleep(0.06)
+        time.sleep(0.04)  # held key must not repeat
+        fake.down.remove(hotkeys.VK_F9)
+        time.sleep(0.04)
+        fake.down.add(hotkeys.VK_F9)
+        time.sleep(0.06)
+        listener.stop()
+        check("registration conflicts enable the polling fallback",
+              started and mode == "poll", f"started={started}, mode={mode}")
+        check("polling fires once per physical key press",
+              fired == ["play", "play"], f"fired={fired}")
+    finally:
+        hotkeys.user32 = original_user32
+        hotkeys.kernel32 = original_kernel32
+
+
 if __name__ == "__main__":
     test_pause_resume_restores_global_state()
     test_pause_during_countdown_never_shows_negative_time()
+    test_play_waits_for_game_focus_without_skipping()
     test_sustain_is_owned_per_channel()
     test_seek_reconstructs_each_channel_pedal()
     test_focus_release_can_restore_state()
     test_hotkey_registration_dispatch_and_shutdown()
     test_partial_hotkey_registration_is_rejected()
+    test_conflicted_hotkeys_fall_back_to_edge_polling()
     print(f"\n{PASS} passed, {FAIL} failed")
     sys.exit(1 if FAIL else 0)

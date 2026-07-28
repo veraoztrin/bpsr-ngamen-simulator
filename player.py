@@ -31,6 +31,8 @@ class MidiPlayer:
         # Zone hints are global. release_all() physically resets the modifier,
         # so retain the requested zone for pause/focus-loss restoration.
         self._current_zone = 0
+        self.is_focus_waiting = False
+        self._focus_wait_started = None
         self.current_event_idx = 0
         self.start_time = 0.0
         self.pause_time = 0.0
@@ -76,7 +78,9 @@ class MidiPlayer:
             return 0.0
         if self.is_syncing:
             return 0.0
-        if self.is_paused:
+        if self.is_focus_waiting and self._focus_wait_started is not None:
+            position = self._focus_wait_started - self.start_time
+        elif self.is_paused:
             position = self.pause_time - self.start_time
         else:
             position = time.perf_counter() - self.start_time
@@ -137,12 +141,40 @@ class MidiPlayer:
         if thread and thread.is_alive() and thread is not threading.current_thread():
             thread.join()
 
+    def _output_focus_ready(self):
+        simulator = self.simulator
+        if not simulator or not getattr(simulator, "focus_guard_enabled", False):
+            return True
+        checker = getattr(simulator, "is_target_focused", None)
+        return bool(checker and checker())
+
+    def _wait_for_output_focus(self, cancel):
+        """Freeze the song clock while focus safety blocks key output."""
+        if self._output_focus_ready():
+            return True
+        blocked_at = time.perf_counter()
+        with self._state_lock:
+            self.is_focus_waiting = True
+            self._focus_wait_started = blocked_at
+        try:
+            while not cancel.is_set() and not self._output_focus_ready():
+                cancel.wait(0.025)
+        finally:
+            elapsed = time.perf_counter() - blocked_at
+            with self._state_lock:
+                # Even cancellation needs this adjustment: pause_time was
+                # captured at the end of the blocked interval.
+                self.start_time += elapsed
+                self.is_focus_waiting = False
+                self._focus_wait_started = None
+        return not cancel.is_set()
+
     def play(self, delay_seconds=0.0):
         # A paused worker is always joined before pause() returns, but joining
         # here as well makes programmatic state changes safe.
         with self._state_lock:
             if self.is_playing:
-                return
+                return False
         try:
             delay_seconds = float(delay_seconds)
         except (TypeError, ValueError):
@@ -160,7 +192,7 @@ class MidiPlayer:
                 self.start_time += time.perf_counter() - self.pause_time
             else:
                 if not self.events:
-                    return
+                    return False
                 self.current_event_idx = 0
                 # delay_seconds allows synchronization
                 self.start_time = time.perf_counter() + delay_seconds
@@ -168,11 +200,14 @@ class MidiPlayer:
 
             self.stop_requested = False
             self.is_playing = True
+            self.is_focus_waiting = False
+            self._focus_wait_started = None
             self._cancel_event = threading.Event()
             cancel = self._cancel_event
             self.thread = threading.Thread(
                 target=self._playback_loop, args=(cancel,), daemon=True)
             self.thread.start()
+            return True
 
     def seek(self, target_time):
         """Jump to a specific point in the song (seconds).
@@ -267,6 +302,8 @@ class MidiPlayer:
             self._active_notes.clear()
             self._sustain_by_channel.clear()
             self._current_zone = 0
+            self.is_focus_waiting = False
+            self._focus_wait_started = None
             self.current_event_idx = 0
 
     def _accurate_delay(self, target_time, cancel):
@@ -294,9 +331,13 @@ class MidiPlayer:
 
             ev = self.events[self.current_event_idx]
             
-            target_time = self.start_time + ev['time']
-            
-            self._accurate_delay(target_time, cancel)
+            while not cancel.is_set():
+                target_time = self.start_time + ev['time']
+                self._accurate_delay(target_time, cancel)
+                if cancel.is_set() or self._output_focus_ready():
+                    break
+                if not self._wait_for_output_focus(cancel):
+                    break
             
             if cancel.is_set():
                 break

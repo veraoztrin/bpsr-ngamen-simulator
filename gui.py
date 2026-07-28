@@ -68,6 +68,7 @@ class App(ctk.CTk):
         self.current_song_idx = -1
         self.was_playing = False
         self._focus_was_blocked = False
+        self._play_wait_message_active = False
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -153,7 +154,8 @@ class App(ctk.CTk):
                 candidate.stop()
                 self.global_hotkeys_var.set(False)
                 self.settings_error_label.configure(
-                    text="F9–F11 could not be registered. Another app may be using them.")
+                    text="F9–F11 could not be registered. Another app may be using them.",
+                    text_color="#ff6b6b")
 
     def toggle_global_hotkeys(self):
         if self.global_hotkeys_var.get():
@@ -164,7 +166,8 @@ class App(ctk.CTk):
             else:
                 self.global_hotkeys_var.set(True)
                 self.settings_error_label.configure(
-                    text="Global hotkeys are still stopping; try again in a moment.")
+                    text="Global hotkeys are still stopping; try again in a moment.",
+                    text_color="#ff6b6b")
 
     def hotkey_play(self):
         # F9 starts playback, or resumes it when paused.
@@ -655,25 +658,35 @@ class App(ctk.CTk):
         focus_blocked = bool(
             self.player.is_playing and simulator
             and simulator.focus_guard_enabled and not simulator.is_target_focused())
-        if focus_blocked:
+        if self.player.is_syncing:
+            self.led_label.configure(
+                text="🟡 Starting — switch to game", text_color="yellow")
+        elif focus_blocked:
             if (simulator.key_refs or simulator.sustain_active
                     or simulator.current_octave_shift):
                 self.player.release_output_state()
             self.led_label.configure(
-                text="🟠 Focus game", text_color="orange")
+                text="🟠 Waiting for game focus", text_color="orange")
         elif self._focus_was_blocked and self.player.is_playing:
             # Focus safety released the pedal/modifier state. Reapply it once
             # the game regains focus; in-progress notes stay released.
             self.player.restore_output_state()
             self.led_label.configure(text="🟢 Playing", text_color="green")
-        elif self.player.is_syncing:
-            self.led_label.configure(text="🟡 Syncing...", text_color="yellow")
+            if self._play_wait_message_active:
+                self.settings_error_label.configure(
+                    text="", text_color="#ff6b6b")
+                self._play_wait_message_active = False
         elif self.player.is_playing:
             self.led_label.configure(text="🟢 Playing", text_color="green")
         else:
             self.led_label.configure(text="🔴 Stopped", text_color="gray")
 
         self._focus_was_blocked = focus_blocked
+        if (self._play_wait_message_active and self.player.is_playing
+                and not focus_blocked):
+            self.settings_error_label.configure(
+                text="", text_color="#ff6b6b")
+            self._play_wait_message_active = False
         self._refresh_progress_bar()
 
         # Auto-advance song if finished naturally (only when Autoplay is on).
@@ -814,7 +827,8 @@ class App(ctk.CTk):
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4")
         if not self.raw_events:
             self.settings_error_label.configure(
-                text="The file has no playable MIDI notes or could not be parsed.")
+                text="The file has no playable MIDI notes or could not be parsed.",
+                text_color="#ff6b6b")
         if self.reconvert() and on_loaded:
             on_loaded()
         if (self.network.room_code and not self.network.is_host
@@ -1031,9 +1045,10 @@ class App(ctk.CTk):
         try:
             settings = self.build_settings()
         except ValueError as exc:
-            self.settings_error_label.configure(text=str(exc))
+            self.settings_error_label.configure(
+                text=str(exc), text_color="#ff6b6b")
             return False
-        self.settings_error_label.configure(text="")
+        self.settings_error_label.configure(text="", text_color="#ff6b6b")
 
         # Apply input timing knobs + the instrument's key offset even when no
         # song is loaded; live-MIDI-only users rely on restored preferences.
@@ -1137,19 +1152,45 @@ class App(ctk.CTk):
 
     def play_solo(self):
         self.update_solo_channels()
-        if self.events:
-            text = self.solo_delay_entry.get().strip().replace(",", ".")
-            try:
-                delay = float(text)
-            except ValueError:
-                delay = -1
-            if not math.isfinite(delay) or not 0 <= delay <= 10:
+        if not self.events:
+            self.settings_error_label.configure(
+                text="No playable MIDI is ready. Load a file and wait for conversion.",
+                text_color="#ff6b6b")
+            return
+        if not self.player.active_channels:
+            self.settings_error_label.configure(
+                text="Select at least one Solo Active Channel before playing.",
+                text_color="#ff6b6b")
+            return
+
+        text = self.solo_delay_entry.get().strip().replace(",", ".")
+        try:
+            delay = float(text)
+        except ValueError:
+            delay = -1
+        if not math.isfinite(delay) or not 0 <= delay <= 10:
+            self.settings_error_label.configure(
+                text="Start delay must be between 0 and 10 seconds.",
+                text_color="#ff6b6b")
+            return
+
+        simulator = self.player.simulator
+        target_focused = bool(simulator and simulator.is_target_focused())
+        if target_focused:
+            delay = 0.0
+        if self.player.play(delay_seconds=delay):
+            if (simulator and simulator.focus_guard_enabled
+                    and not target_focused):
+                target = simulator.target_window_text or "the game"
                 self.settings_error_label.configure(
-                    text="Start delay must be between 0 and 10 seconds.")
-                return
-            if self.player.simulator and self.player.simulator.is_target_focused():
-                delay = 0.0
-            self.player.play(delay_seconds=delay)
+                    text=f"Playback armed — switch to {target}. "
+                         "The song will wait instead of skipping notes.",
+                    text_color="orange")
+                self._play_wait_message_active = True
+            else:
+                self.settings_error_label.configure(
+                    text="", text_color="#ff6b6b")
+                self._play_wait_message_active = False
 
     # --- Networking ---
 
