@@ -230,6 +230,111 @@ def test_kick_follows_the_bassline():
           f"identical kick times ({len(ka)})")
 
 
+def test_kick_follows_low_voice_not_high_melody():
+    from arranger import ConversionSettings, convert_drum, DRUM_KICK
+    # Keep the same pitches and note count, but swap which voice is syncopated.
+    # Only the low voice should place a kick on the first off-beat (0.25 sec).
+    def build(low_offset, high_offset):
+        events = []
+        for bar in range(4):
+            base = bar * 2.0
+            for beat in range(4):
+                events += _note(base + beat * 0.5 + low_offset, 0.08, 43)
+                events += _note(base + beat * 0.5 + high_offset, 0.08, 76)
+        return sorted(events, key=lambda event: event['time'])
+
+    settings = ConversionSettings(
+        drum_style='ballad', drum_fill_frequency=0)
+    low_sync = convert_drum(
+        build(0.25, 0.0), settings, orig_bpm=120, beats_per_measure=4)
+    high_sync = convert_drum(
+        build(0.0, 0.25), settings, orig_bpm=120, beats_per_measure=4)
+    low_kicks = {round(t % 2.0, 3) for t, note in _hits(low_sync)
+                 if note == DRUM_KICK}
+    high_kicks = {round(t % 2.0, 3) for t, note in _hits(high_sync)
+                  if note == DRUM_KICK}
+    check("kick syncopation follows the low voice, not the high melody",
+          0.25 in low_kicks and 0.25 not in high_kicks,
+          f"low={sorted(low_kicks)} high={sorted(high_kicks)}")
+
+
+def test_melody_syncopation_changes_snare_answers():
+    from arranger import ConversionSettings, convert_drum, DRUM_SNARE
+    def build(melody_offset):
+        events = []
+        for bar in range(6):
+            base = bar * 2.0
+            for beat in range(4):
+                events += _note(base + beat * 0.5, 0.08, 43)
+                events += _note(
+                    base + beat * 0.5 + melody_offset, 0.08, 76,
+                    velocity=105)
+        return sorted(events, key=lambda event: event['time'])
+
+    settings = ConversionSettings(
+        drum_style='ballad', drum_fill_frequency=0)
+    straight = convert_drum(
+        build(0.0), settings, orig_bpm=120, beats_per_measure=4)
+    syncopated = convert_drum(
+        build(0.25), settings, orig_bpm=120, beats_per_measure=4)
+    straight_snares = [t for t, note in _hits(straight)
+                       if note == DRUM_SNARE]
+    sync_snares = [t for t, note in _hits(syncopated)
+                   if note == DRUM_SNARE]
+    check("syncopated melody earns extra ghost-snare answers",
+          len(sync_snares) > len(straight_snares),
+          f"straight={len(straight_snares)} syncopated={len(sync_snares)}")
+
+
+def test_generated_groove_is_varied_but_repeatable():
+    from arranger import ConversionSettings, convert_drum, DRUM_KICK
+    events = []
+    for bar in range(9):
+        base = bar * 2.0
+        for beat in range(4):
+            events += _note(base + beat * 0.5, 0.08, 43, velocity=90)
+            events += _note(base + beat * 0.5, 0.08, 76, velocity=100)
+    events.sort(key=lambda event: event['time'])
+    settings = ConversionSettings(drum_style='pop', drum_fill_frequency=0)
+    first = convert_drum(
+        events, settings, orig_bpm=120, beats_per_measure=4)
+    second = convert_drum(
+        events, settings, orig_bpm=120, beats_per_measure=4)
+    kick_shapes = []
+    hits = _hits(first)
+    for bar in range(9):
+        kick_shapes.append(tuple(
+            round(t - bar * 2.0, 3)
+            for t, note in hits
+            if note == DRUM_KICK and bar * 2.0 <= t < (bar + 1) * 2.0
+        ))
+    check("identical input produces an identical generated performance",
+          first == second)
+    check("repeated musical bars receive stable groove variations",
+          len(set(kick_shapes)) >= 2, f"shapes={kick_shapes}")
+
+
+def test_note_dynamics_shape_drum_energy():
+    from arranger import ConversionSettings, convert_drum
+    def build(velocity):
+        events = []
+        for bar in range(6):
+            for slot in range(8):
+                events += _note(
+                    bar * 2.0 + slot * 0.25, 0.07, 60 + slot % 5,
+                    velocity=velocity)
+        return sorted(events, key=lambda event: event['time'])
+
+    settings = ConversionSettings(drum_fill_frequency=0)
+    soft = convert_drum(
+        build(30), settings, orig_bpm=120, beats_per_measure=4)
+    loud = convert_drum(
+        build(120), settings, orig_bpm=120, beats_per_measure=4)
+    check("louder source dynamics raise the generated drum energy",
+          len(_hits(loud)) > len(_hits(soft)),
+          f"soft={len(_hits(soft))} loud={len(_hits(loud))}")
+
+
 def test_rest_bars_produce_no_drums():
     from arranger import ConversionSettings, convert_drum
     bar = 0.5 * 4
@@ -444,6 +549,10 @@ if __name__ == "__main__":
         test_sparse_song_stays_minimal,
         test_closed_hats_are_not_sixteenth_spammed,
         test_kick_follows_the_bassline,
+        test_kick_follows_low_voice_not_high_melody,
+        test_melody_syncopation_changes_snare_answers,
+        test_generated_groove_is_varied_but_repeatable,
+        test_note_dynamics_shape_drum_energy,
         test_rest_bars_produce_no_drums,
         test_groove_scales_with_speed,
         test_varied_song_uses_all_nine_voices,

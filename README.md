@@ -53,11 +53,11 @@ Selecting **Drum** reveals percussion controls instead of pitch-range and chord 
 
 - **Drum source:** **Auto** safely preserves an authored GM channel-10 drum track and generates a groove when none exists. **Preserve** forces source-only mapping, **Augment** keeps it while filling missing kit roles, and **Generate** replaces it.
 - **Style / Intensity:** Auto, Rock, Pop, Ballad, or Dance. Intensity changes the number and placement of hits rather than merely changing their volume.
-- **Fills / Hats / Bass follow:** Set the fill interval, quarter/eighth/sixteenth hat backbone, and how strongly off-beat source onsets influence the kick.
+- **Fills / Hats / Bass follow:** Set the fallback fill interval, quarter/eighth/sixteenth hat backbone, and how strongly off-beat notes in the inferred **low voice** influence the kick. High melody notes are analysed separately and can receive restrained ghost-snare answers.
 - **Swing / Quantize:** Swing generated subdivisions; optionally pull preserved GM hits toward the grid without discarding their original timing by default.
 - **Minimum spacing:** A same-drum retrigger limit in milliseconds. `0` uses the safe automatic value derived from the app's retrigger gap.
 
-The arranger follows the MIDI's complete tempo and time-signature maps, keeps pickups on the correct bar grid, supports meters such as 3/4 and 6/8, treats a chord as one rhythmic onset, and uses sustained-note occupancy so held passages do not become accidental silence.
+The arranger follows the MIDI's complete tempo and time-signature maps, keeps pickups on the correct bar grid, supports meters such as 3/4 and 6/8, treats a chord as one rhythmic onset, and uses sustained-note occupancy so held passages do not become accidental silence. Generated grooves also react to source dynamics, register, phrase gaps, section-energy changes, bass syncopation, and melody syncopation. Repeated bars receive deterministic motif variations, so re-converting the same MIDI stays repeatable without sounding like one pasted loop.
 
 ## Setup & Installation
 

@@ -1035,13 +1035,23 @@ def _drum_bars(end_beat, time_signature_map, default_numerator):
 
 
 def _drum_bar_analysis(notes, bars):
-    """Measure rhythmic activity without mistaking chord size for density."""
+    """Extract musical activity, dynamics, register, and low-voice rhythm."""
     if not bars:
         return []
+    all_pitches = sorted(int(note['note']) for note in notes)
+    global_median = all_pitches[len(all_pitches) // 2]
+    pitch_span = all_pitches[-1] - all_pitches[0]
+    lower_quartile = all_pitches[len(all_pitches) // 4]
+    if global_median <= 55:
+        bass_cutoff = global_median + 3
+    elif pitch_span >= 12:
+        bass_cutoff = min(global_median - 5, lower_quartile + 3)
+    else:
+        bass_cutoff = -1
+
     starts = [bar[0] for bar in bars]
     ends = [bar[1] for bar in bars]
     onsets_by_bar = [[] for _bar in bars]
-    velocities_by_bar = [[] for _bar in bars]
     max_overlap = [0.0 for _bar in bars]
     full_bar_delta = [0 for _ in range(len(bars) + 1)]
 
@@ -1051,8 +1061,10 @@ def _drum_bar_analysis(notes, bars):
         onset_bar = bisect_right(starts, ns) - 1
         if (0 <= onset_bar < len(bars)
                 and starts[onset_bar] <= ns < ends[onset_bar]):
-            onsets_by_bar[onset_bar].append(ns)
-            velocities_by_bar[onset_bar].append(note.get('velocity', 64))
+            onsets_by_bar[onset_bar].append((
+                ns, int(note['note']), int(note.get('velocity', 64)),
+                max(0.0, ne - ns),
+            ))
 
         first = bisect_right(ends, ns)
         last = bisect_left(starts, ne) - 1
@@ -1074,31 +1086,106 @@ def _drum_bar_analysis(notes, bars):
     for index, (start, end, numerator, denominator) in enumerate(bars):
         full_depth += full_bar_delta[index]
         nominal_bar_beats = numerator * 4.0 / denominator
-        onsets = onsets_by_bar[index]
-        velocities = velocities_by_bar[index]
         onset_groups = []
-        for onset in sorted(onsets):
-            if not onset_groups or onset - onset_groups[-1] > 0.06:
-                onset_groups.append(onset)
+        for beat, pitch, velocity, duration in sorted(onsets_by_bar[index]):
+            if not onset_groups or beat - onset_groups[-1]['beat'] > 0.06:
+                onset_groups.append({
+                    'beat': beat,
+                    'low': pitch,
+                    'high': pitch,
+                    'velocity': velocity,
+                    'duration': duration,
+                    'notes': 1,
+                })
+            else:
+                group = onset_groups[-1]
+                group['low'] = min(group['low'], pitch)
+                group['high'] = max(group['high'], pitch)
+                group['velocity'] = max(group['velocity'], velocity)
+                group['duration'] = max(group['duration'], duration)
+                group['notes'] += 1
         occupancy = 1.0 if full_depth else max_overlap[index] / max(
             nominal_bar_beats, 1e-9)
         rhythmic_rate = len(onset_groups) / max(nominal_bar_beats, 1e-9)
         active = occupancy > 0.08 or bool(onset_groups)
-        if not active:
-            level = -1
-        elif rhythmic_rate < 0.55:
-            level = 0
-        elif rhythmic_rate < 1.3:
-            level = 1
-        else:
-            level = 2
+        velocities = [group['velocity'] for group in onset_groups]
+        high_notes = [group['high'] for group in onset_groups]
+        average_velocity = (
+            sum(velocities) / len(velocities) if velocities else 64)
+        average_high = (
+            sum(high_notes) / len(high_notes) if high_notes else global_median)
+        rhythm_energy = min(1.0, rhythmic_rate / 2.0)
+        dynamic_energy = max(0.0, min(1.0, (average_velocity - 35.0) / 75.0))
+        register_lift = max(
+            0.0, min(1.0, (average_high - global_median) / 18.0))
+        energy = (
+            0.55 * rhythm_energy
+            + 0.25 * dynamic_energy
+            + 0.10 * min(1.0, occupancy)
+            + 0.10 * register_lift
+        ) if active else 0.0
         analysis.append({
             'active': active,
-            'level': level,
             'occupancy': occupancy,
-            'onsets': onset_groups,
-            'velocity': sum(velocities) / len(velocities) if velocities else 64,
+            'onsets': [group['beat'] for group in onset_groups],
+            'onset_details': onset_groups,
+            'bass_onsets': [
+                group for group in onset_groups
+                if group['low'] <= bass_cutoff
+            ],
+            'melody_onsets': [
+                group for group in onset_groups
+                if group['high'] >= global_median
+            ],
+            'velocity': average_velocity,
+            'energy': energy,
         })
+
+    # Smooth energy just enough to make builds feel gradual, while retaining
+    # the current bar as the strongest vote so drops still land on time.
+    for index, info in enumerate(analysis):
+        if not info['active']:
+            info['level'] = -1
+            info['smoothed_energy'] = 0.0
+            continue
+        neighbour_energy = []
+        if index and analysis[index - 1]['active']:
+            neighbour_energy.append(analysis[index - 1]['energy'])
+        if index + 1 < len(analysis) and analysis[index + 1]['active']:
+            neighbour_energy.append(analysis[index + 1]['energy'])
+        smoothed = (
+            info['energy'] * 2.0 + sum(neighbour_energy)
+        ) / (2.0 + len(neighbour_energy))
+        info['smoothed_energy'] = smoothed
+        if smoothed < 0.27:
+            info['level'] = 0
+        elif smoothed < 0.58:
+            info['level'] = 1
+        else:
+            info['level'] = 2
+
+    all_onsets = [
+        group['beat']
+        for info in analysis
+        for group in info['onset_details']
+    ]
+    for index, info in enumerate(analysis):
+        last = info['onsets'][-1] if info['onsets'] else None
+        next_position = (
+            bisect_right(all_onsets, last) if last is not None else 0)
+        next_onset = (
+            all_onsets[next_position]
+            if last is not None and next_position < len(all_onsets)
+            else None)
+        next_active = (
+            index + 1 < len(analysis) and analysis[index + 1]['active'])
+        info['phrase_end'] = bool(
+            info['active'] and (
+                not next_active
+                or (last is not None and next_onset is not None
+                    and next_onset - last >= 1.5)
+                or (last is not None and next_onset is None)
+            ))
     return analysis
 
 
@@ -1142,8 +1229,27 @@ def _meter_backbeats(numerator, denominator):
     )
 
 
+def _musical_bar_variant(info, bar_start, index):
+    """Stable 0..2 variation derived from this bar's authored MIDI rhythm."""
+    signature = index * 17 + int(round(info['energy'] * 100))
+    for group in info['onset_details']:
+        local_slot = int(round((group['beat'] - bar_start) * 4))
+        signature += (
+            (local_slot + 1) * 7
+            + group['low'] * 3
+            + group['high']
+            + group['velocity']
+        )
+    return signature % 3
+
+
+def _append_unique_slot(slots, value, tolerance=0.10):
+    if not any(abs(existing - value) <= tolerance for existing in slots):
+        slots.append(value)
+
+
 def _generate_groove_v2(notes, timeline, bars, settings):
-    """Generate a meter-aware groove driven by onset and occupancy activity."""
+    """Generate a meter-aware groove driven by musical phrases and voices."""
     if not notes or not bars:
         return []
     analysis = _drum_bar_analysis(notes, bars)
@@ -1160,31 +1266,65 @@ def _generate_groove_v2(notes, timeline, bars, settings):
         if not info['active']:
             continue
         level = info['level']
+        variant = _musical_bar_variant(info, start, index)
         style = style_setting
         if style == 'auto':
             style = ('ballad', 'pop', 'rock')[max(0, min(2, level))]
         bar_beats, kicks, snares = _meter_backbeats(numerator, denominator)
 
-        # Intensity changes arrangement density, not merely velocity.
-        if intensity < 0.65:
-            snares = snares[:1]
-            kicks = kicks[:1]
-        elif intensity >= 1.35 and bar_beats >= 2:
-            kicks = sorted(set(kicks + [bar_beats / 2.0]))
+        # Pattern variants respond deterministically to each bar's rhythm and
+        # pitches. Re-converting is stable, but adjacent bars stop feeling like
+        # a pasted loop.
         if style == 'dance':
             kicks = [b for b in range(int(math.ceil(bar_beats))) if b < bar_beats]
         elif style == 'ballad':
             kicks = kicks[:1]
+            if bar_beats >= 4 and variant == 2 and level >= 1:
+                _append_unique_slot(kicks, 2.5)
         elif style == 'rock' and bar_beats >= 4:
-            kicks = sorted(set(kicks + [3.0]))
+            rock_extras = ((3.0,), (1.5, 3.0), (0.5, 3.5))[variant]
+            for extra in rock_extras:
+                _append_unique_slot(kicks, extra)
         elif style == 'pop' and bar_beats >= 3:
-            kicks = sorted(set(kicks + [2.5]))
+            pop_extras = ((2.5,), (1.5, 3.5), (0.5, 2.5))[variant]
+            for extra in pop_extras:
+                if extra < bar_beats:
+                    _append_unique_slot(kicks, extra)
 
-        previous_level = analysis[index - 1]['level'] if index else -1
-        if index == 0 or previous_level != level:
+        # Follow the inferred LOW voice only. High melody syncopation is used
+        # for snare responses below and no longer masquerades as a bassline.
+        follow_capacity = max(0, level)
+        if level >= 2:
+            follow_capacity = 3 if intensity >= 1.35 else 2
+        follow_count = int(round(
+            max(0.0, min(1.0, settings.drum_bass_follow))
+            * follow_capacity))
+        bass_candidates = []
+        for group in info['bass_onsets']:
+            local = group['beat'] - start
+            if 0 <= local < bar_beats and abs(local - round(local)) > 0.12:
+                bass_candidates.append((group['velocity'], local))
+        bass_candidates.sort(key=lambda item: (-item[0], item[1]))
+        for _velocity, local in bass_candidates[:follow_count]:
+            _append_unique_slot(kicks, local)
+
+        # Intensity changes actual arrangement density, not merely velocity.
+        if intensity < 0.65:
+            snares = snares[:1]
+            kicks = sorted(kicks)[:max(1, min(2, len(kicks)))]
+        elif intensity >= 1.35 and bar_beats >= 2:
+            _append_unique_slot(kicks, bar_beats / 2.0)
+
+        previous = analysis[index - 1] if index else None
+        previous_level = previous['level'] if previous else -1
+        energy_rise = bool(
+            previous and previous['active']
+            and info['smoothed_energy'] - previous['smoothed_energy'] >= 0.14)
+        section_start = not previous or not previous['active'] or energy_rise
+        if section_start:
             crash = DRUM_CRASH_2 if level >= 2 else DRUM_CRASH_1
             _add_beat_hit(hits, timeline, start, crash, _V_ACCENT)
-        for offset in kicks:
+        for offset in sorted(kicks):
             _add_beat_hit(hits, timeline, start + offset, DRUM_KICK,
                           _V_ACCENT if offset == 0 else _V_NORMAL)
         for offset in snares:
@@ -1196,42 +1336,88 @@ def _generate_groove_v2(notes, timeline, bars, settings):
             hat_step = 0.25
         else:
             hat_step = 0.5
-        if intensity < 0.55 or level == 0:
+        if (intensity < 0.55 or level == 0
+                or (level == 1 and info['smoothed_energy'] < 0.38)):
             hat_step = max(1.0, hat_step)
         elif intensity > 1.6:
             hat_step = min(0.25, hat_step)
         offset = 0.0
         slot = 0
         while offset < bar_beats - 1e-9:
-            voice = DRUM_HH_OPEN if style == 'dance' and slot % 4 == 2 else DRUM_HH_CLOSED
+            voice = (
+                DRUM_HH_OPEN
+                if style == 'dance' and slot % 2 == 1
+                else DRUM_HH_CLOSED)
             _add_beat_hit(
                 hits, timeline, start + offset, voice,
                 _V_NORMAL if slot % 2 == 0 else _V_SOFT,
                 settings.drum_swing, hat_step,
             )
-            # High-activity sections gain real subdivisions while retaining
-            # an eighth-note closed-hat backbone.
-            if level >= 2 and intensity >= 0.8 and hat_step >= 0.5:
-                _add_beat_hit(
-                    hits, timeline, start + offset + hat_step / 2.0,
-                    DRUM_HH_OPEN, _V_GHOST, settings.drum_swing, hat_step / 2.0)
             offset += hat_step
             slot += 1
 
-        # Follow a limited number of genuine off-beat musical onsets.
-        follow_count = int(round(max(0.0, min(1.0, settings.drum_bass_follow)) * 2))
-        offbeats = []
-        for onset in info['onsets']:
-            local = onset - start
-            if abs(local - round(local)) > 0.12:
-                offbeats.append(onset)
-        for onset in offbeats[:follow_count]:
-            _add_beat_hit(hits, timeline, onset, DRUM_KICK, _V_SOFT)
+        # A high-energy phrase gets one purposeful open-hat lift, rather than
+        # the previous open-hat hit on every subdivision.
+        if style != 'dance' and level >= 2 and intensity >= 0.8:
+            open_offsets = [(
+                max(0.0, bar_beats - 0.5)
+                if info['phrase_end'] or variant == 2
+                else 1.5 if variant == 1 and bar_beats > 2 else 0.5)]
+            if intensity >= 1.0 and info['energy'] >= 0.62 and bar_beats >= 4:
+                open_offsets.append(2.5)
+            for open_offset in sorted(set(open_offsets)):
+                _add_beat_hit(
+                    hits, timeline, start + open_offset,
+                    DRUM_HH_OPEN, _V_NORMAL, settings.drum_swing, 0.5)
 
-        seam = index + 1 < len(analysis) and analysis[index + 1]['level'] != level
+        # Let a syncopated melody receive a short ghost-snare answer. The low
+        # voice is excluded so kick and snare react to different musical roles.
+        melody_syncopations = []
+        for group in info['melody_onsets']:
+            local = group['beat'] - start
+            if (group not in info['bass_onsets']
+                    and 0 <= local < bar_beats - 0.25
+                    and abs(local - round(local)) > 0.12):
+                melody_syncopations.append(group)
+        if level >= 1 and intensity >= 0.85 and melody_syncopations:
+            # A restrained passage gets one answer; a genuinely busy phrase
+            # can earn up to four, spaced apart and kept away from the main
+            # backbeats. This makes authored motion audible without a constant
+            # sixteenth-note drum roll.
+            response_limit = (
+                4 if level >= 2 and info['energy'] >= 0.62
+                else 2 if level >= 2 else 1)
+            responses = []
+            backbeats = [start + offset for offset in snares]
+            for group in reversed(melody_syncopations):
+                response = group['beat'] + 0.25
+                if response >= end:
+                    continue
+                if any(abs(response - backbeat) < 0.18
+                       for backbeat in backbeats):
+                    continue
+                if any(abs(response - existing) < 0.40
+                       for existing in responses):
+                    continue
+                responses.append(response)
+                if len(responses) >= response_limit:
+                    break
+            for response in sorted(responses):
+                _add_beat_hit(
+                    hits, timeline, response, DRUM_SNARE, _V_GHOST,
+                    settings.drum_swing, 0.25)
+
+        next_info = analysis[index + 1] if index + 1 < len(analysis) else None
+        energy_change = bool(
+            next_info and next_info['active']
+            and abs(next_info['smoothed_energy']
+                    - info['smoothed_energy']) >= 0.16)
+        seam = info['phrase_end'] or energy_change
         periodic = fill_every and (index + 1) % fill_every == 0
         if level >= 1 and intensity >= 0.8 and (seam or periodic):
-            fill_len = min(1.0, bar_beats)
+            fill_len = min(
+                1.0 if level >= 2 or energy_change else 0.5,
+                bar_beats)
             fill_start = end - fill_len
             step = 0.25 if intensity >= 1.25 else 0.5
             voices = (DRUM_TOM_1, DRUM_TOM_2, DRUM_FLOOR_TOM, DRUM_SNARE)
@@ -1239,7 +1425,8 @@ def _generate_groove_v2(notes, timeline, bars, settings):
             fi = 0
             while fill_pos < end - 1e-9:
                 _add_beat_hit(hits, timeline, fill_pos,
-                              voices[(fill_rotation + fi) % len(voices)], _V_NORMAL)
+                              voices[(fill_rotation + fi)
+                                     % len(voices)], _V_NORMAL)
                 fill_pos += step
                 fi += 1
             fill_rotation += 1
