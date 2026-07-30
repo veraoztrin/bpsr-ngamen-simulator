@@ -86,6 +86,10 @@ class BPSRInputSimulator:
         self._lock = threading.RLock()
         self.current_octave_shift = 0 # 0: normal, 1: High, -1: Low
         self.sustain_active = False
+        # Space is a toggle in the game. If focus safety prevents an "off"
+        # toggle, remember it rather than sending Space to the wrong window or
+        # lying about the game's state.
+        self._pending_sustain_off = False
         self.key_refs = {}
         # Timing knobs (settable from the GUI):
         # shift_delay_ms: wait after toggling Shift/Ctrl before the next note,
@@ -226,11 +230,29 @@ class BPSRInputSimulator:
 
     @synchronized
     def set_sustain(self, active):
-        if self.sustain_active != active:
-            if active and not self._allow_press():
-                return
-            tap_key(VK_SPACE)
-            self.sustain_active = active
+        active = bool(active)
+        if self.sustain_active == active:
+            if active:
+                # Playback still needs the pedal after a temporary focus loss.
+                self._pending_sustain_off = False
+            return True
+        if not self._allow_press():
+            if not active:
+                self._pending_sustain_off = True
+            return False
+        tap_key(VK_SPACE)
+        self.sustain_active = active
+        self._pending_sustain_off = False
+        return True
+
+    @synchronized
+    def flush_pending_sustain(self):
+        """Apply a deferred pedal-off toggle once it is safe to send Space."""
+        if not self._pending_sustain_off:
+            return True
+        if not self.is_target_focused():
+            return False
+        return self.set_sustain(False)
 
     def _await_key_up(self, vk_code):
         """Block until this key has been up for at least retrigger_gap_ms.
@@ -256,19 +278,19 @@ class BPSRInputSimulator:
     @synchronized
     def press_note(self, midi_note):
         if not self._allow_press():
-            return
+            return False
         target = midi_note + self.key_offset
         target_shift, base_note = self._get_mapping(target)
         if base_note is None:
-            return # Out of range
+            return False # Out of range
 
         if not self.set_octave_shift(target_shift):
-            return
+            return False
 
         note_name = midi_to_note_name(base_note)
         vk_code = KEY_MAP.get(note_name)
         if not vk_code:
-            return
+            return False
 
         refs = self.key_refs.get(vk_code, 0)
         if refs > 0:
@@ -282,6 +304,7 @@ class BPSRInputSimulator:
         # gave it to us, so release_note() can undo exactly this press even if
         # the octave modifier has moved on by then.
         self.note_keys.setdefault(midi_note, []).append(vk_code)
+        return True
 
     @synchronized
     def release_note(self, midi_note):

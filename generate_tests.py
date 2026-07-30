@@ -1,4 +1,3 @@
-import mido
 from mido import Message, MidiFile, MidiTrack
 
 def create_scale():

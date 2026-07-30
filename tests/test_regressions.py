@@ -278,6 +278,9 @@ def _client_manager():
     manager.on_sync_update = None
     manager.on_disband = None
     manager.on_kicked = None
+    manager.on_conversion_profile_received = None
+    manager.on_connection_status = None
+    manager.running = True
     return network_sync, manager
 
 
@@ -302,7 +305,8 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
     network_sync, manager = _client_manager()
     monkeypatch.setattr(network_sync, "_log", lambda _message: None)
     received = []
-    manager.on_midi_received = lambda name, data: received.append((name, data))
+    manager.on_midi_received = (
+        lambda name, data, profile: received.append((name, data, profile)))
     encoded = base64.b64encode(b"MThd").decode("ascii")
 
     unsigned = types.SimpleNamespace(
@@ -320,7 +324,7 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
         "data": encoded,
         "sha256": hashlib.sha256(b"MThd").hexdigest(),
     }))
-    assert received == [("evil.mid", b"MThd")]
+    assert received == [("evil.mid", b"MThd", None)]
 
     replay = _signed_message(manager, {
         "type": "midi_file",
@@ -330,7 +334,50 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
     })
     manager._on_message(None, None, replay)
     manager._on_message(None, None, replay)
-    assert received.count(("song.mid", b"MThd")) == 1
+    assert received.count(("song.mid", b"MThd", None)) == 1
+
+
+def test_disconnect_invalidates_client_clock_sync():
+    _network_sync, manager = _client_manager()
+    manager.is_synced = True
+    manager.sync_rtt = 0.012
+    manager.host_offset = 1.5
+    manager._sync_samples = [(time.time(), 0.012, 1.5)]
+
+    manager._on_disconnect(None, None, None, "network lost")
+
+    assert not manager.is_synced
+    assert manager.sync_rtt is None
+    assert manager.host_offset == 0.0
+    assert manager._sync_samples == []
+
+
+def test_host_profile_change_clears_remote_ready_status():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.is_host = True
+    manager.client_id = "host"
+    manager.room_state = {
+        "players": [
+            {"client_id": "host", "ready": True},
+            {"client_id": "client", "ready": True},
+        ],
+        "filename": "song.mid",
+    }
+    published = []
+    broadcasts = []
+    manager._publish = lambda payload: published.append(payload)
+    manager._broadcast_state = lambda: broadcasts.append(True)
+
+    manager.share_conversion_profile({"version": 1})
+
+    assert manager.room_state["players"][0]["ready"] is True
+    assert manager.room_state["players"][1]["ready"] is False
+    assert broadcasts == [True]
+    assert published == [{
+        "type": "conversion_profile",
+        "profile": {"version": 1},
+    }]
 
 
 def test_remote_disband_unsubscribes_before_reset():

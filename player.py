@@ -354,8 +354,12 @@ class MidiPlayer:
                     if ev['type'] == 'note_on':
                         if ev['channel'] in self.active_channels and self.simulator:
                             played_note = ev['note'] + self.transpose
-                            self.simulator.press_note(played_note)
-                            self._active_notes.setdefault(key, []).append(played_note)
+                            accepted = self.simulator.press_note(played_note)
+                            # Only an explicit False means focus/range safety
+                            # rejected the press; simple test doubles may return
+                            # None after successfully recording it.
+                            if accepted is not False:
+                                self._active_notes.setdefault(key, []).append(played_note)
                     elif ev['type'] == 'note_off':
                         played = self._active_notes.get(key)
                         if played and self.simulator:

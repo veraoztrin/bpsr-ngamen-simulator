@@ -329,6 +329,47 @@ def test_focus_guard_blocks_key_down_outside_target():
     check("blocked press is not reference-counted", sim.key_refs == {})
 
 
+def test_focus_guard_defers_sustain_off_without_tapping_wrong_window():
+    print("[foreground-window sustain safety]")
+    sim, log = make_sim()
+    isim.tap_key = lambda vk, duration=0.01: log.append(('TAP', vk))
+    sim.focus_guard_enabled = True
+    sim.target_window_text = "Blue Protocol"
+    sim.foreground_window_title = lambda: "Blue Protocol"
+    sim.set_sustain(True)
+    log.clear()
+
+    sim.foreground_window_title = lambda: "Notes - Personal"
+    sim.release_all()
+    check("focus loss never taps Space into another app", not any(
+        item[0] == 'TAP' for item in log), f"got {log}")
+    check("pedal state remains truthful until it can be toggled off",
+          sim.sustain_active and sim._pending_sustain_off)
+
+    sim.foreground_window_title = lambda: "Blue Protocol"
+    sim.flush_pending_sustain()
+    check("deferred pedal-off is applied in the game",
+          not sim.sustain_active and not sim._pending_sustain_off)
+
+
+def test_temporary_focus_loss_cancels_deferred_sustain_off():
+    print("[temporary focus-loss sustain restoration]")
+    sim, log = make_sim()
+    isim.tap_key = lambda vk, duration=0.01: log.append(('TAP', vk))
+    sim.focus_guard_enabled = True
+    sim.target_window_text = "Blue Protocol"
+    sim.foreground_window_title = lambda: "Blue Protocol"
+    sim.set_sustain(True)
+    log.clear()
+    sim.foreground_window_title = lambda: "Other"
+    sim.release_all()
+    sim.foreground_window_title = lambda: "Blue Protocol"
+    sim.set_sustain(True)
+    check("restoration keeps an already-active pedal without a second toggle",
+          log == [] and sim.sustain_active and not sim._pending_sustain_off,
+          f"got {log}")
+
+
 def test_stray_note_off_is_safe():
     print("[note_off with no matching press]")
     sim, log = make_sim()

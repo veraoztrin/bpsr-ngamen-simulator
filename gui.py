@@ -8,6 +8,10 @@ import math
 import threading
 from midi_parser import parse_midi_full, get_channels_info, guess_channel_instrument
 from arranger import ConversionSettings, convert, convert_drum, ABS_LOW, ABS_HIGH
+from conversion_profile import (
+    make_conversion_profile, load_conversion_profile,
+    should_use_host_conversion,
+)
 from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
 from player import MidiPlayer
 from network_sync import (
@@ -34,7 +38,8 @@ class App(ctk.CTk):
         self.geometry("820x940")
         self.minsize(720, 700)
         self.player = MidiPlayer()
-        self.live_midi = LiveMidiListener(self.player.simulator)
+        self.live_midi = LiveMidiListener(
+            self.player.simulator, on_state_release=self._restore_playback_state)
         self.network = NetworkManager(
             on_state_change=self.on_network_state,
             on_play_cmd=self.on_network_play,
@@ -44,7 +49,8 @@ class App(ctk.CTk):
             on_disband=self.on_network_disband,
             on_connection_status=self.on_network_connection_status,
             on_sync_stalled=self.on_network_sync_stalled,
-            on_kicked=self.on_network_kicked
+            on_kicked=self.on_network_kicked,
+            on_conversion_profile_received=self.on_network_conversion_profile,
         )
         
         self.events = []
@@ -69,6 +75,8 @@ class App(ctk.CTk):
         self.was_playing = False
         self._focus_was_blocked = False
         self._play_wait_message_active = False
+        self._network_conversion_profile = None
+        self._current_conversion_profile = None
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -301,7 +309,8 @@ class App(ctk.CTk):
                 var = ctk.BooleanVar(value=False)
                 self.conv_vars[key] = var
                 ctk.CTkCheckBox(row, text=label, variable=var,
-                                command=self.reconvert).pack(side="left", padx=(0, 14))
+                                command=lambda k=key: self._on_conversion_toggle(k)
+                                ).pack(side="left", padx=(0, 14))
 
         # Row 3: range + timing
         self.row3 = row3 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
@@ -462,6 +471,19 @@ class App(ctk.CTk):
     def _inst(self):
         return INSTRUMENTS.get(self.instrument_var.get(), INSTRUMENTS["Piano"])
 
+    def _restore_playback_state(self):
+        """Reconcile shared pedal/modifier state after live MIDI releases."""
+        if self.player.is_playing:
+            self.player.restore_output_state()
+
+    def _on_conversion_toggle(self, key):
+        # These features plan the same global octave modifier differently.
+        if key == "melody_lock" and self.conv_vars[key].get():
+            self.conv_vars["phrase_gap_shifting"].set(False)
+        elif key == "phrase_gap_shifting" and self.conv_vars[key].get():
+            self.conv_vars["melody_lock"].set(False)
+        self.reconvert()
+
     def on_instrument_change(self, choice):
         """Apply an instrument's playable range to the Range fields, then
         re-fit the loaded MIDI into it. Drum is a different beast - it has
@@ -603,11 +625,27 @@ class App(ctk.CTk):
         self.ready_btn = ctk.CTkButton(self.client_control_frame, text="I'm Ready!", command=self.toggle_ready, state="disabled")
         self.ready_btn.grid(row=0, column=0, padx=5, pady=5, sticky="ew")
 
+        override_row = ctk.CTkFrame(
+            self.client_control_frame, fg_color="transparent")
+        override_row.grid(row=1, column=0, padx=5, pady=(0, 4), sticky="ew")
+        self.client_conversion_override_var = ctk.BooleanVar(value=False)
+        self.client_conversion_override_check = ctk.CTkCheckBox(
+            override_row,
+            text="Use my conversion settings (advanced)",
+            variable=self.client_conversion_override_var,
+            command=self.toggle_client_conversion,
+            state="disabled")
+        self.client_conversion_override_check.pack(side="left")
+        ctk.CTkLabel(
+            override_row,
+            text="default: host arrangement · local roles may differ",
+            text_color="gray").pack(side="left", padx=8)
+
         # Manual sync calibration: cancels the residual start offset that the
         # automatic clock sync can't remove (network path asymmetry + this
         # machine's input latency). Tune by ear until both players line up.
         nudge_row = ctk.CTkFrame(self.client_control_frame, fg_color="transparent")
-        nudge_row.grid(row=1, column=0, padx=5, pady=(0, 6), sticky="ew")
+        nudge_row.grid(row=2, column=0, padx=5, pady=(0, 6), sticky="ew")
         ctk.CTkLabel(nudge_row, text="Sync nudge (ms):").pack(side="left")
         self.nudge_entry = ctk.CTkEntry(nudge_row, width=60)
         self.nudge_entry.insert(0, "0")
@@ -618,7 +656,7 @@ class App(ctk.CTk):
         self.leave_btn = ctk.CTkButton(self.client_control_frame, text="Leave Room",
                                        command=self.leave_room, fg_color="gray30",
                                        hover_color="gray20", state="disabled")
-        self.leave_btn.grid(row=2, column=0, padx=5, pady=(0, 5), sticky="ew")
+        self.leave_btn.grid(row=3, column=0, padx=5, pady=(0, 5), sticky="ew")
 
     # --- Actions ---
 
@@ -681,6 +719,11 @@ class App(ctk.CTk):
         else:
             self.led_label.configure(text="🔴 Stopped", text_color="gray")
 
+        if simulator and not self.player.is_playing:
+            # Apply any pedal-off deferred by focus safety, but only once the
+            # simulator confirms the intended game window is focused.
+            simulator.flush_pending_sustain()
+
         self._focus_was_blocked = focus_blocked
         if (self._play_wait_message_active and self.player.is_playing
                 and not focus_blocked):
@@ -707,11 +750,20 @@ class App(ctk.CTk):
         file_paths = filedialog.askopenfilenames(filetypes=[("MIDI Files", "*.mid *.midi")])
         if file_paths:
             last_new_idx = None
+            existing_paths = {
+                os.path.normcase(os.path.abspath(song["path"]))
+                for song in self.playlist
+            }
             for p in file_paths:
-                name = os.path.basename(p)
-                if name not in [s["name"] for s in self.playlist]:
-                    self.playlist.append({"name": name, "path": p})
-                    last_new_idx = len(self.playlist) - 1
+                normalized = os.path.normcase(os.path.abspath(p))
+                if normalized in existing_paths:
+                    continue
+                filename = os.path.basename(p)
+                name = self._unique_song_label(filename, p)
+                self.playlist.append({
+                    "name": name, "filename": filename, "path": p})
+                existing_paths.add(normalized)
+                last_new_idx = len(self.playlist) - 1
 
             self._update_playlist_ui()
 
@@ -721,6 +773,23 @@ class App(ctk.CTk):
             if last_new_idx is not None:
                 self.current_song_idx = last_new_idx
                 self._load_current_song()
+
+    def _unique_song_label(self, filename, path):
+        used = {song["name"] for song in self.playlist}
+        if filename not in used:
+            return filename
+        parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        base = f"{filename} — {parent or 'folder'}"
+        label = base
+        suffix = 2
+        while label in used:
+            label = f"{base} ({suffix})"
+            suffix += 1
+        return label
+
+    @staticmethod
+    def _playlist_filename(song):
+        return song.get("filename") or os.path.basename(song["path"])
 
     def remove_current_song(self):
         """Drop the currently selected song from the playlist (feedback:
@@ -783,11 +852,18 @@ class App(ctk.CTk):
             self.player.stop()
             self._parse_and_load(
                 song["path"], on_loaded=self.play_solo if autoplay else None)
-            
-            if self.network.room_code and self.network.is_host:
-                self.network.share_midi(song["path"], song["name"])
             if self.network.room_code:
                 self._update_lobby_ui(self.network.room_state)
+
+    def _share_current_midi(self):
+        if (not self.network.is_host
+                or not (0 <= self.current_song_idx < len(self.playlist))
+                or not self._current_conversion_profile):
+            return
+        song = self.playlist[self.current_song_idx]
+        self.network.share_midi(
+            song["path"], self._playlist_filename(song),
+            self._current_conversion_profile)
 
     def _parse_and_load(self, file_path, on_loaded=None):
         """Parse potentially large files without freezing Tk's event loop."""
@@ -805,7 +881,20 @@ class App(ctk.CTk):
             self.ready_btn.configure(state="disabled", text="Loading MIDI…")
 
         def worker():
-            parsed = parse_midi_full(file_path)
+            try:
+                parsed = parse_midi_full(file_path)
+            except Exception as exc:
+                print(f"Unexpected MIDI parser error: {exc}")
+                parsed = {
+                    "events": [],
+                    "bpm": 120.0,
+                    "beats_per_measure": 4,
+                    "tempo_map": [{"beat": 0.0, "bpm": 120.0}],
+                    "time_signature_map": [{
+                        "beat": 0.0, "numerator": 4, "denominator": 4}],
+                    "channel_programs": {},
+                    "error": f"Could not parse MIDI: {exc}",
+                }
             if not self._closing:
                 self.after(0, self._finish_parse, generation, parsed, on_loaded)
 
@@ -825,14 +914,23 @@ class App(ctk.CTk):
         self.channel_programs = parsed.get('channel_programs', {})
         self.song_info_label.configure(
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4")
-        if not self.raw_events:
+        converted = self.reconvert(broadcast_profile=False)
+        parse_error = parsed.get("error")
+        if parse_error:
             self.settings_error_label.configure(
-                text="The file has no playable MIDI notes or could not be parsed.",
+                text=parse_error, text_color="#ff6b6b")
+        elif not self.raw_events:
+            self.settings_error_label.configure(
+                text="The file has no playable MIDI notes.",
                 text_color="#ff6b6b")
-        if self.reconvert() and on_loaded:
+        if (converted and self.raw_events
+                and self.network.room_code and self.network.is_host):
+            self._share_current_midi()
+        if converted and on_loaded:
             on_loaded()
         if (self.network.room_code and not self.network.is_host
-                and self.network.is_synced and self.raw_events):
+                and self.network.is_synced and self.raw_events
+                and converted and self.events):
             self.ready_btn.configure(state="normal", text="I'm Ready!")
 
     def _get_float(self, entry, default):
@@ -893,6 +991,10 @@ class App(ctk.CTk):
         for key, val in prefs.get("checks", {}).items():
             if key in self.conv_vars:
                 self.conv_vars[key].set(bool(val))
+        if (self.conv_vars["melody_lock"].get()
+                and self.conv_vars["phrase_gap_shifting"].get()):
+            # Older preferences could persist this ambiguous combination.
+            self.conv_vars["phrase_gap_shifting"].set(False)
 
         def _set_entry(entry, val):
             if val is None:
@@ -991,7 +1093,14 @@ class App(ctk.CTk):
         else:
             range_low = midi_note(self.range_low_entry, "Range start")
             range_high = midi_note(self.range_high_entry, "Range end")
-            duet_split = midi_note(self.duet_split_entry, "Duet split")
+            if range_low > range_high:
+                raise ValueError("Range start must not be above range end.")
+            duet_enabled = (
+                self.conv_vars["duet_mode"].get()
+                and not self.autosplit_var.get())
+            duet_split = (
+                midi_note(self.duet_split_entry, "Duet split")
+                if duet_enabled else 60)
             shift_delay = finite_float(
                 self.shift_delay_entry, "Shift delay", 0, 500)
             shift_hold = finite_float(
@@ -999,8 +1108,6 @@ class App(ctk.CTk):
             drum_intensity, drum_fills = 1.0, 8
             drum_bass_follow, drum_swing = 100.0, 0.0
             drum_quantize, drum_spacing = 0.0, 0.0
-        finite_float(self.solo_delay_entry, "Start delay", 0, 10)
-
         s = ConversionSettings(
             bpm_override=bpm_override,
             speed=speed,
@@ -1040,23 +1147,48 @@ class App(ctk.CTk):
         self.save_prefs()
         return s
 
-    def reconvert(self):
+    def reconvert(self, broadcast_profile=True):
         """Re-run the conversion pipeline on the raw MIDI with current settings."""
+        using_local_override = bool(
+            self.network.room_code and not self.network.is_host
+            and self.client_conversion_override_var.get())
+        using_host_profile = should_use_host_conversion(
+            self.network.room_code, self.network.is_host,
+            self._network_conversion_profile, using_local_override)
+        local_change_requires_ready = bool(
+            using_local_override and broadcast_profile)
+        if local_change_requires_ready:
+            self._mark_client_unready("Applying my settings…")
         try:
-            settings = self.build_settings()
+            if using_host_profile:
+                settings, instrument_name = load_conversion_profile(
+                    self._network_conversion_profile)
+                # Modifier timing is hardware-specific and remains local.
+                shift_delay = min(max(
+                    self._get_float(self.shift_delay_entry, 30.0), 0.0), 500.0)
+                shift_hold = min(max(
+                    self._get_float(self.shift_hold_entry, 10.0), 0.0), 500.0)
+            else:
+                settings = self.build_settings()
+                instrument_name = self.instrument_var.get()
+                shift_delay = settings._shift_delay_ms
+                shift_hold = settings._shift_hold_ms
+                self._current_conversion_profile = make_conversion_profile(
+                    settings, instrument_name)
         except ValueError as exc:
             self.settings_error_label.configure(
                 text=str(exc), text_color="#ff6b6b")
             return False
         self.settings_error_label.configure(text="", text_color="#ff6b6b")
+        instrument = INSTRUMENTS[instrument_name]
 
         # Apply input timing knobs + the instrument's key offset even when no
         # song is loaded; live-MIDI-only users rely on restored preferences.
         if self.player.simulator:
-            self.player.simulator.shift_delay_ms = settings._shift_delay_ms
-            self.player.simulator.shift_hold_ms = settings._shift_hold_ms
+            self.player.simulator.shift_delay_ms = shift_delay
+            self.player.simulator.shift_hold_ms = shift_hold
             self.player.simulator.retrigger_gap_ms = settings.retrigger_gap * 1000.0
-            self.player.simulator.key_offset = self._inst()["offset"]
+            self.player.simulator.key_offset = instrument["offset"]
             self.player.simulator.focus_guard_enabled = self.focus_guard_var.get()
             self.player.simulator.target_window_text = (
                 self.target_window_entry.get().strip() or "Blue Protocol")
@@ -1067,7 +1199,7 @@ class App(ctk.CTk):
             self.build_solo_channel_ui()
             self.player.load_events([], [])
             return True
-        is_drum = self._inst().get("is_drum", False)
+        is_drum = instrument.get("is_drum", False)
         if is_drum:
             self.events = convert_drum(self.raw_events, settings, orig_bpm=self.orig_bpm,
                                        beats_per_measure=self.beats_per_measure,
@@ -1089,12 +1221,32 @@ class App(ctk.CTk):
         output_notes = sum(
             ev.get("type") == "note_on" for ev in self.events)
         duration = self.events[-1]["time"] if self.events else 0
+        profile_suffix = (
+            f" · host settings: {instrument_name}"
+            if using_host_profile else (
+                f" · my settings: {instrument_name}"
+                if using_local_override else ""))
         self.song_info_label.configure(
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4 · "
-                 f"{output_notes}/{raw_notes} notes · {duration:.1f}s")
+                 f"{output_notes}/{raw_notes} notes · {duration:.1f}s"
+                 f"{profile_suffix}")
 
-        if self.network.room_code:
+        if self.network.room_code and self.network.is_host:
             self._update_lobby_ui(self.network.room_state)
+            if broadcast_profile and self._current_conversion_profile:
+                self.network.share_conversion_profile(
+                    self._current_conversion_profile)
+        elif local_change_requires_ready:
+            if self.network.is_synced and self.events:
+                self.ready_btn.configure(
+                    state="normal", text="I'm Ready!")
+                self.status_label.configure(
+                    text="My conversion updated. Mark Ready again.",
+                    text_color="orange")
+            else:
+                self.status_label.configure(
+                    text="My conversion produced no playable notes.",
+                    text_color="red")
         return True
 
     def _channel_ranges(self):
@@ -1235,9 +1387,7 @@ class App(ctk.CTk):
         self.disband_btn.configure(state="normal")
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
-        if 0 <= self.current_song_idx < len(self.playlist):
-            song = self.playlist[self.current_song_idx]
-            self.network.share_midi(song["path"], song["name"])
+        self._share_current_midi()
 
     def join_room(self):
         nick = self.nick_entry.get() or "Player"
@@ -1263,6 +1413,8 @@ class App(ctk.CTk):
         self.host_btn.configure(state="disabled")
         self.join_btn.configure(state="disabled")
         self.leave_btn.configure(state="normal")
+        self.client_conversion_override_var.set(False)
+        self.client_conversion_override_check.configure(state="normal")
         # Ready stays locked until the clock is synced with the host, so nobody
         # can start a song before the timing is aligned.
         self.ready_btn.configure(state="disabled", text="Syncing clock…")
@@ -1272,11 +1424,13 @@ class App(ctk.CTk):
     def leave_room(self):
         self.network.leave_room()
         self.player.stop()
+        self._network_conversion_profile = None
         self._reset_multiplayer_ui("You left the room.")
 
     def disband_room(self):
         self.network.disband_room()
         self.player.stop()
+        self._network_conversion_profile = None
         self._reset_multiplayer_ui("Lobby disbanded.")
 
     def on_network_disband(self):
@@ -1285,6 +1439,7 @@ class App(ctk.CTk):
 
     def _on_host_disbanded(self):
         self.player.stop()
+        self._network_conversion_profile = None
         self._reset_multiplayer_ui("Host closed the room.")
 
     def kick_player(self, client_id):
@@ -1297,9 +1452,11 @@ class App(ctk.CTk):
 
     def _on_kicked(self):
         self.player.stop()
+        self._network_conversion_profile = None
         self._reset_multiplayer_ui("You were removed from the room by the host.")
 
     def _reset_multiplayer_ui(self, status="Not Connected"):
+        self._network_conversion_profile = None
         self.status_label.configure(text=status, text_color="gray")
         self.sync_label.configure(text="")
         self.host_btn.configure(state="normal")
@@ -1312,6 +1469,8 @@ class App(ctk.CTk):
         self.sync_stop_btn.configure(state="disabled")
         self.disband_btn.configure(state="disabled")
         self.leave_btn.configure(state="disabled")
+        self.client_conversion_override_var.set(False)
+        self.client_conversion_override_check.configure(state="disabled")
         self.my_ready_status = False
         self._known_room_players = set()
         for widget in self.lobby_frame.winfo_children():
@@ -1324,6 +1483,55 @@ class App(ctk.CTk):
         else:
             self.ready_btn.configure(text="I'm Ready!", fg_color=["#3a7ebf", "#1f538d"], hover_color=["#325882", "#14375e"])
         self.network.send_ready_status(self.my_ready_status)
+
+    def _mark_client_unready(self, text="Applying conversion…"):
+        if not self.network.room_code or self.network.is_host:
+            return
+        if self.my_ready_status:
+            self.network.send_ready_status(False)
+        self.my_ready_status = False
+        self.ready_btn.configure(
+            state="disabled", text=text,
+            fg_color=["#3a7ebf", "#1f538d"],
+            hover_color=["#325882", "#14375e"])
+
+    def toggle_client_conversion(self):
+        if not self.network.room_code or self.network.is_host:
+            self.client_conversion_override_var.set(False)
+            return
+
+        use_local = self.client_conversion_override_var.get()
+        self.player.stop()
+        self._mark_client_unready("Applying my settings…" if use_local
+                                  else "Applying host settings…")
+
+        if not self.raw_events:
+            self.status_label.configure(
+                text=("My conversion will be used when the MIDI arrives."
+                      if use_local else
+                      "The host conversion will be used when the MIDI arrives."),
+                text_color="orange" if use_local else "green")
+            return
+        if not use_local and not self._network_conversion_profile:
+            self.status_label.configure(
+                text="The host conversion profile has not arrived yet.",
+                text_color="red")
+            return
+
+        if self.reconvert(broadcast_profile=False) and self.events:
+            if self.network.is_synced:
+                self.ready_btn.configure(
+                    state="normal", text="I'm Ready!")
+            self.status_label.configure(
+                text=("Using my conversion. Host channel assignments may "
+                      "refer to different roles."
+                      if use_local else
+                      "Using the host conversion settings."),
+                text_color="orange" if use_local else "green")
+        else:
+            self.status_label.configure(
+                text="Fix the conversion settings before marking Ready.",
+                text_color="red")
 
     def sync_play(self):
         if self.events and self.network.is_host:
@@ -1348,8 +1556,7 @@ class App(ctk.CTk):
         self._known_room_players = player_ids
         if (newcomers and self.network.is_host
                 and 0 <= self.current_song_idx < len(self.playlist)):
-            song = self.playlist[self.current_song_idx]
-            self.network.share_midi(song["path"], song["name"])
+            self._share_current_midi()
         self._update_lobby_ui(state)
 
     def on_network_play(self, global_start_time, my_channels):
@@ -1368,6 +1575,7 @@ class App(ctk.CTk):
         self.sync_label.configure(text=f"🕐 Synced ±{acc_ms:.0f} ms", text_color=color)
         # Unlock Ready once we have a clock lock (only before the user readies up).
         if (not self.network.is_host and not self.my_ready_status
+                and self.raw_events and self.events
                 and self.ready_btn.cget("state") == "disabled"):
             self.ready_btn.configure(state="normal", text="I'm Ready!")
 
@@ -1382,7 +1590,7 @@ class App(ctk.CTk):
         if self.network.is_host or not self.network.room_code or self.network.is_synced:
             return  # already resolved, or state changed since the watchdog fired
         self.sync_label.configure(
-            text="🕐 Can't reach host clock (check firewall/port 1883)",
+            text="🕐 Can't reach host clock (check firewall/TLS port 8883)",
             text_color="red")
 
     def on_network_connection_status(self, status, detail):
@@ -1399,14 +1607,57 @@ class App(ctk.CTk):
         elif status == "reconnecting":
             if self.network.room_code:
                 self.status_label.configure(text="Connection lost - reconnecting…", text_color="orange")
+                if not self.network.is_host:
+                    self.my_ready_status = False
+                    self.ready_btn.configure(
+                        state="disabled", text="Syncing clock…",
+                        fg_color=["#3a7ebf", "#1f538d"],
+                        hover_color=["#325882", "#14375e"])
+                    self.sync_label.configure(
+                        text="🕐 Re-syncing clock…", text_color="orange")
         elif status == "disconnected":
             if self.network.room_code:
                 self.status_label.configure(
                     text=f"Disconnected from server ({detail or 'connection lost'}).",
                     text_color="red")
 
-    def on_network_midi(self, filename, data):
-        self.after(0, self._save_and_load_midi, filename, data)
+    def on_network_midi(self, filename, data, conversion_profile):
+        self.after(
+            0, self._save_and_load_midi,
+            filename, data, conversion_profile)
+
+    def on_network_conversion_profile(self, conversion_profile):
+        self.after(
+            0, self._apply_network_conversion_profile, conversion_profile)
+
+    def _apply_network_conversion_profile(self, conversion_profile):
+        try:
+            _settings, _instrument_name = load_conversion_profile(
+                conversion_profile)
+        except ValueError as exc:
+            self.status_label.configure(
+                text=f"Rejected host conversion settings: {exc}",
+                text_color="red")
+            return
+        self._network_conversion_profile = conversion_profile
+        if self.network.room_code and not self.network.is_host:
+            use_local = self.client_conversion_override_var.get()
+            self.player.stop()
+            self._mark_client_unready(
+                "Keeping my settings…" if use_local
+                else "Applying host settings…")
+            converted = bool(self.raw_events) and (
+                bool(self.events) if use_local
+                else self.reconvert(broadcast_profile=False))
+            if converted and self.events:
+                if self.network.is_synced:
+                    self.ready_btn.configure(state="normal", text="I'm Ready!")
+                self.status_label.configure(
+                    text=("Host settings updated; my conversion override is "
+                          "still active."
+                          if use_local else
+                          "Host conversion settings updated."),
+                    text_color="orange" if use_local else "green")
 
     def _update_lobby_ui(self, state):
         for widget in self.lobby_frame.winfo_children():
@@ -1428,7 +1679,7 @@ class App(ctk.CTk):
                     self.ready_btn.configure(
                         text="âœ… Ready!", fg_color="green",
                         hover_color="darkgreen")
-                elif self.network.is_synced:
+                elif self.network.is_synced and self.raw_events and self.events:
                     self.ready_btn.configure(
                         state="normal", text="I'm Ready!",
                         fg_color=["#3a7ebf", "#1f538d"],
@@ -1442,7 +1693,6 @@ class App(ctk.CTk):
             name = f"{p['nickname']} (Me)" if is_me else p['nickname']
             
             # Status dot
-            status_color = "green" if p.get("connected", True) else "red"
             status_text = "🟢" if p.get("connected", True) else "🔴"
             
             status_lbl = ctk.CTkLabel(frame, text=status_text, width=20)
@@ -1510,7 +1760,7 @@ class App(ctk.CTk):
               f"(nudge {nudge*1000:.0f}ms) for Channels {my_channels}")
         self.player.play(delay_seconds=delay)
 
-    def _save_and_load_midi(self, filename, data):
+    def _save_and_load_midi(self, filename, data, conversion_profile):
         filename = os.path.basename(str(filename).replace("\\", "/"))
         ext = os.path.splitext(filename)[1].lower()
         if ext not in {".mid", ".midi"} or not filename:
@@ -1521,6 +1771,14 @@ class App(ctk.CTk):
             self.status_label.configure(
                 text="Rejected an oversized received MIDI.", text_color="red")
             return
+        try:
+            _settings, _instrument_name = load_conversion_profile(
+                conversion_profile)
+        except ValueError as exc:
+            self.status_label.configure(
+                text=f"Rejected host conversion settings: {exc}",
+                text_color="red")
+            return
         if not messagebox.askyesno(
                 "Accept shared MIDI?",
                 f"The authenticated host shared “{filename}” "
@@ -1528,6 +1786,7 @@ class App(ctk.CTk):
             self.status_label.configure(
                 text="Shared MIDI declined.", text_color="gray")
             return
+        self._network_conversion_profile = conversion_profile
         temp_file = tempfile.NamedTemporaryFile(
             mode="wb", prefix="bpsr_received_", suffix=ext, delete=False)
         file_path = temp_file.name
@@ -1537,7 +1796,11 @@ class App(ctk.CTk):
         
         # In client mode, we just override current song view (or add to playlist)
         # We will clear playlist and set this as the only song for the client
-        self.playlist = [{"name": f"{filename} (Received)", "path": file_path}]
+        self.playlist = [{
+            "name": f"{filename} (Received)",
+            "filename": filename,
+            "path": file_path,
+        }]
         self.current_song_idx = 0
         self._update_playlist_ui()
         self.song_var.set(self.playlist[0]["name"])

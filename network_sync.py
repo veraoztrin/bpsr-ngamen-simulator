@@ -32,7 +32,8 @@ MIN_ROOM_CREDENTIAL_LENGTH = 16
 ROOM_CREDENTIAL_PREFIX = "bpsr2"
 PROTOCOL_VERSION = 2
 HOST_ONLY_TYPES = {
-    "sync_pong", "state", "midi_file", "play", "stop", "disband", "kick",
+    "sync_pong", "state", "midi_file", "conversion_profile",
+    "play", "stop", "disband", "kick",
 }
 
 # The release build runs with PyInstaller's --windowed flag (no console), so
@@ -104,7 +105,8 @@ def select_offset(samples, k=5):
 class NetworkManager:
     def __init__(self, on_state_change=None, on_play_cmd=None, on_stop_cmd=None,
                  on_midi_received=None, on_sync_update=None, on_disband=None,
-                 on_connection_status=None, on_sync_stalled=None, on_kicked=None):
+                 on_connection_status=None, on_sync_stalled=None, on_kicked=None,
+                 on_conversion_profile_received=None):
         self._identity_private = Ed25519PrivateKey.generate()
         self._identity_public_raw = self._identity_private.public_key().public_bytes(
             encoding=serialization.Encoding.Raw,
@@ -155,6 +157,7 @@ class NetworkManager:
         self.on_connection_status = on_connection_status  # ("connected"|"reconnecting"|"disconnected", detail)
         self.on_sync_stalled = on_sync_stalled             # fired once if no sync_pong arrives for a while
         self.on_kicked = on_kicked                         # fired on the removed client when the host kicks them
+        self.on_conversion_profile_received = on_conversion_profile_received
 
         # Room State (Host maintains this)
         self.room_state = {
@@ -179,7 +182,7 @@ class NetworkManager:
         try:
             self.client.connect(BROKER, PORT, 60)
         except Exception as e:
-            # A blocked/unreachable broker (firewalled port 1883, no network,
+            # A blocked/unreachable broker (firewalled TLS port 8883, no network,
             # DNS failure, ...) used to raise straight out of a GUI button
             # handler with nothing shown to the user. Surface it instead.
             _log(f"Could not reach {BROKER}:{PORT}: {e}")
@@ -349,10 +352,9 @@ class NetworkManager:
             "ready": is_ready
         })
 
-    def share_midi(self, file_path, filename):
+    def share_midi(self, file_path, filename, conversion_profile=None):
         if not self.is_host:
             return
-        self.room_state["filename"] = filename
         try:
             size = os.path.getsize(file_path)
             if size > MAX_MIDI_BYTES:
@@ -366,17 +368,36 @@ class NetworkManager:
             safe_name = ntpath.basename(str(filename))[:MAX_FILENAME_LENGTH]
             if os.path.splitext(safe_name)[1].lower() not in {".mid", ".midi"}:
                 raise ValueError("Shared file must use the .mid or .midi extension")
+            if conversion_profile is not None and not isinstance(
+                    conversion_profile, dict):
+                raise ValueError("Conversion profile must be an object")
             data = base64.b64encode(raw).decode('ascii')
-            
+
             self._publish({
                 "type": "midi_file",
                 "filename": safe_name,
                 "data": data,
                 "sha256": hashlib.sha256(raw).hexdigest(),
+                "conversion_profile": conversion_profile,
             })
+            self.room_state["filename"] = safe_name
+            for player in self.room_state["players"]:
+                if player["client_id"] != self.client_id:
+                    player["ready"] = False
             self._broadcast_state()
         except Exception as e:
             _log(f"Failed to share MIDI: {e}")
+
+    def share_conversion_profile(self, conversion_profile):
+        if self.is_host and isinstance(conversion_profile, dict):
+            for player in self.room_state["players"]:
+                if player["client_id"] != self.client_id:
+                    player["ready"] = False
+            self._broadcast_state()
+            self._publish({
+                "type": "conversion_profile",
+                "profile": conversion_profile,
+            })
 
     def send_play(self, delay_seconds=4.0):
         if not self.is_host:
@@ -673,12 +694,29 @@ class NetworkManager:
                     "client_id": self.client_id,
                     "nickname": self.nickname
                 })
+                # A reconnect starts a fresh clock measurement. Also clear any
+                # stale Ready flag retained by the host.
+                self._publish({
+                    "type": "ready",
+                    "client_id": self.client_id,
+                    "ready": False,
+                })
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
         _log(f"Disconnected from MQTT broker: {reason_code}")
+        if self.running and self.room_code and not self.is_host:
+            self._invalidate_client_sync()
         if self.on_connection_status:
             self.on_connection_status("reconnecting" if self.running else "disconnected",
                                       str(reason_code))
+
+    def _invalidate_client_sync(self):
+        self.is_synced = False
+        self.sync_rtt = None
+        self.host_offset = 0.0
+        self._sync_samples = []
+        self._room_joined_at = time.time()
+        self._sync_stall_reported = False
 
     def _on_message(self, client, userdata, msg):
         try:
@@ -868,7 +906,16 @@ class NetworkManager:
                             or not data.startswith(b"MThd")):
                         raise ValueError("Received MIDI failed integrity checks")
                     if self.on_midi_received:
-                        self.on_midi_received(filename, data)
+                        profile = payload.get("conversion_profile")
+                        if profile is not None and not isinstance(profile, dict):
+                            raise ValueError("Received invalid conversion profile")
+                        self.on_midi_received(filename, data, profile)
+                elif msg_type == "conversion_profile":
+                    profile = payload.get("profile")
+                    if not isinstance(profile, dict):
+                        raise ValueError("Received invalid conversion profile")
+                    if self.on_conversion_profile_received:
+                        self.on_conversion_profile_received(profile)
 
             # Both host and client handle 'play' and 'stop'
             if msg_type == "play":

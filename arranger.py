@@ -21,8 +21,11 @@ from dataclasses import dataclass
 from config import (
     DRUM_HH_CLOSED, DRUM_KICK, DRUM_FLOOR_TOM, DRUM_SNARE,
     DRUM_TOM_1, DRUM_TOM_2, DRUM_CRASH_1, DRUM_HH_OPEN, DRUM_CRASH_2,
-    DRUM_NOTES,
+    DRUM_NOTES as _DRUM_NOTES,
 )
+
+# Kept as a public compatibility export for tests and external callers.
+DRUM_NOTES = _DRUM_NOTES
 
 # Playable zones for the BPSR 3-octave keyboard + octave modifiers.
 # zone 0  : no modifier    -> MIDI 48..83  (C3..B5)
@@ -1318,7 +1321,6 @@ def _generate_groove_v2(notes, timeline, bars, settings):
             _append_unique_slot(kicks, bar_beats / 2.0)
 
         previous = analysis[index - 1] if index else None
-        previous_level = previous['level'] if previous else -1
         energy_rise = bool(
             previous and previous['active']
             and info['smoothed_energy'] - previous['smoothed_energy'] >= 0.14)
@@ -1540,11 +1542,11 @@ def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4,
     drum_notes = [note for note in notes if note['channel'] == 9]
     melodic_notes = [note for note in notes if note['channel'] != 9]
     original_hits = _map_gm_hits(drum_notes, timeline, settings)
-    if drum_notes and (settings.drum_source_mode or 'auto').lower() == 'auto':
-        mode = 'preserve'
-    else:
-        mode = _choose_drum_source_mode(
-            settings.drum_source_mode, original_hits, bars, timeline)
+    # Auto should preserve only when the source produced usable mapped hits.
+    # A channel-10 track containing unsupported GM percussion is otherwise
+    # mistaken for a valid drum part and converts to silence.
+    mode = _choose_drum_source_mode(
+        settings.drum_source_mode, original_hits, bars, timeline)
     groove_source = melodic_notes or notes
     generated_hits = _generate_groove_v2(groove_source, timeline, bars, settings)
     if mode == 'preserve':

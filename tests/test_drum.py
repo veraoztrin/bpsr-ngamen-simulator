@@ -520,6 +520,20 @@ def test_unknown_gm_percussion_is_ignored():
           _hits(out) == [], f"got {_hits(out)}")
 
 
+def test_auto_generates_when_drum_channel_has_no_supported_hits():
+    from arranger import ConversionSettings, convert_drum
+    events = _note(0.0, 0.03, 10, channel=9) + _melody(4, 4)
+    events.sort(key=lambda event: event['time'])
+    automatic = convert_drum(
+        events, ConversionSettings(drum_source_mode='auto'), orig_bpm=120)
+    preserved = convert_drum(
+        events, ConversionSettings(drum_source_mode='preserve'), orig_bpm=120)
+    check("auto falls back to a generated groove for unusable percussion",
+          bool(_hits(automatic)), f"got {_hits(automatic)}")
+    check("explicit preserve still keeps the empty mapped drum track",
+          _hits(preserved) == [], f"got {_hits(preserved)}")
+
+
 def test_user_minimum_spacing_is_honoured():
     from arranger import ConversionSettings, convert_drum
     events = (_note(0.0, 0.02, 36, channel=9)
@@ -565,6 +579,7 @@ if __name__ == "__main__":
         test_tempo_map_controls_generated_hit_timing,
         test_three_four_meter_uses_three_beat_bars,
         test_unknown_gm_percussion_is_ignored,
+        test_auto_generates_when_drum_channel_has_no_supported_hits,
         test_user_minimum_spacing_is_honoured,
     ]:
         fn()
