@@ -6,7 +6,9 @@
 #   1. quantised MIDI puts a note_off on the exact timestamp of the next
 #      note_on, leaving zero key-up time;
 #   2. release_note() re-derived the key from the CURRENT octave modifier, so
-#      a zone change mid-note released the wrong key and stranded the real one.
+#      a zone change mid-note released the wrong key and stranded the real one;
+#   3. changing Shift/Ctrl left already-held keys on their old physical row,
+#      so a held C5 on Q turned into C6 instead of moving to A under Shift.
 #
 # Run from the repo root:  python -m tests.test_retrigger
 # Pure-Python, no dependencies needed.
@@ -218,6 +220,56 @@ def test_zone_change_does_not_strand_a_key():
     check("no key is left held", not sim.key_refs or
           all(v == 0 for v in sim.key_refs.values()), f"got {sim.key_refs}")
     check("no press record leaks", sim.note_keys == {}, f"got {sim.note_keys}")
+
+
+def test_zone_change_remaps_held_note_to_preserve_pitch():
+    print("[octave change remaps a held note]")
+    sim, log = make_sim()
+    sim.press_note(72)        # C5 = Q in the unshifted zone
+    sim.press_note(84)        # C6 requires Shift; held C5 must move to A
+
+    old_key_up = log.index(('UP', 'C5'))
+    shift_down = log.index(('DOWN', 'LSHIFT'))
+    remapped_down = log.index(('DOWN', 'C4'))
+    check("held C5 is released before Shift changes its pitch",
+          old_key_up < shift_down, f"got {log}")
+    check("held C5 is re-pressed on A/C4 after Shift",
+          shift_down < remapped_down, f"got {log}")
+    check("C5 and C6 use distinct physical keys in the high zone",
+          sim.note_keys.get(72) == [KEY_MAP['C4']]
+          and sim.note_keys.get(84) == [KEY_MAP['C5']],
+          f"got {sim.note_keys}")
+
+    sim.release_note(84)
+    sim.release_note(72)
+    check("remapped notes release their replacement keys",
+          log.count(('UP', 'C4')) == 1
+          and log.count(('UP', 'C5')) == 2,
+          f"got {log}")
+    check("remapping leaves no held-key state behind",
+          sim.note_keys == {}
+          and all(refs == 0 for refs in sim.key_refs.values()),
+          f"notes={sim.note_keys} refs={sim.key_refs}")
+
+
+def test_incompatible_held_note_is_silenced_safely_on_zone_change():
+    print("[incompatible held note at octave change]")
+    sim, log = make_sim()
+    sim.press_note(48)        # C3 cannot coexist with C6 in any one zone
+    sim.press_note(84)        # choose the new note's high zone
+
+    check("out-of-zone held note is released before the modifier changes",
+          log.index(('UP', 'C3')) < log.index(('DOWN', 'LSHIFT')),
+          f"got {log}")
+    check("incompatible note keeps a harmless release placeholder",
+          sim.note_keys.get(48) == [None], f"got {sim.note_keys}")
+    before_release = list(log)
+    sim.release_note(48)
+    check("incompatible note-off does not release the high note's key",
+          log == before_release, f"before={before_release} after={log}")
+    sim.release_note(84)
+    check("compatible high note still releases normally",
+          log[-1] == ('UP', 'C5'), f"got {log}")
 
 
 def test_repeats_under_a_held_high_note():

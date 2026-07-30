@@ -132,9 +132,11 @@ def notes_to_events(notes, sustains, zone_hints=None):
     for z in (zone_hints or []):
         evs.append({'time': z['time'], 'type': 'zone', 'value': z['value']})
 
-    # At identical timestamps: zone hints first, then releases (free the keys),
-    # then sustain, then new presses.
-    order = {'zone': 0, 'note_off': 1, 'sustain': 2, 'note_on': 3}
+    # At an octave boundary, release notes that end there under the OLD
+    # modifier first. Then change the zone so only genuinely sustained notes
+    # are remapped before the new attacks. This avoids briefly re-pressing a
+    # note whose note_off was scheduled for the same instant.
+    order = {'note_off': 0, 'zone': 1, 'sustain': 2, 'note_on': 3}
     evs.sort(key=lambda e: (e['time'], order.get(e['type'], 4)))
     return evs
 

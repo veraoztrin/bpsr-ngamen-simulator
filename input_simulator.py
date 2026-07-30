@@ -105,10 +105,10 @@ class BPSRInputSimulator:
         self.retrigger_gap_ms = 25
         self._last_shift_change = 0.0
         self._last_release = {}  # vk_code -> perf_counter() of its last key-up
-        # midi_note -> [vk_code, ...] actually pressed for the notes of that
-        # pitch currently sounding. The octave modifier can change between a
-        # note's press and its release, and re-deriving the key at release time
-        # would then release a *different* key, leaving this one stuck down.
+        # midi_note -> [vk_code | None, ...] for currently sounding instances.
+        # None means the note cannot fit the active global octave zone. The
+        # octave modifier can change between a note's press and release, so
+        # these records are also remapped whenever the zone changes.
         self.note_keys = {}
         # Semitone offset added before the piano key lookup, so instruments
         # whose keyboard is the piano layout transposed (e.g. Bass = -3 octaves)
@@ -151,9 +151,17 @@ class BPSRInputSimulator:
     @synchronized
     def set_octave_shift(self, target_shift):
         if self.current_octave_shift == target_shift:
-            return
+            return True
         if target_shift not in (-1, 0, 1):
-            return
+            return False
+
+        active_count = sum(len(stack) for stack in self.note_keys.values())
+        # A modifier change now re-presses compatible notes below. Do not
+        # inject either the modifier or those replacement presses while focus
+        # safety is blocking output. Releasing everything is handled by the
+        # player's focus-loss path instead.
+        if (target_shift != 0 or active_count) and not self._allow_press():
+            return False
 
         # Respect the minimum hold time since the last modifier change
         hold_ms = self._safe_ms(self.shift_hold_ms, 10.0)
@@ -163,6 +171,29 @@ class BPSRInputSimulator:
             if remaining > 0:
                 time.sleep(remaining)
 
+        # Shift/Ctrl changes the pitch of every physical key that is already
+        # down. Build the replacement key state first, then release held notes
+        # while the OLD modifier is still active. After changing the modifier,
+        # compatible notes are re-pressed on the key that preserves their MIDI
+        # pitch (for example, held C5 moves from Q/C5 to A/C4 under Shift).
+        remapped_note_keys = {}
+        remapped_refs = {}
+        for midi_note, stack in self.note_keys.items():
+            base_note = self._base_note_in_shift(
+                midi_note + self.key_offset, target_shift)
+            vk_code = (
+                KEY_MAP.get(midi_to_note_name(base_note))
+                if base_note is not None else None)
+            remapped_note_keys[midi_note] = [vk_code] * len(stack)
+            if vk_code:
+                remapped_refs[vk_code] = (
+                    remapped_refs.get(vk_code, 0) + len(stack))
+
+        for vk_code, refs in list(self.key_refs.items()):
+            if refs > 0:
+                self._release_vk(vk_code)
+        self.key_refs.clear()
+
         # Release the previous modifier
         if self.current_octave_shift == 1:
             release_key(VK_LSHIFT)
@@ -170,9 +201,6 @@ class BPSRInputSimulator:
             release_key(VK_LCONTROL)
 
         # Press the new modifier
-        if target_shift != 0 and not self._allow_press():
-            self.current_octave_shift = 0
-            return
         if target_shift == 1:
             press_key(VK_LSHIFT)
         elif target_shift == -1:
@@ -185,6 +213,16 @@ class BPSRInputSimulator:
         delay_ms = self._safe_ms(self.shift_delay_ms, 30.0)
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
+
+        # Rebuild the physical chord in the new zone. Notes outside that
+        # zone receive a None placeholder: their eventual note_off remains
+        # paired and harmless instead of releasing an unrelated key.
+        for vk_code in remapped_refs:
+            self._await_key_up(vk_code)
+            press_key(vk_code)
+        self.note_keys = remapped_note_keys
+        self.key_refs = remapped_refs
+        return True
 
     @synchronized
     def set_sustain(self, active):
@@ -224,7 +262,8 @@ class BPSRInputSimulator:
         if base_note is None:
             return # Out of range
 
-        self.set_octave_shift(target_shift)
+        if not self.set_octave_shift(target_shift):
+            return
 
         note_name = midi_to_note_name(base_note)
         vk_code = KEY_MAP.get(note_name)
@@ -270,14 +309,23 @@ class BPSRInputSimulator:
             if self.key_refs[vk_code] == 0:
                 self._release_vk(vk_code)
 
+    @staticmethod
+    def _base_note_in_shift(midi_note, octave_shift):
+        """Return the physical piano-layout note for one fixed shift zone."""
+        if octave_shift == 0 and 48 <= midi_note <= 83:
+            return midi_note
+        if octave_shift == 1 and 60 <= midi_note <= 95:
+            return midi_note - 12
+        if octave_shift == -1 and 36 <= midi_note <= 71:
+            return midi_note + 12
+        return None
+
     def _get_mapping(self, midi_note):
         # Check if playable in CURRENT shift first to minimize toggling
-        if self.current_octave_shift == 0 and 48 <= midi_note <= 83:
-            return 0, midi_note
-        elif self.current_octave_shift == 1 and 60 <= midi_note <= 95:
-            return 1, midi_note - 12
-        elif self.current_octave_shift == -1 and 36 <= midi_note <= 71:
-            return -1, midi_note + 12
+        base_note = self._base_note_in_shift(
+            midi_note, self.current_octave_shift)
+        if base_note is not None:
+            return self.current_octave_shift, base_note
             
         # If not playable currently, map to the default shift
         if 48 <= midi_note <= 83:

@@ -203,6 +203,17 @@ def test_event_ordering():
     at_1 = [e['type'] for e in out if abs(e['time'] - 1.0) < 1e-9]
     check("off before on at same t", at_1 == ['note_off', 'note_on'], f"got {at_1}")
 
+    notes, _sustains = events_to_notes(evs)
+    with_zone = notes_to_events(
+        notes, [], [{'time': 1.0, 'value': 1}])
+    at_boundary = [
+        event['type'] for event in with_zone
+        if abs(event['time'] - 1.0) < 1e-9
+    ]
+    check("old note releases before zone change and new note",
+          at_boundary == ['note_off', 'zone', 'note_on'],
+          f"got {at_boundary}")
+
 
 # --- consistent windows ----------------------------------------------------
 
