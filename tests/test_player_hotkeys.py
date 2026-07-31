@@ -139,6 +139,23 @@ def test_play_waits_for_game_focus_without_skipping():
     player.stop()
 
 
+def test_strict_multiplayer_timing_aborts_instead_of_desyncing():
+    errors = []
+    player = MidiPlayer(on_output_error=errors.append)
+    player.simulator = FocusSimulator()
+    player.load_events([
+        {"time": 0.0, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 0.2, "type": "note_off", "note": 60, "channel": 0},
+    ], [0])
+
+    assert player.play(strict_timing=True)
+    player.thread.join(timeout=1.0)
+
+    assert not player.is_playing
+    assert ("press", 60) not in player.simulator.log
+    assert errors and "Synchronized playback stopped" in errors[0]
+
+
 def test_sustain_is_owned_per_channel():
     player = MidiPlayer()
     player.simulator = StatefulSimulator()

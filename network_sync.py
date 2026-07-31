@@ -29,12 +29,16 @@ MAX_PLAYERS = 16
 MAX_NICKNAME_LENGTH = 32
 MAX_FILENAME_LENGTH = 180
 MIN_ROOM_CREDENTIAL_LENGTH = 16
-ROOM_CREDENTIAL_PREFIX = "bpsr2"
-PROTOCOL_VERSION = 2
+ROOM_CREDENTIAL_PREFIX = "bpsr3"
+PROTOCOL_VERSION = 3
+MIN_SYNC_SAMPLES = 5
+MAX_READY_SYNC_RTT = 0.5
+MAX_ROOM_REVISION = 2**31 - 1
 HOST_ONLY_TYPES = {
     "sync_pong", "state", "midi_file", "conversion_profile",
     "play", "stop", "disband", "kick",
 }
+RELIABLE_TYPES = HOST_ONLY_TYPES | {"join", "leave", "ready"}
 
 # The release build runs with PyInstaller's --windowed flag (no console), so
 # print() output disappears into the void for every real user. Mirror it to a
@@ -162,7 +166,9 @@ class NetworkManager:
         # Room State (Host maintains this)
         self.room_state = {
             "players": [], # list of dicts: {"client_id": "", "nickname": "", "channels": [], "connected": True, "last_seen": 0, "ready": False}
-            "filename": None
+            "filename": None,
+            "song_id": None,
+            "revision": 0,
         }
 
         self.heartbeat_thread = None
@@ -174,6 +180,10 @@ class NetworkManager:
         if self.is_host:
             return time.time()
         return time.time() + self.host_offset
+
+    @property
+    def sync_sample_count(self):
+        return len(self._sync_samples)
 
     def connect(self):
         if self.running:
@@ -207,7 +217,7 @@ class NetworkManager:
         while self.running:
             if self.room_code and not self.is_host:
                 # Burst until we have a few samples, then a steady trickle.
-                n = 10 if len(self._sync_samples) < 5 else 1
+                n = 10 if not self.is_synced else 1
                 for _ in range(n):
                     if not (self.running and self.room_code and not self.is_host):
                         break
@@ -220,7 +230,8 @@ class NetworkManager:
                 # silent and permanent (no timeout existed before this). Tell
                 # the UI once so it can show *something* actionable instead of
                 # hanging forever with no explanation.
-                if (not self.is_synced and not self._sync_stall_reported
+                if (not self.is_synced and not self._sync_samples
+                        and not self._sync_stall_reported
                         and self._room_joined_at is not None
                         and time.time() - self._room_joined_at > 8.0):
                     self._sync_stall_reported = True
@@ -255,7 +266,10 @@ class NetworkManager:
         self._seen_message_ids = set()
         self._seen_message_order = deque()
         self.is_host = False
-        self.room_state = {"players": [], "filename": None}
+        self.room_state = {
+            "players": [], "filename": None,
+            "song_id": None, "revision": 0,
+        }
         self.host_offset = 0.0
         self.sync_rtt = None
         self.is_synced = False
@@ -298,8 +312,13 @@ class NetworkManager:
         self._room_joined_at = time.time()
         self._sync_stall_reported = False
         self.room_state = {
-            "players": [{"client_id": self.client_id, "nickname": self.nickname, "channels": [], "connected": True, "last_seen": time.time(), "ready": True}],
-            "filename": None
+            "players": [{"client_id": self.client_id,
+                         "nickname": self.nickname, "channels": [],
+                         "connected": True, "last_seen": time.time(),
+                         "ready": False}],
+            "filename": None,
+            "song_id": None,
+            "revision": 0,
         }
         self._subscribe()
         self._broadcast_state()
@@ -324,11 +343,22 @@ class NetworkManager:
 
     def assign_channels(self, target_client_id, channels):
         if not self.is_host:
-            return
+            return False
+        channels = self._validate_channels(channels)
+        if channels is None:
+            return False
         for p in self.room_state["players"]:
             if p["client_id"] == target_client_id:
+                if p["channels"] == channels:
+                    return True
                 p["channels"] = channels
-        self._broadcast_state()
+                # A remote player must explicitly approve every new part.
+                # The host has already loaded its own conversion, so a valid
+                # non-empty assignment is enough to arm its local part.
+                p["ready"] = bool(channels) if target_client_id == self.client_id else False
+                self._broadcast_state()
+                return True
+        return False
 
     def kick_player(self, target_client_id):
         """Host removes a player from the room. Mirrors leave/disband:
@@ -346,15 +376,27 @@ class NetworkManager:
         self._broadcast_state()
 
     def send_ready_status(self, is_ready):
-        self._publish({
+        revision = self.room_state.get("revision", 0)
+        return self._publish({
             "type": "ready",
             "client_id": self.client_id,
-            "ready": is_ready
+            "ready": bool(is_ready),
+            "revision": revision,
         })
 
-    def share_midi(self, file_path, filename, conversion_profile=None):
+    def _advance_revision(self):
+        current = self.room_state.get("revision", 0)
+        return 1 if current >= MAX_ROOM_REVISION else current + 1
+
+    def _set_players_unready_for_revision(self):
+        for player in self.room_state["players"]:
+            player["ready"] = bool(
+                player["client_id"] == self.client_id and player["channels"])
+
+    def share_midi(self, file_path, filename, conversion_profile=None,
+                   target_client_id=None):
         if not self.is_host:
-            return
+            return False
         try:
             size = os.path.getsize(file_path)
             if size > MAX_MIDI_BYTES:
@@ -372,76 +414,169 @@ class NetworkManager:
                     conversion_profile, dict):
                 raise ValueError("Conversion profile must be an object")
             data = base64.b64encode(raw).decode('ascii')
+            song_id = hashlib.sha256(raw).hexdigest()
+            known_target = any(
+                p["client_id"] == target_client_id
+                for p in self.room_state["players"])
+            targeted = bool(
+                target_client_id and known_target
+                and self.room_state.get("song_id") == song_id
+                and self.room_state.get("revision", 0) > 0)
 
-            self._publish({
+            if not targeted:
+                target_client_id = None
+                self.room_state["filename"] = safe_name
+                self.room_state["song_id"] = song_id
+                self.room_state["revision"] = self._advance_revision()
+                self._set_players_unready_for_revision()
+                # State must arrive first: it authenticates the exact file and
+                # revision that the following MIDI packet belongs to.
+                self._broadcast_state()
+
+            revision = self.room_state["revision"]
+            published = self._publish({
                 "type": "midi_file",
                 "filename": safe_name,
                 "data": data,
-                "sha256": hashlib.sha256(raw).hexdigest(),
+                "sha256": song_id,
+                "revision": revision,
+                "to": target_client_id,
                 "conversion_profile": conversion_profile,
             })
-            self.room_state["filename"] = safe_name
-            for player in self.room_state["players"]:
-                if player["client_id"] != self.client_id:
-                    player["ready"] = False
-            self._broadcast_state()
+            if not published:
+                _log("The shared MIDI could not be queued for delivery")
+            return published
         except Exception as e:
             _log(f"Failed to share MIDI: {e}")
+            return False
 
     def share_conversion_profile(self, conversion_profile):
-        if self.is_host and isinstance(conversion_profile, dict):
-            for player in self.room_state["players"]:
-                if player["client_id"] != self.client_id:
-                    player["ready"] = False
-            self._broadcast_state()
-            self._publish({
-                "type": "conversion_profile",
-                "profile": conversion_profile,
-            })
+        if (not self.is_host or not isinstance(conversion_profile, dict)
+                or not self.room_state.get("song_id")):
+            return False
+        self.room_state["revision"] = self._advance_revision()
+        self._set_players_unready_for_revision()
+        self._broadcast_state()
+        return self._publish({
+            "type": "conversion_profile",
+            "profile": conversion_profile,
+            "revision": self.room_state["revision"],
+        })
+
+    def room_start_issue(self):
+        if not self.is_host:
+            return "Only the host can start synchronized playback."
+        if (not self.room_state.get("song_id")
+                or self.room_state.get("revision", 0) <= 0):
+            return "Share a MIDI file before starting multiplayer playback."
+        players = self.room_state.get("players", [])
+        if not players:
+            return "No players are present in the room."
+        for player in players:
+            name = player.get("nickname") or "A player"
+            if not player.get("connected", True):
+                return f"{name} is disconnected."
+            if not player.get("channels"):
+                return f"Assign at least one channel to {name}."
+            if not player.get("ready", False):
+                return f"{name} is not Ready."
+        return None
+
+    def client_ready_issue(self, accepted_revision, has_playable_events,
+                           available_channels):
+        if not self.room_code or self.is_host:
+            return "Join a multiplayer room first."
+        if not self.is_synced:
+            return "Wait for a stable clock sync before marking Ready."
+        revision = self.room_state.get("revision", 0)
+        if revision <= 0 or not self.room_state.get("song_id"):
+            return "Wait for the host to share a MIDI file."
+        if accepted_revision != revision:
+            return "Accept and finish converting the host's current MIDI first."
+        if not has_playable_events:
+            return "The current MIDI has no playable converted notes."
+        me = next(
+            (p for p in self.room_state.get("players", [])
+             if p.get("client_id") == self.client_id), None)
+        if not me or not me.get("connected", True):
+            return "Wait until your room connection is restored."
+        if not me.get("channels"):
+            return "Ask the host to assign you at least one channel."
+        if not set(me["channels"]).issubset(set(available_channels)):
+            return "The host's channel assignment does not exist in this conversion."
+        return None
 
     def send_play(self, delay_seconds=4.0):
         if not self.is_host:
-            return
+            return False
+        issue = self.room_start_issue()
+        if issue:
+            _log(f"Multiplayer start blocked: {issue}")
+            return False
+        try:
+            delay_seconds = float(delay_seconds)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(delay_seconds):
+            return False
+        delay_seconds = min(max(delay_seconds, 0.5), 30.0)
         start_time = self.get_global_time() + delay_seconds
-        
-        # Reset ready status
-        for p in self.room_state["players"]:
-            if p["client_id"] != self.client_id:
-                p["ready"] = False
-        self._broadcast_state()
-        
-        self._publish({
+
+        published = self._publish({
             "type": "play",
-            "start_time": start_time
+            "start_time": start_time,
+            "revision": self.room_state["revision"],
         })
-        
+        if not published:
+            return False
+        host = next(
+            (p for p in self.room_state["players"]
+             if p["client_id"] == self.client_id), None)
+        if host and self.on_play_cmd:
+            # Start locally without depending on the MQTT broker echoing the
+            # host's own packet back through its subscription.
+            self.on_play_cmd(start_time, list(host["channels"]))
+        return True
+
     def send_stop(self):
         if not self.is_host:
-            return
-        self._publish({
+            return False
+        published = self._publish({
             "type": "stop"
         })
+        if self.on_stop_cmd:
+            self.on_stop_cmd()
+        return published
 
     def _subscribe(self):
         self.client.subscribe(self._room_topic())
 
     def _publish(self, payload_dict):
         if not self.room_code:
-            return
-        payload = dict(payload_dict)
-        payload["_sender"] = self.client_id
-        payload["_msg_id"] = uuid.uuid4().hex
-        payload["_sender_pub"] = self._identity_public_text
-        payload["_proto"] = PROTOCOL_VERSION
-        secret = getattr(self, "_room_secret", None)
-        if secret:
-            payload["_sig"] = self._sign(payload)
-            payload["_sender_sig"] = self._sign_sender(payload)
-        qos = 1 if payload.get("type") in HOST_ONLY_TYPES else 0
-        self.client.publish(
-            self._room_topic(),
-            json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
-            qos=qos)
+            return False
+        try:
+            payload = dict(payload_dict)
+            payload["_sender"] = self.client_id
+            payload["_msg_id"] = uuid.uuid4().hex
+            payload["_sender_pub"] = self._identity_public_text
+            payload["_proto"] = PROTOCOL_VERSION
+            secret = getattr(self, "_room_secret", None)
+            if secret:
+                payload["_sig"] = self._sign(payload)
+                payload["_sender_sig"] = self._sign_sender(payload)
+            qos = 1 if payload.get("type") in RELIABLE_TYPES else 0
+            info = self.client.publish(
+                self._room_topic(),
+                json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+                qos=qos)
+            rc = getattr(info, "rc", 0)
+            if rc not in (None, 0):
+                _log(f"MQTT publish failed for {payload.get('type')}: rc={rc}")
+                return False
+            return True
+        except Exception as exc:
+            _log(f"MQTT publish failed for {payload_dict.get('type')}: {exc}")
+            return False
 
     @staticmethod
     def _b64url(data):
@@ -478,7 +613,8 @@ class NetworkManager:
         parts = credential.split(".")
         if len(parts) != 3 or parts[0] != ROOM_CREDENTIAL_PREFIX:
             raise ValueError(
-                "Use the complete bpsr2 room invitation generated by the host")
+                f"Use the complete {ROOM_CREDENTIAL_PREFIX} room invitation "
+                "generated by the host")
         if not MIN_ROOM_CREDENTIAL_LENGTH <= len(parts[1]) <= 128:
             raise ValueError("Room invitation contains a weak room secret")
         try:
@@ -589,8 +725,30 @@ class NetworkManager:
             return None
         return sorted(set(channels))
 
+    @staticmethod
+    def _validate_revision(value):
+        if (isinstance(value, bool) or not isinstance(value, int)
+                or not 0 <= value <= MAX_ROOM_REVISION):
+            return None
+        return value
+
     def _validate_state(self, state):
-        if not isinstance(state, dict) or set(state) - {"players", "filename"}:
+        if (not isinstance(state, dict)
+                or set(state) - {"players", "filename", "song_id", "revision"}):
+            return None
+        revision = self._validate_revision(state.get("revision"))
+        song_id = state.get("song_id")
+        if revision is None:
+            return None
+        if song_id is not None:
+            if not isinstance(song_id, str) or len(song_id) != 64:
+                return None
+            try:
+                int(song_id, 16)
+            except ValueError:
+                return None
+            song_id = song_id.lower()
+        if (revision == 0) != (song_id is None):
             return None
         players = state.get("players")
         if not isinstance(players, list) or not 1 <= len(players) <= MAX_PLAYERS:
@@ -623,7 +781,12 @@ class NetworkManager:
         filename = state.get("filename")
         if filename is not None:
             filename = ntpath.basename(str(filename))[:MAX_FILENAME_LENGTH]
-        return {"players": cleaned, "filename": filename}
+        return {
+            "players": cleaned,
+            "filename": filename,
+            "song_id": song_id,
+            "revision": revision,
+        }
 
     @staticmethod
     def _reject_json_constant(value):
@@ -660,6 +823,7 @@ class NetworkManager:
                         if p["client_id"] != self.client_id:
                             if p["connected"] and (current_time - p["last_seen"] > 12.0):
                                 p["connected"] = False
+                                p["ready"] = False
                                 changed = True
                     if changed:
                         self._broadcast_state()
@@ -700,6 +864,7 @@ class NetworkManager:
                     "type": "ready",
                     "client_id": self.client_id,
                     "ready": False,
+                    "revision": self.room_state.get("revision", 0),
                 })
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties=None):
@@ -801,7 +966,10 @@ class NetworkManager:
                         # Median offset of the lowest-RTT samples: cleaner and
                         # steadier than trusting one single fastest round trip.
                         self.sync_rtt, self.host_offset = select_offset(self._sync_samples)
-                        self.is_synced = True
+                        self.is_synced = bool(
+                            len(self._sync_samples) >= MIN_SYNC_SAMPLES
+                            and self.sync_rtt is not None
+                            and self.sync_rtt <= MAX_READY_SYNC_RTT)
                         if self.on_sync_update:
                             self.on_sync_update(self.sync_rtt, self.host_offset)
                 return
@@ -843,6 +1011,7 @@ class NetworkManager:
                         if p["client_id"] == payload["client_id"]:
                             p["connected"] = True
                             p["last_seen"] = time.time()
+                            p["ready"] = False
                             exists = True
                             break
                     if not exists:
@@ -863,16 +1032,26 @@ class NetworkManager:
                         if p["client_id"] == payload["client_id"]:
                             if not p["connected"]:
                                 p["connected"] = True
+                                p["ready"] = False
                                 self._broadcast_state()
                             p["last_seen"] = time.time()
                             break
 
                 elif msg_type == "ready":
-                    if not isinstance(payload.get("ready"), bool):
+                    requested = payload.get("ready")
+                    revision = self._validate_revision(payload.get("revision"))
+                    if not isinstance(requested, bool) or revision is None:
                         return
                     for p in self.room_state["players"]:
                         if p["client_id"] == payload["client_id"]:
-                            p["ready"] = payload["ready"]
+                            if requested:
+                                p["ready"] = bool(
+                                    revision == self.room_state.get("revision")
+                                    and self.room_state.get("song_id")
+                                    and p.get("connected", True)
+                                    and p.get("channels"))
+                            else:
+                                p["ready"] = False
                             self._broadcast_state()
                             break
 
@@ -886,6 +1065,13 @@ class NetworkManager:
                     if self.on_state_change:
                         self.on_state_change(self.room_state)
                 elif msg_type == "midi_file":
+                    target = payload.get("to")
+                    if target is not None and target != self.client_id:
+                        return
+                    revision = self._validate_revision(payload.get("revision"))
+                    if (revision is None
+                            or revision != self.room_state.get("revision")):
+                        return
                     encoded = payload["data"]
                     if not isinstance(encoded, str) or len(encoded) > MAX_MIDI_B64_CHARS:
                         raise ValueError("Received MIDI exceeds the size limit")
@@ -902,6 +1088,8 @@ class NetworkManager:
                     if (not isinstance(expected_hash, str)
                             or len(expected_hash) != 64
                             or not hmac.compare_digest(
+                                expected_hash, self.room_state.get("song_id") or "")
+                            or not hmac.compare_digest(
                                 hashlib.sha256(data).hexdigest(), expected_hash)
                             or not data.startswith(b"MThd")):
                         raise ValueError("Received MIDI failed integrity checks")
@@ -909,30 +1097,43 @@ class NetworkManager:
                         profile = payload.get("conversion_profile")
                         if profile is not None and not isinstance(profile, dict):
                             raise ValueError("Received invalid conversion profile")
-                        self.on_midi_received(filename, data, profile)
+                        self.on_midi_received(filename, data, profile, revision)
                 elif msg_type == "conversion_profile":
                     profile = payload.get("profile")
-                    if not isinstance(profile, dict):
+                    revision = self._validate_revision(payload.get("revision"))
+                    if (not isinstance(profile, dict) or revision is None
+                            or revision != self.room_state.get("revision")):
                         raise ValueError("Received invalid conversion profile")
                     if self.on_conversion_profile_received:
-                        self.on_conversion_profile_received(profile)
+                        self.on_conversion_profile_received(profile, revision)
 
             # Both host and client handle 'play' and 'stop'
             if msg_type == "play":
+                if self.is_host and sender == self.client_id:
+                    return
+                revision = self._validate_revision(payload.get("revision"))
+                if (revision is None
+                        or revision != self.room_state.get("revision")):
+                    return
+                if not self.is_host and not self.is_synced:
+                    return
                 start_time = self._finite_number(payload.get("start_time"), 0)
                 now = self.get_global_time()
                 if start_time is None or not now - 5.0 <= start_time <= now + 30.0:
                     return
-                my_channels = []
-                for p in self.room_state["players"]:
-                    if p["client_id"] == self.client_id:
-                        my_channels = p["channels"]
-                        break
-                
+                me = next(
+                    (p for p in self.room_state["players"]
+                     if p["client_id"] == self.client_id), None)
+                if (not me or not me.get("connected", True)
+                        or not me.get("ready", False)
+                        or not me.get("channels")):
+                    return
                 if self.on_play_cmd:
-                    self.on_play_cmd(start_time, my_channels)
+                    self.on_play_cmd(start_time, list(me["channels"]))
             
             elif msg_type == "stop":
+                if self.is_host and sender == self.client_id:
+                    return
                 if self.on_stop_cmd:
                     self.on_stop_cmd()
 

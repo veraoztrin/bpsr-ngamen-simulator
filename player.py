@@ -8,8 +8,9 @@ except Exception:
     BPSRInputSimulator = None
 
 class MidiPlayer:
-    def __init__(self):
+    def __init__(self, on_output_error=None):
         self.simulator = BPSRInputSimulator() if BPSRInputSimulator else None
+        self.on_output_error = on_output_error
         self.events = []
         self.active_channels = set()
         self._transpose = 0
@@ -39,6 +40,7 @@ class MidiPlayer:
         self.time_offset = 0.0
         
         self.sleep_threshold = 0.002 
+        self.strict_timing = False
 
     @property
     def transpose(self):
@@ -169,11 +171,13 @@ class MidiPlayer:
                 self._focus_wait_started = None
         return not cancel.is_set()
 
-    def play(self, delay_seconds=0.0):
+    def play(self, delay_seconds=0.0, strict_timing=False):
         # A paused worker is always joined before pause() returns, but joining
         # here as well makes programmatic state changes safe.
         with self._state_lock:
             if self.is_playing:
+                return False
+            if not self.active_channels:
                 return False
         try:
             delay_seconds = float(delay_seconds)
@@ -200,6 +204,7 @@ class MidiPlayer:
 
             self.stop_requested = False
             self.is_playing = True
+            self.strict_timing = bool(strict_timing)
             self.is_focus_waiting = False
             self._focus_wait_started = None
             self._cancel_event = threading.Event()
@@ -325,6 +330,7 @@ class MidiPlayer:
                 pass
 
     def _playback_loop(self, cancel):
+        focus_error = None
         while self.current_event_idx < len(self.events):
             if cancel.is_set():
                 break
@@ -336,10 +342,16 @@ class MidiPlayer:
                 self._accurate_delay(target_time, cancel)
                 if cancel.is_set() or self._output_focus_ready():
                     break
+                if self.strict_timing:
+                    focus_error = (
+                        "Synchronized playback stopped because the target "
+                        "game window was not focused. Refocus the game and "
+                        "ask the host to start again.")
+                    break
                 if not self._wait_for_output_focus(cancel):
                     break
             
-            if cancel.is_set():
+            if cancel.is_set() or focus_error:
                 break
 
             with self._state_lock:
@@ -379,10 +391,18 @@ class MidiPlayer:
 
             self.current_event_idx += 1
 
-        if not cancel.is_set() and self.current_event_idx >= len(self.events):
-            self.is_playing = False
+        completed = self.current_event_idx >= len(self.events)
+        if focus_error or (not cancel.is_set() and completed):
+            with self._state_lock:
+                self.is_playing = False
+                self.is_paused = False
             if self.simulator:
                 self.simulator.release_all()
             self._active_notes.clear()
             self._sustain_by_channel.clear()
             self._current_zone = 0
+            if focus_error and self.on_output_error:
+                try:
+                    self.on_output_error(focus_error)
+                except Exception:
+                    pass

@@ -253,7 +253,7 @@ def _client_manager():
     host_public = host_private.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     credential = (
-        "bpsr2.correct-horse-battery-staple."
+        "bpsr3.correct-horse-battery-staple."
         + manager._b64url(host_public))
     manager._configure_room(credential)
     manager.is_host = False
@@ -262,8 +262,17 @@ def _client_manager():
     manager._test_host_public = host_public
     manager.nickname = "Client"
     manager.room_state = {
-        "players": [{"client_id": "client", "channels": [0]}],
-        "filename": None,
+        "players": [{
+            "client_id": manager.client_id,
+            "nickname": "Client",
+            "channels": [0],
+            "connected": True,
+            "last_seen": time.time(),
+            "ready": True,
+        }],
+        "filename": "song.mid",
+        "song_id": hashlib.sha256(b"MThd").hexdigest(),
+        "revision": 1,
     }
     manager.host_offset = 0.0
     manager.sync_rtt = None
@@ -289,7 +298,7 @@ def _signed_message(manager, payload):
     payload["_sender"] = manager.host_id
     payload["_msg_id"] = os.urandom(16).hex()
     payload["_sender_pub"] = manager._b64url(manager._test_host_public)
-    payload["_proto"] = 2
+    payload["_proto"] = 3
     payload["_sig"] = manager._sign(payload)
     unsigned = json.dumps(
         payload, sort_keys=True, separators=(",", ":"),
@@ -306,7 +315,8 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
     monkeypatch.setattr(network_sync, "_log", lambda _message: None)
     received = []
     manager.on_midi_received = (
-        lambda name, data, profile: received.append((name, data, profile)))
+        lambda name, data, profile, revision:
+        received.append((name, data, profile, revision)))
     encoded = base64.b64encode(b"MThd").decode("ascii")
 
     unsigned = types.SimpleNamespace(
@@ -323,18 +333,20 @@ def test_network_rejects_unsigned_file_and_sanitizes_signed_filename(monkeypatch
         "filename": "../../evil.mid",
         "data": encoded,
         "sha256": hashlib.sha256(b"MThd").hexdigest(),
+        "revision": 1,
     }))
-    assert received == [("evil.mid", b"MThd", None)]
+    assert received == [("evil.mid", b"MThd", None, 1)]
 
     replay = _signed_message(manager, {
         "type": "midi_file",
         "filename": "song.mid",
         "data": encoded,
         "sha256": hashlib.sha256(b"MThd").hexdigest(),
+        "revision": 1,
     })
     manager._on_message(None, None, replay)
     manager._on_message(None, None, replay)
-    assert received.count(("song.mid", b"MThd", None)) == 1
+    assert received.count(("song.mid", b"MThd", None, 1)) == 1
 
 
 def test_disconnect_invalidates_client_clock_sync():
@@ -359,10 +371,12 @@ def test_host_profile_change_clears_remote_ready_status():
     manager.client_id = "host"
     manager.room_state = {
         "players": [
-            {"client_id": "host", "ready": True},
-            {"client_id": "client", "ready": True},
+            {"client_id": "host", "channels": [0], "ready": True},
+            {"client_id": "client", "channels": [1], "ready": True},
         ],
         "filename": "song.mid",
+        "song_id": "a" * 64,
+        "revision": 1,
     }
     published = []
     broadcasts = []
@@ -377,6 +391,7 @@ def test_host_profile_change_clears_remote_ready_status():
     assert published == [{
         "type": "conversion_profile",
         "profile": {"version": 1},
+        "revision": 2,
     }]
 
 
@@ -416,11 +431,171 @@ def test_room_member_cannot_forge_host_command():
 
 def test_non_finite_network_start_is_rejected():
     _network_sync, manager = _client_manager()
+    manager.is_synced = True
     played = []
     manager.on_play_cmd = lambda *args: played.append(args)
     message = _signed_message(manager, {
         "type": "play",
         "start_time": float("nan"),
+        "revision": 1,
     })
     manager._on_message(None, None, message)
     assert played == []
+
+
+def test_player_refuses_silent_play_with_no_active_channels():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([{
+        "time": 0.0, "type": "note_on", "note": 60, "channel": 0,
+    }], [])
+
+    assert player.play() is False
+    assert not player.is_playing
+    assert not any(entry[0] == "press" for entry in player.simulator.log)
+
+
+def test_channel_assignment_invalidates_remote_ready():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.is_host = True
+    manager.client_id = "host"
+    manager.room_state = {
+        "players": [
+            {"client_id": "host", "channels": [0], "ready": True},
+            {"client_id": "client", "channels": [1], "ready": True},
+        ],
+        "filename": "song.mid", "song_id": "a" * 64, "revision": 1,
+    }
+    broadcasts = []
+    manager._broadcast_state = lambda: broadcasts.append(True)
+
+    assert manager.assign_channels("client", [2]) is True
+    assert manager.room_state["players"][1]["channels"] == [2]
+    assert manager.room_state["players"][1]["ready"] is False
+    assert broadcasts == [True]
+
+
+def test_play_requires_sync_ready_and_assigned_channels():
+    _network_sync, manager = _client_manager()
+    calls = []
+    manager.on_play_cmd = lambda start, channels: calls.append(channels)
+
+    def send_play():
+        manager._on_message(None, None, _signed_message(manager, {
+            "type": "play",
+            "start_time": manager.get_global_time() + 1.0,
+            "revision": 1,
+        }))
+
+    manager.is_synced = False
+    send_play()
+    assert calls == []
+
+    manager.is_synced = True
+    manager.room_state["players"][0]["ready"] = False
+    send_play()
+    assert calls == []
+
+    manager.room_state["players"][0]["ready"] = True
+    manager.room_state["players"][0]["channels"] = []
+    send_play()
+    assert calls == []
+
+    manager.room_state["players"][0]["channels"] = [0]
+    send_play()
+    assert calls == [[0]]
+
+
+def test_clock_needs_five_good_samples_before_ready():
+    _network_sync, manager = _client_manager()
+    for sample in range(4):
+        t0 = time.time() - 0.05
+        manager._on_message(None, None, _signed_message(manager, {
+            "type": "sync_pong", "to": manager.client_id,
+            "id": sample, "t0": t0, "t1": t0 + 0.02,
+            "t2": t0 + 0.021,
+        }))
+        assert manager.is_synced is False
+
+    t0 = time.time() - 0.05
+    manager._on_message(None, None, _signed_message(manager, {
+        "type": "sync_pong", "to": manager.client_id,
+        "id": 4, "t0": t0, "t1": t0 + 0.02,
+        "t2": t0 + 0.021,
+    }))
+    assert manager.sync_sample_count == 5
+    assert manager.is_synced is True
+
+
+def test_host_start_rejects_disconnected_unready_or_unassigned_players():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.is_host = True
+    manager.room_state = {
+        "players": [{
+            "client_id": "host", "nickname": "Host", "channels": [],
+            "connected": True, "ready": False,
+        }],
+        "filename": "song.mid", "song_id": "a" * 64, "revision": 1,
+    }
+
+    assert "Assign" in manager.room_start_issue()
+    manager.room_state["players"][0]["channels"] = [0]
+    assert "not Ready" in manager.room_start_issue()
+    manager.room_state["players"][0]["ready"] = True
+    manager.room_state["players"][0]["connected"] = False
+    assert "disconnected" in manager.room_start_issue()
+    manager.room_state["players"][0]["connected"] = True
+    assert manager.room_start_issue() is None
+
+
+def test_host_play_starts_locally_without_waiting_for_broker_echo():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.is_host = True
+    manager.client_id = "host"
+    manager.room_state = {
+        "players": [{
+            "client_id": "host", "nickname": "Host", "channels": [0],
+            "connected": True, "ready": True,
+        }],
+        "filename": "song.mid", "song_id": "a" * 64, "revision": 1,
+    }
+    published = []
+    played = []
+    manager._publish = lambda payload: published.append(payload) or True
+    manager.on_play_cmd = lambda start, channels: played.append(channels)
+    manager.get_global_time = lambda: 100.0
+
+    assert manager.send_play(2.0) is True
+    assert published == [{"type": "play", "start_time": 102.0,
+                          "revision": 1}]
+    assert played == [[0]]
+
+
+def test_client_ready_requires_the_current_revision_and_valid_assignment():
+    _network_sync, manager = _client_manager()
+    manager.is_synced = True
+
+    issue = manager.client_ready_issue(
+        accepted_revision=0, has_playable_events=True,
+        available_channels=[0])
+    assert "current MIDI" in issue
+
+    manager.room_state["players"][0]["channels"] = []
+    issue = manager.client_ready_issue(
+        accepted_revision=1, has_playable_events=True,
+        available_channels=[0])
+    assert "assign" in issue
+
+    manager.room_state["players"][0]["channels"] = [1]
+    issue = manager.client_ready_issue(
+        accepted_revision=1, has_playable_events=True,
+        available_channels=[0])
+    assert "does not exist" in issue
+
+    manager.room_state["players"][0]["channels"] = [0]
+    assert manager.client_ready_issue(
+        accepted_revision=1, has_playable_events=True,
+        available_channels=[0]) is None
