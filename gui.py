@@ -36,7 +36,9 @@ class App(ctk.CTk):
 
         self.title("Blue Protocol MIDI Bard Player - Multiplayer")
         self.geometry("820x940")
-        self.minsize(720, 700)
+        # Conversion controls need this width, but the Solo page now scrolls
+        # vertically, so compact/laptop layouts no longer need a tall minimum.
+        self.minsize(720, 520)
         self.player = MidiPlayer()
         self.live_midi = LiveMidiListener(
             self.player.simulator, on_state_release=self._restore_playback_state)
@@ -184,10 +186,21 @@ class App(ctk.CTk):
 
     def setup_solo_tab(self):
         self.tab_solo.grid_columnconfigure(0, weight=1)
-        self.tab_solo.grid_rowconfigure(3, weight=1)
+        self.tab_solo.grid_rowconfigure(0, weight=1)
+
+        # Scroll the entire Solo page, not just the channel list. Conversion
+        # settings have grown over time and used to push "Solo Active
+        # Channels" below the visible area when the window was shortened.
+        # One page-level scrollbar keeps every section reachable and avoids
+        # competing nested mouse-wheel regions.
+        self.solo_scroll = ctk.CTkScrollableFrame(
+            self.tab_solo, fg_color="transparent", corner_radius=0)
+        self.solo_scroll.grid(
+            row=0, column=0, padx=0, pady=0, sticky="nsew")
+        self.solo_scroll.grid_columnconfigure(0, weight=1)
 
         # Live MIDI Keyboard
-        self.live_midi_frame = ctk.CTkFrame(self.tab_solo)
+        self.live_midi_frame = ctk.CTkFrame(self.solo_scroll)
         self.live_midi_frame.grid(row=0, column=0, padx=10, pady=(10, 0), sticky="ew")
         self.live_midi_frame.grid_columnconfigure(1, weight=1)
         
@@ -203,7 +216,7 @@ class App(ctk.CTk):
         self.refresh_devices_btn.grid(row=0, column=2, padx=(0, 10), pady=10)
 
         # Play Controls
-        self.control_frame = ctk.CTkFrame(self.tab_solo)
+        self.control_frame = ctk.CTkFrame(self.solo_scroll)
         self.control_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
         self.control_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
         
@@ -232,7 +245,7 @@ class App(ctk.CTk):
         self.autoplay_cb.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 10), sticky="w")
 
         # --- Conversion Settings Panel ---
-        self.conv_frame = ctk.CTkFrame(self.tab_solo)
+        self.conv_frame = ctk.CTkFrame(self.solo_scroll)
         self.conv_frame.grid(row=2, column=0, padx=10, pady=(0, 5), sticky="ew")
 
         header = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
@@ -460,8 +473,16 @@ class App(ctk.CTk):
         self._drum_hidden_widgets.append((self.row4, {"fill": "x", "padx": 10, "pady": (0, 8)}))
         self.drum_controls_frame.pack_forget()
 
-        self.channel_frame = ctk.CTkScrollableFrame(self.tab_solo, label_text="Solo Active Channels")
-        self.channel_frame.grid(row=3, column=0, padx=10, pady=10, sticky="nsew")
+        self.channel_section = ctk.CTkFrame(self.solo_scroll)
+        self.channel_section.grid(
+            row=3, column=0, padx=10, pady=10, sticky="ew")
+        ctk.CTkLabel(
+            self.channel_section, text="Solo Active Channels",
+            font=ctk.CTkFont(weight="bold")).pack(
+                fill="x", padx=10, pady=(8, 2))
+        self.channel_frame = ctk.CTkFrame(
+            self.channel_section, fg_color="transparent")
+        self.channel_frame.pack(fill="x", padx=4, pady=(0, 8))
 
     def on_transpose(self, val):
         val = int(val)
