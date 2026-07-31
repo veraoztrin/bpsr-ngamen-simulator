@@ -28,6 +28,7 @@ MAX_CONTROL_MESSAGE_BYTES = 128 * 1024
 MAX_PLAYERS = 16
 MAX_NICKNAME_LENGTH = 32
 MAX_FILENAME_LENGTH = 180
+MAX_PART_LABEL_LENGTH = 80
 MIN_ROOM_CREDENTIAL_LENGTH = 16
 ROOM_CREDENTIAL_PREFIX = "bpsr3"
 PROTOCOL_VERSION = 3
@@ -38,7 +39,8 @@ HOST_ONLY_TYPES = {
     "sync_pong", "state", "midi_file", "conversion_profile",
     "play", "stop", "disband", "kick",
 }
-RELIABLE_TYPES = HOST_ONLY_TYPES | {"join", "leave", "ready"}
+RELIABLE_TYPES = HOST_ONLY_TYPES | {
+    "join", "leave", "ready", "part_manifest"}
 
 # The release build runs with PyInstaller's --windowed flag (no console), so
 # print() output disappears into the void for every real user. Mirror it to a
@@ -165,7 +167,7 @@ class NetworkManager:
 
         # Room State (Host maintains this)
         self.room_state = {
-            "players": [], # list of dicts: {"client_id": "", "nickname": "", "channels": [], "connected": True, "last_seen": 0, "ready": False}
+            "players": [],
             "filename": None,
             "song_id": None,
             "revision": 0,
@@ -314,6 +316,8 @@ class NetworkManager:
         self.room_state = {
             "players": [{"client_id": self.client_id,
                          "nickname": self.nickname, "channels": [],
+                         "available_parts": [], "parts_revision": 0,
+                         "local_conversion": False,
                          "connected": True, "last_seen": time.time(),
                          "ready": False}],
             "filename": None,
@@ -349,6 +353,10 @@ class NetworkManager:
             return False
         for p in self.room_state["players"]:
             if p["client_id"] == target_client_id:
+                available = self.player_available_channels(p)
+                if (available is not None
+                        and not set(channels).issubset(available)):
+                    return False
                 if p["channels"] == channels:
                     return True
                 p["channels"] = channels
@@ -359,6 +367,70 @@ class NetworkManager:
                 self._broadcast_state()
                 return True
         return False
+
+    def send_part_manifest(self, parts, local_conversion=False,
+                           revision=None):
+        """Advertise this participant's converted output parts to the host."""
+        if not self.room_code:
+            return False
+        parts = self._validate_parts(parts)
+        if parts is None or not isinstance(local_conversion, bool):
+            return False
+        current_revision = self.room_state.get("revision", 0)
+        revision = current_revision if revision is None else revision
+        if (self._validate_revision(revision) is None
+                or revision <= 0 or revision != current_revision):
+            return False
+        if self.is_host:
+            return self._store_part_manifest(
+                self.client_id, parts, local_conversion, revision)
+        return self._publish({
+            "type": "part_manifest",
+            "client_id": self.client_id,
+            "parts": parts,
+            "local_conversion": local_conversion,
+            "revision": revision,
+        })
+
+    def _store_part_manifest(self, client_id, parts, local_conversion,
+                             revision):
+        """Host-side validated update for one authenticated participant."""
+        if (not self.is_host
+                or revision != self.room_state.get("revision", 0)):
+            return False
+        for player in self.room_state.get("players", []):
+            if player.get("client_id") != client_id:
+                continue
+            old = (
+                player.get("available_parts", []),
+                player.get("parts_revision", 0),
+                player.get("local_conversion", False),
+            )
+            player["available_parts"] = parts
+            player["parts_revision"] = revision
+            player["local_conversion"] = local_conversion
+            available = {part["channel"] for part in parts}
+            filtered = [channel for channel in player.get("channels", [])
+                        if channel in available]
+            assignment_changed = filtered != player.get("channels", [])
+            player["channels"] = filtered
+            manifest_changed = old != (parts, revision, local_conversion)
+            if assignment_changed or manifest_changed:
+                # Remote participants approve the resulting assignment again.
+                player["ready"] = bool(
+                    client_id == self.client_id and filtered)
+                self._broadcast_state()
+            return True
+        return False
+
+    def player_available_channels(self, player):
+        """Return current advertised channels, or None for a legacy/unknown list."""
+        if player.get("parts_revision") != self.room_state.get("revision", 0):
+            return None
+        parts = self._validate_parts(player.get("available_parts"))
+        if parts is None:
+            return None
+        return {part["channel"] for part in parts}
 
     def kick_player(self, target_client_id):
         """Host removes a player from the room. Mirrors leave/disband:
@@ -392,6 +464,9 @@ class NetworkManager:
         for player in self.room_state["players"]:
             player["ready"] = bool(
                 player["client_id"] == self.client_id and player["channels"])
+            player["available_parts"] = []
+            player["parts_revision"] = 0
+            player["local_conversion"] = False
 
     def share_midi(self, file_path, filename, conversion_profile=None,
                    target_client_id=None):
@@ -478,6 +553,10 @@ class NetworkManager:
                 return f"{name} is disconnected."
             if not player.get("channels"):
                 return f"Assign at least one channel to {name}."
+            available = self.player_available_channels(player)
+            if (available is not None
+                    and not set(player["channels"]).issubset(available)):
+                return f"{name}'s assigned parts no longer exist. Reassign them."
             if not player.get("ready", False):
                 return f"{name} is not Ready."
         return None
@@ -726,6 +805,29 @@ class NetworkManager:
         return sorted(set(channels))
 
     @staticmethod
+    def _validate_parts(parts):
+        if not isinstance(parts, list) or len(parts) > 16:
+            return None
+        cleaned = []
+        seen = set()
+        for part in parts:
+            if not isinstance(part, dict) or set(part) != {"channel", "label"}:
+                return None
+            channel = part.get("channel")
+            label = part.get("label")
+            if (isinstance(channel, bool) or not isinstance(channel, int)
+                    or not 0 <= channel <= 15 or channel in seen
+                    or not isinstance(label, str)):
+                return None
+            label = "".join(char for char in label.strip()
+                            if char.isprintable())[:MAX_PART_LABEL_LENGTH]
+            if not label:
+                label = f"Part {channel + 1}"
+            seen.add(channel)
+            cleaned.append({"channel": channel, "label": label})
+        return sorted(cleaned, key=lambda part: part["channel"])
+
+    @staticmethod
     def _validate_revision(value):
         if (isinstance(value, bool) or not isinstance(value, int)
                 or not 0 <= value <= MAX_ROOM_REVISION):
@@ -761,18 +863,32 @@ class NetworkManager:
             client_id = player.get("client_id")
             nickname = player.get("nickname")
             channels = self._validate_channels(player.get("channels"))
+            available_parts = self._validate_parts(
+                player.get("available_parts", []))
+            parts_revision = self._validate_revision(
+                player.get("parts_revision", 0))
+            local_conversion = player.get("local_conversion", False)
             if (not isinstance(client_id, str) or len(client_id) != 32
                     or client_id in seen or not isinstance(nickname, str)
                     or not nickname.strip()
                     or len(nickname) > MAX_NICKNAME_LENGTH
                     or channels is None
+                    or available_parts is None or parts_revision is None
+                    or not isinstance(local_conversion, bool)
                     or not isinstance(player.get("ready"), bool)):
+                return None
+            if (parts_revision not in (0, revision)
+                    or (parts_revision == 0
+                        and (available_parts or local_conversion))):
                 return None
             seen.add(client_id)
             cleaned.append({
                 "client_id": client_id,
                 "nickname": nickname.strip(),
                 "channels": channels,
+                "available_parts": available_parts,
+                "parts_revision": parts_revision,
+                "local_conversion": local_conversion,
                 "connected": bool(player.get("connected", True)),
                 "last_seen": self._finite_number(
                     player.get("last_seen", 0), 0) or 0,
@@ -917,7 +1033,8 @@ class NetworkManager:
 
             # Bind claimed client IDs to the authenticated sender identity.
             claimed = payload.get("client_id")
-            if (msg_type in {"join", "leave", "heartbeat", "ready"}
+            if (msg_type in {
+                    "join", "leave", "heartbeat", "ready", "part_manifest"}
                     and sender and claimed != sender):
                 return
             if msg_type == "sync_ping" and sender and payload.get("from") != sender:
@@ -1021,6 +1138,9 @@ class NetworkManager:
                             "client_id": payload["client_id"],
                             "nickname": nickname.strip(),
                             "channels": [],
+                            "available_parts": [],
+                            "parts_revision": 0,
+                            "local_conversion": False,
                             "connected": True,
                             "last_seen": time.time(),
                             "ready": False
@@ -1044,16 +1164,31 @@ class NetworkManager:
                         return
                     for p in self.room_state["players"]:
                         if p["client_id"] == payload["client_id"]:
+                            available = self.player_available_channels(p)
                             if requested:
                                 p["ready"] = bool(
                                     revision == self.room_state.get("revision")
                                     and self.room_state.get("song_id")
                                     and p.get("connected", True)
-                                    and p.get("channels"))
+                                    and p.get("channels")
+                                    and (available is None or set(
+                                        p["channels"]).issubset(available)))
                             else:
                                 p["ready"] = False
                             self._broadcast_state()
                             break
+
+                elif msg_type == "part_manifest":
+                    revision = self._validate_revision(
+                        payload.get("revision"))
+                    parts = self._validate_parts(payload.get("parts"))
+                    local_conversion = payload.get("local_conversion")
+                    if (revision is None or parts is None
+                            or not isinstance(local_conversion, bool)):
+                        return
+                    self._store_part_manifest(
+                        payload["client_id"], parts,
+                        local_conversion, revision)
 
             else:
                 # Client processing

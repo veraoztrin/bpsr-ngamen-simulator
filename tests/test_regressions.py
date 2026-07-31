@@ -599,3 +599,86 @@ def test_client_ready_requires_the_current_revision_and_valid_assignment():
     assert manager.client_ready_issue(
         accepted_revision=1, has_playable_events=True,
         available_channels=[0]) is None
+
+
+def test_host_assigns_each_client_from_their_own_conversion_parts():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.is_host = True
+    manager.client_id = "host"
+    manager.room_state = {
+        "players": [
+            {
+                "client_id": "host", "nickname": "Drummer",
+                "channels": [0],
+                "available_parts": [{"channel": 0, "label": "Drum"}],
+                "parts_revision": 1, "local_conversion": False,
+                "connected": True, "ready": True,
+            },
+            {
+                "client_id": "client", "nickname": "Pianist",
+                "channels": [0], "available_parts": [],
+                "parts_revision": 0, "local_conversion": False,
+                "connected": True, "ready": True,
+            },
+        ],
+        "filename": "song.mid", "song_id": "a" * 64, "revision": 1,
+    }
+    broadcasts = []
+    manager._broadcast_state = lambda: broadcasts.append(True)
+    local_parts = [
+        {"channel": channel, "label": f"MIDI Ch. {channel + 1}"}
+        for channel in (1, 2, 9, 14)]
+
+    assert manager._store_part_manifest(
+        "client", local_parts, True, revision=1)
+    client = manager.room_state["players"][1]
+    assert client["channels"] == []
+    assert client["ready"] is False
+    assert client["local_conversion"] is True
+    assert manager.assign_channels("client", [0]) is False
+    assert manager.assign_channels("client", [14]) is True
+    client["ready"] = True
+
+    assert manager.room_start_issue() is None
+    assert broadcasts == [True, True]
+
+
+def test_part_manifest_is_revision_bound_validated_and_state_safe():
+    network_sync, client_manager = _client_manager()
+    parts = [
+        {"channel": 14, "label": "  Lead\x00\n  "},
+        {"channel": 1, "label": "Piano"},
+    ]
+    cleaned = client_manager._validate_parts(parts)
+    assert cleaned == [
+        {"channel": 1, "label": "Piano"},
+        {"channel": 14, "label": "Lead"},
+    ]
+    assert client_manager._validate_parts([
+        {"channel": 1, "label": "One"},
+        {"channel": 1, "label": "Duplicate"},
+    ]) is None
+
+    state = dict(client_manager.room_state)
+    state["players"] = [dict(state["players"][0],
+        available_parts=cleaned, parts_revision=1,
+        local_conversion=True)]
+    validated = client_manager._validate_state(state)
+    assert validated["players"][0]["available_parts"] == cleaned
+    assert validated["players"][0]["local_conversion"] is True
+
+    host = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    host.is_host = True
+    host.client_id = "host"
+    host.room_code = "room"
+    host.room_state = {
+        "players": [{
+            "client_id": "host", "channels": [], "ready": False,
+            "available_parts": [], "parts_revision": 0,
+            "local_conversion": False,
+        }],
+        "song_id": "a" * 64, "revision": 2,
+    }
+    host._broadcast_state = lambda: None
+    assert not host.send_part_manifest(cleaned, revision=1)

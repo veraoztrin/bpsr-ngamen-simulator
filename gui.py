@@ -671,7 +671,9 @@ class App(ctk.CTk):
         self.sync_label.pack(side="left", padx=8)
 
         # Lobby List
-        self.lobby_frame = ctk.CTkScrollableFrame(self.tab_multi, label_text="Lobby Players (Host assigns channels here)")
+        self.lobby_frame = ctk.CTkScrollableFrame(
+            self.tab_multi,
+            label_text="Lobby Players (Host assigns each player's parts here)")
         self.lobby_frame.grid(row=2, column=0, padx=10, pady=10, sticky="nsew")
 
         # Host Controls
@@ -711,7 +713,7 @@ class App(ctk.CTk):
         self.client_conversion_override_check.pack(side="left")
         ctk.CTkLabel(
             override_row,
-            text="default: host arrangement · local roles may differ",
+            text="default: host arrangement · local parts are shared with host",
             text_color="gray").pack(side="left", padx=8)
 
         # Manual sync calibration: cancels the residual start offset that the
@@ -934,10 +936,12 @@ class App(ctk.CTk):
                 or not self._current_conversion_profile):
             return
         song = self.playlist[self.current_song_idx]
-        self.network.share_midi(
+        shared = self.network.share_midi(
             song["path"], self._playlist_filename(song),
             self._current_conversion_profile,
             target_client_id=target_client_id)
+        if shared and target_client_id is None:
+            self._publish_part_manifest()
 
     def _parse_and_load(self, file_path, on_loaded=None,
                         network_revision=None):
@@ -998,6 +1002,7 @@ class App(ctk.CTk):
         if (network_revision is not None and converted
                 and self.raw_events and self.events):
             self._accepted_network_revision = network_revision
+            self._publish_part_manifest()
         self._loading_network_revision = None
         parse_error = parsed.get("error")
         if parse_error:
@@ -1324,12 +1329,14 @@ class App(ctk.CTk):
                  f"{profile_suffix}")
 
         if self.network.room_code and self.network.is_host:
-            self._update_lobby_ui(self.network.room_state)
             if broadcast_profile and self._current_conversion_profile:
-                self.network.share_conversion_profile(
-                    self._current_conversion_profile)
+                if self.network.share_conversion_profile(
+                        self._current_conversion_profile):
+                    self._publish_part_manifest()
+            self._update_lobby_ui(self.network.room_state)
         elif local_change_requires_ready:
             if self.events:
+                self._publish_part_manifest()
                 self._refresh_client_ready_button()
                 self.status_label.configure(
                     text="My conversion updated. Mark Ready again.",
@@ -1366,6 +1373,37 @@ class App(ctk.CTk):
                 f"MIDI Ch. {channel + 1} - likely {guess}"
                 if guess else f"MIDI Ch. {channel + 1}")
         return labels
+
+    def _publish_part_manifest(self):
+        """Tell the host which parts this machine can actually play."""
+        if not self.network.room_code:
+            return False
+        revision = self.network.room_state.get("revision", 0)
+        if revision <= 0:
+            return False
+        if (not self.network.is_host
+                and self._accepted_network_revision != revision):
+            return False
+        labels = self._channel_labels()
+        parts = [{"channel": channel,
+                  "label": labels.get(channel, f"Part {channel + 1}")}
+                 for channel in self.channels]
+        using_local = bool(
+            not self.network.is_host
+            and self.client_conversion_override_var.get())
+        return self.network.send_part_manifest(
+            parts, local_conversion=using_local, revision=revision)
+
+    def _player_part_options(self, player, state):
+        """Part choices for one lobby member, with legacy-host fallback."""
+        revision = state.get("revision", 0)
+        if player.get("parts_revision") == revision:
+            return [
+                (part["channel"], part["label"])
+                for part in player.get("available_parts", [])]
+        labels = self._channel_labels()
+        return [(channel, labels.get(channel, f"Part {channel + 1}"))
+                for channel in self.channels]
 
     def build_solo_channel_ui(self, duet=False, auto=False, parts=2,
                               grouping_mode='roles'):
@@ -1710,10 +1748,11 @@ class App(ctk.CTk):
             return
 
         if self.reconvert(broadcast_profile=False) and self.events:
+            self._publish_part_manifest()
             self._refresh_client_ready_button()
             self.status_label.configure(
-                text=("Using my conversion. Host channel assignments may "
-                      "refer to different roles."
+                text=("Using my conversion. The host can now assign from "
+                      "my local part list."
                       if use_local else
                       "Using the host conversion settings."),
                 text_color="orange" if use_local else "green")
@@ -1741,11 +1780,6 @@ class App(ctk.CTk):
         issue = self.network.room_start_issue()
         if issue:
             return issue
-        valid_channels = set(self.channels)
-        for player in self.network.room_state.get("players", []):
-            if not set(player.get("channels", [])).issubset(valid_channels):
-                return (f"{player.get('nickname', 'A player')} has channels "
-                        "that do not exist in the current conversion.")
         return None
             
     def sync_stop(self):
@@ -1772,6 +1806,21 @@ class App(ctk.CTk):
                 and 0 <= self.current_song_idx < len(self.playlist)):
             for client_id in newcomers:
                 self._share_current_midi(target_client_id=client_id)
+        if (not self.network.is_host
+                and self._accepted_network_revision == state.get("revision")
+                and self.events):
+            me = next((player for player in state.get("players", [])
+                       if player.get("client_id") == self.network.client_id),
+                      None)
+            advertised = (
+                sorted(part["channel"]
+                       for part in me.get("available_parts", []))
+                if me and me.get("parts_revision") == state.get("revision")
+                else None)
+            using_local = self.client_conversion_override_var.get()
+            if (advertised != sorted(self.channels)
+                    or bool(me and me.get("local_conversion")) != using_local):
+                self._publish_part_manifest()
         self._update_lobby_ui(state)
 
     def on_network_play(self, global_start_time, my_channels):
@@ -1876,6 +1925,7 @@ class App(ctk.CTk):
                 else self.reconvert(broadcast_profile=False))
             if converted and self.events:
                 self._accepted_network_revision = revision
+                self._publish_part_manifest()
                 self._refresh_client_ready_button()
                 self.status_label.configure(
                     text=("Host settings updated; my conversion override is "
@@ -1893,7 +1943,6 @@ class App(ctk.CTk):
             ctk.CTkLabel(self.lobby_frame, text=f"🎵 Shared Song: {fn}", font=ctk.CTkFont(weight="bold")).pack(pady=5)
 
         self.host_checkbox_vars = {}
-        channel_labels = self._channel_labels()
 
         if not self.network.is_host:
             me = next((p for p in state.get("players", [])
@@ -1909,6 +1958,8 @@ class App(ctk.CTk):
                     self._refresh_client_ready_button()
 
         for p in state["players"]:
+            part_options = self._player_part_options(p, state)
+            player_labels = dict(part_options)
             frame = ctk.CTkFrame(self.lobby_frame)
             frame.pack(fill="x", pady=5, padx=5)
             
@@ -1940,11 +1991,17 @@ class App(ctk.CTk):
                 ch_frame = ctk.CTkScrollableFrame(frame, height=40, fg_color="transparent", orientation="horizontal")
                 ch_frame.pack(side="left", fill="x", expand=True, padx=5)
                 
-                if not self.channels:
-                    ctk.CTkLabel(ch_frame, text="Load a MIDI file first to assign channels.", text_color="gray").pack(side="left")
+                if not part_options:
+                    message = (
+                        "This conversion has no playable parts."
+                        if p.get("parts_revision") == state.get("revision")
+                        else "Waiting for this player's converted part listâ€¦")
+                    ctk.CTkLabel(
+                        ch_frame, text=message,
+                        text_color="gray").pack(side="left")
                 else:
                     self.host_checkbox_vars[p['client_id']] = {}
-                    for ch in self.channels:
+                    for ch, part_label in part_options:
                         var = ctk.BooleanVar(value=(ch in p["channels"]))
                         self.host_checkbox_vars[p['client_id']][ch] = var
                         
@@ -1953,13 +2010,15 @@ class App(ctk.CTk):
                             self.network.assign_channels(cid, chs)
                             
                         cb = ctk.CTkCheckBox(
-                            ch_frame, text=channel_labels.get(
-                                ch, f"MIDI Ch. {ch + 1}"),
+                            ch_frame,
+                            text=(f"{part_label} (local conversion)"
+                                  if p.get("local_conversion")
+                                  else part_label),
                             variable=var, command=on_toggle)
                         cb.pack(side="left", padx=10, pady=5)
             else:
                 assigned_text = (
-                    ", ".join(channel_labels.get(
+                    ", ".join(player_labels.get(
                         channel, f"MIDI Ch. {channel + 1}")
                         for channel in p['channels'])
                     if p['channels'] else "None")
