@@ -1,26 +1,36 @@
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
 import json
+import math
 import os
 import secrets
 import tempfile
-import math
 import threading
-from midi_parser import parse_midi_full, get_channels_info, guess_channel_instrument
-from arranger import ConversionSettings, convert, convert_drum, ABS_LOW, ABS_HIGH
+from copy import deepcopy
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+
+from arranger import ABS_HIGH, ABS_LOW, ConversionSettings, convert, convert_drum
+from config import INSTRUMENTS, midi_to_note_name, note_name_to_midi
 from conversion_profile import (
-    make_conversion_profile, load_conversion_profile,
+    load_conversion_profile,
+    make_conversion_profile,
     should_use_host_conversion,
 )
-from config import midi_to_note_name, note_name_to_midi, INSTRUMENTS
-from player import MidiPlayer
-from network_sync import (
-    NetworkManager, MAX_MIDI_BYTES, MIN_ROOM_CREDENTIAL_LENGTH,
-    ROOM_CREDENTIAL_PREFIX, MIN_SYNC_SAMPLES, MAX_READY_SYNC_RTT,
-)
 from live_midi import LiveMidiListener
+from midi_parser import get_channels_info, guess_channel_instrument, parse_midi_full
+from network_sync import (
+    MAX_MIDI_BYTES,
+    MAX_READY_SYNC_RTT,
+    MIN_ROOM_CREDENTIAL_LENGTH,
+    MIN_SYNC_SAMPLES,
+    ROOM_CREDENTIAL_PREFIX,
+    NetworkManager,
+)
+from player import MidiPlayer
+from track_preparation import prepare_track, prepared_track_matches
+
 try:
-    from hotkeys import GlobalHotkeys, VK_F9, VK_F10, VK_F11
+    from hotkeys import VK_F9, VK_F10, VK_F11, GlobalHotkeys
 except Exception:
     # Non-Windows platform: run without global hotkeys.
     GlobalHotkeys = None
@@ -88,6 +98,11 @@ class App(ctk.CTk):
         self._current_conversion_profile = None
         self._accepted_network_revision = None
         self._loading_network_revision = None
+        self._applying_track_profile = False
+        self._preparation_generation = 0
+        self._multiplayer_autoplay_pending_revision = None
+        self._multiplayer_auto_ready_revision = None
+        self._network_track_profiles = {}
 
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(3, weight=1)
@@ -285,9 +300,23 @@ class App(ctk.CTk):
         # all keys at the end of the current track instead of advancing to the
         # next loaded MIDI.
         self.autoplay_var = ctk.BooleanVar(value=False)
-        self.autoplay_cb = ctk.CTkCheckBox(self.control_frame, text="Autoplay next track",
-                                           variable=self.autoplay_var)
-        self.autoplay_cb.grid(row=1, column=0, columnspan=3, padx=10, pady=(0, 10), sticky="w")
+        self.autoplay_cb = ctk.CTkCheckBox(
+            self.control_frame,
+            text="Autoplay next track (host-led in multiplayer)",
+            variable=self.autoplay_var, command=self._on_autoplay_toggle)
+        self.autoplay_cb.grid(
+            row=1, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="w")
+
+        # Optional session profiles: each loaded playlist item can retain its
+        # own arrangement instead of inheriting whichever settings were used
+        # by the previous track.
+        self.per_track_settings_var = ctk.BooleanVar(value=False)
+        self.per_track_settings_cb = ctk.CTkCheckBox(
+            self.control_frame, text="Remember settings for each MIDI",
+            variable=self.per_track_settings_var,
+            command=self._on_per_track_settings_toggle)
+        self.per_track_settings_cb.grid(
+            row=1, column=2, columnspan=2, padx=10, pady=(0, 10), sticky="w")
 
         # --- Conversion Settings Panel ---
         self.conv_frame = ctk.CTkFrame(self.solo_scroll)
@@ -581,10 +610,14 @@ class App(ctk.CTk):
                     text="preserve, enhance, or generate a meter-aware groove")
             else:
                 lo, hi = midi_to_note_name(rng["low"]), midi_to_note_name(rng["high"])
-                self.range_low_entry.delete(0, "end"); self.range_low_entry.insert(0, lo)
-                self.range_high_entry.delete(0, "end"); self.range_high_entry.insert(0, hi)
+                if not self._applying_track_profile:
+                    self.range_low_entry.delete(0, "end")
+                    self.range_low_entry.insert(0, lo)
+                    self.range_high_entry.delete(0, "end")
+                    self.range_high_entry.insert(0, hi)
                 self.instrument_hint.configure(text=f"fits notes into {lo}–{hi}")
-        self.reconvert()
+        if not self._applying_track_profile:
+            self.reconvert()
 
     def on_midi_device_select(self, choice):
         if choice == "None":
@@ -631,6 +664,7 @@ class App(ctk.CTk):
         self.drum_style_var.set("Auto")
         self.drum_hat_var.set("Eighth")
         self.autoplay_var.set(False)
+        self.per_track_settings_var.set(False)
         self.focus_guard_var.set(True)
         self.global_hotkeys_var.set(True)
         self.toggle_global_hotkeys()
@@ -813,9 +847,12 @@ class App(ctk.CTk):
         is_playing_now = self.player.is_playing
         if (self.was_playing and not is_playing_now
                 and not self.player.stop_requested
-                and not self.player.is_paused):
-            if self.autoplay_var.get():
-                self.next_song(autoplay=True)
+                and not self.player.is_paused
+                and self.autoplay_var.get()
+                and (not self.network.room_code or self.network.is_host)):
+            # Multiplayer transitions are host-owned. Clients wait for the
+            # authenticated next file and synchronized Play command.
+            self.next_song(autoplay=True)
 
         self.was_playing = is_playing_now
             
@@ -846,6 +883,7 @@ class App(ctk.CTk):
             # unselected in the dropdown while a different song stays active
             # (feedback: loading a MIDI should make it the selected one).
             if last_new_idx is not None:
+                self._remember_current_track_profile()
                 self.current_song_idx = last_new_idx
                 self._load_current_song()
 
@@ -905,18 +943,21 @@ class App(ctk.CTk):
     def on_song_select(self, choice):
         for idx, s in enumerate(self.playlist):
             if s["name"] == choice:
+                self._remember_current_track_profile()
                 self.current_song_idx = idx
                 self._load_current_song()
                 break
 
     def prev_song(self):
         if not self.playlist: return
+        self._remember_current_track_profile()
         self.current_song_idx = (self.current_song_idx - 1) % len(self.playlist)
         self._load_current_song(autoplay=self.player.is_playing)
 
     def next_song(self, autoplay=False):
         if not self.playlist: return
         was_playing = self.player.is_playing or autoplay
+        self._remember_current_track_profile()
         self.current_song_idx = (self.current_song_idx + 1) % len(self.playlist)
         self._load_current_song(autoplay=was_playing)
 
@@ -925,10 +966,100 @@ class App(ctk.CTk):
             song = self.playlist[self.current_song_idx]
             self.song_var.set(song["name"])
             self.player.stop()
+            profile = self._profile_for_song(song)
+            if self.per_track_settings_var.get() and profile:
+                try:
+                    self._apply_conversion_profile_to_ui(profile)
+                except ValueError as exc:
+                    song.pop("conversion_profile", None)
+                    song.pop("prepared", None)
+                    self.settings_error_label.configure(
+                        text=f"Saved track settings were invalid: {exc}",
+                        text_color="#ff6b6b")
+                    profile = self._current_conversion_profile
+            on_loaded = self._on_autoplay_track_loaded if autoplay else None
+            if (profile and prepared_track_matches(
+                    song.get("prepared"), song["path"], profile)):
+                self._activate_prepared_song(
+                    song, song["prepared"], on_loaded=on_loaded)
+                return
             self._parse_and_load(
-                song["path"], on_loaded=self.play_solo if autoplay else None)
+                song["path"], on_loaded=on_loaded)
             if self.network.room_code:
                 self._update_lobby_ui(self.network.room_state)
+
+    def _activate_prepared_song(self, song, prepared, on_loaded=None):
+        """Install a background-prepared item without parsing/converting again."""
+        self._parse_generation += 1
+        profile = prepared["profile"]
+        settings, instrument_name = load_conversion_profile(profile)
+        if self.per_track_settings_var.get():
+            self._apply_conversion_profile_to_ui(profile)
+        self._current_conversion_profile = deepcopy(profile)
+        parsed = prepared["parsed"]
+        self.raw_events = parsed.get("events", [])
+        self.orig_bpm = parsed.get("bpm", 120.0)
+        self.beats_per_measure = parsed.get("beats_per_measure", 4)
+        self.tempo_map = parsed.get(
+            "tempo_map", [{"beat": 0.0, "bpm": self.orig_bpm}])
+        self.time_signature_map = parsed.get("time_signature_map", [{
+            "beat": 0.0, "numerator": self.beats_per_measure,
+            "denominator": 4,
+        }])
+        self.channel_programs = parsed.get("channel_programs", {})
+        self.events = prepared["events"]
+        self.channels = list(prepared["channels"])
+
+        instrument = INSTRUMENTS[instrument_name]
+        if self.player.simulator:
+            self.player.simulator.shift_delay_ms = min(max(
+                self._get_float(self.shift_delay_entry, 30.0), 0.0), 500.0)
+            self.player.simulator.shift_hold_ms = min(max(
+                self._get_float(self.shift_hold_entry, 10.0), 0.0), 500.0)
+            self.player.simulator.retrigger_gap_ms = (
+                settings.retrigger_gap * 1000.0)
+            self.player.simulator.key_offset = instrument["offset"]
+            self.player.simulator.focus_guard_enabled = self.focus_guard_var.get()
+            self.player.simulator.target_window_text = (
+                self.target_window_entry.get().strip() or "Blue Protocol")
+
+        is_drum = bool(instrument.get("is_drum", False))
+        self.build_solo_channel_ui(
+            duet=(settings.duet_mode and not is_drum),
+            auto=(settings.auto_split and not is_drum),
+            parts=settings.auto_split_parts,
+            grouping_mode=settings.grouping_mode)
+        self._apply_song_channel_selection(song)
+        selected_channels = [
+            channel for channel, variable in self.channel_vars
+            if variable.get()]
+        self.player.load_events(self.events, selected_channels)
+        raw_notes = sum(
+            event.get("type") == "note_on" for event in self.raw_events)
+        output_notes = sum(
+            event.get("type") == "note_on" for event in self.events)
+        duration = self.events[-1]["time"] if self.events else 0.0
+        self.song_info_label.configure(
+            text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4 · "
+                 f"{output_notes}/{raw_notes} notes · {duration:.1f}s · prepared")
+        parse_error = parsed.get("error")
+        if parse_error:
+            self.settings_error_label.configure(
+                text=parse_error, text_color="#ff6b6b")
+        elif not self.raw_events:
+            self.settings_error_label.configure(
+                text="The file has no playable MIDI notes.",
+                text_color="#ff6b6b")
+        else:
+            self.settings_error_label.configure(
+                text="", text_color="#ff6b6b")
+        self._remember_current_track_profile(profile)
+        if self.network.room_code and self.network.is_host and self.events:
+            self._share_current_midi()
+            self._update_lobby_ui(self.network.room_state)
+        if self.events and on_loaded:
+            on_loaded()
+        self._schedule_next_preparation()
 
     def _share_current_midi(self, target_client_id=None):
         if (not self.network.is_host
@@ -1015,7 +1146,7 @@ class App(ctk.CTk):
         if (converted and self.raw_events
                 and self.network.room_code and self.network.is_host):
             self._share_current_midi()
-        if converted and on_loaded:
+        if converted and self.events and on_loaded:
             on_loaded()
         if self.network.room_code and not self.network.is_host:
             self._refresh_client_ready_button()
@@ -1026,6 +1157,185 @@ class App(ctk.CTk):
             return value if math.isfinite(value) else default
         except (ValueError, AttributeError):
             return default
+
+    @staticmethod
+    def _set_entry(entry, value):
+        entry.delete(0, "end")
+        entry.insert(0, str(value))
+
+    @staticmethod
+    def _number_text(value):
+        return f"{float(value):g}"
+
+    def _apply_conversion_profile_to_ui(self, profile):
+        """Show a playlist item's validated conversion profile in the panel."""
+        settings, instrument_name = load_conversion_profile(profile)
+        reverse_grouping = {value: label for label, value in GROUPING_LABELS.items()}
+        self._applying_track_profile = True
+        try:
+            self.instrument_var.set(instrument_name)
+            self.on_instrument_change(instrument_name)
+            for key, variable in self.conv_vars.items():
+                variable.set(bool(getattr(settings, key)))
+            self._set_entry(
+                self.bpm_entry,
+                "" if settings.bpm_override is None
+                else self._number_text(settings.bpm_override))
+            self._set_entry(self.speed_entry, self._number_text(settings.speed))
+            self.max_chord_seg.set(str(settings.max_chord_notes))
+            self._set_entry(
+                self.range_low_entry, midi_to_note_name(settings.range_low))
+            self._set_entry(
+                self.range_high_entry, midi_to_note_name(settings.range_high))
+            self._set_entry(
+                self.duet_split_entry,
+                midi_to_note_name(settings.duet_split_note))
+            self.autosplit_var.set(bool(settings.auto_split))
+            self.autosplit_seg.set(str(settings.auto_split_parts))
+            self.grouping_mode_var.set(
+                reverse_grouping.get(settings.grouping_mode, "Musical roles"))
+            self._set_entry(
+                self.retrigger_gap_entry,
+                self._number_text(settings.retrigger_gap * 1000.0))
+            self.drum_source_var.set(settings.drum_source_mode.title())
+            self.drum_style_var.set(settings.drum_style.title())
+            self.drum_hat_var.set(settings.drum_hat_density.title())
+            self._set_entry(
+                self.drum_intensity_entry,
+                self._number_text(settings.drum_intensity))
+            self._set_entry(
+                self.drum_fill_entry, str(settings.drum_fill_frequency))
+            self._set_entry(
+                self.drum_bass_follow_entry,
+                self._number_text(settings.drum_bass_follow * 100.0))
+            self._set_entry(
+                self.drum_swing_entry,
+                self._number_text(settings.drum_swing * 100.0))
+            self._set_entry(
+                self.drum_quantize_entry,
+                self._number_text(settings.drum_quantize * 100.0))
+            self._set_entry(
+                self.drum_spacing_entry,
+                self._number_text(settings.drum_min_spacing * 1000.0))
+        finally:
+            self._applying_track_profile = False
+
+    def _current_song(self):
+        if 0 <= self.current_song_idx < len(self.playlist):
+            return self.playlist[self.current_song_idx]
+        return None
+
+    def _remember_current_track_profile(self, profile=None):
+        """Keep the current conversion and selected parts with this MIDI."""
+        if not self.per_track_settings_var.get():
+            return
+        song = self._current_song()
+        profile = profile or self._current_conversion_profile
+        if song is None or not profile:
+            return
+        previous = song.get("conversion_profile")
+        song["conversion_profile"] = deepcopy(profile)
+        song["active_channels"] = [
+            channel for channel, variable in self.channel_vars
+            if variable.get()]
+        if previous != profile:
+            song.pop("prepared", None)
+
+        # A client playlist contains only the host's current temporary file.
+        # Keep local-override profiles by authenticated MIDI hash so returning
+        # to a song during the same room session restores its own arrangement.
+        if (self.network.room_code and not self.network.is_host
+                and self.client_conversion_override_var.get()):
+            song_id = self.network.room_state.get("song_id")
+            if song_id:
+                self._network_track_profiles[song_id] = deepcopy(profile)
+                while len(self._network_track_profiles) > 64:
+                    self._network_track_profiles.pop(
+                        next(iter(self._network_track_profiles)))
+
+    def _profile_for_song(self, song):
+        if self.per_track_settings_var.get():
+            profile = song.get("conversion_profile")
+            if not profile and self._current_conversion_profile:
+                profile = deepcopy(self._current_conversion_profile)
+                song["conversion_profile"] = profile
+            return profile
+        return self._current_conversion_profile
+
+    def _apply_song_channel_selection(self, song):
+        if "active_channels" not in song:
+            return
+        selected = set(song.get("active_channels", []))
+        for channel, variable in self.channel_vars:
+            variable.set(channel in selected)
+        self.update_solo_channels(remember=False)
+
+    def _on_autoplay_toggle(self):
+        if not self.autoplay_var.get():
+            self._multiplayer_autoplay_pending_revision = None
+            self._multiplayer_auto_ready_revision = None
+            self._preparation_generation += 1
+        else:
+            self._schedule_next_preparation()
+            self._maybe_auto_ready_multiplayer()
+        self.save_prefs()
+
+    def _on_per_track_settings_toggle(self):
+        if self.per_track_settings_var.get():
+            self._remember_current_track_profile()
+            self._schedule_next_preparation()
+        else:
+            self._preparation_generation += 1
+        self.save_prefs()
+
+    def _schedule_next_preparation(self):
+        """Prepare the next playlist item off the UI thread for autoplay."""
+        if (not self.autoplay_var.get() or len(self.playlist) < 2
+                or not (0 <= self.current_song_idx < len(self.playlist))
+                or (self.network.room_code and not self.network.is_host)):
+            return
+        song = self.playlist[(self.current_song_idx + 1) % len(self.playlist)]
+        profile = self._profile_for_song(song)
+        if not profile:
+            return
+        if prepared_track_matches(song.get("prepared"), song["path"], profile):
+            return
+
+        self._preparation_generation += 1
+        generation = self._preparation_generation
+        profile = deepcopy(profile)
+
+        def worker():
+            prepared = None
+            error = None
+            try:
+                prepared = prepare_track(song["path"], profile)
+            except Exception as exc:  # noqa: BLE001 - preparation is non-fatal
+                error = str(exc)
+            if not self._closing:
+                self.after(
+                    0, self._finish_track_preparation,
+                    generation, song, prepared, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_track_preparation(self, generation, song, prepared, error):
+        if (generation != self._preparation_generation
+                or not any(candidate is song for candidate in self.playlist)):
+            return
+        if prepared is not None:
+            song["prepared"] = prepared
+            current = self._current_song()
+            # Keep memory bounded even for a very long set list.  Only the
+            # active item and the one prepared ahead are useful for a smooth
+            # transition; older parsed/conversion copies can be reclaimed.
+            for candidate in self.playlist:
+                if candidate is not song and candidate is not current:
+                    candidate.pop("prepared", None)
+        elif error:
+            # Normal loading will still report the parse/conversion error if
+            # this item is selected; background preparation stays non-fatal.
+            song.pop("prepared", None)
 
     def save_prefs(self):
         """Persist the conversion panel so it survives closing the app
@@ -1056,6 +1366,7 @@ class App(ctk.CTk):
                 "grouping_mode": self.grouping_mode_var.get(),
                 "instrument": self.instrument_var.get(),
                 "autoplay": self.autoplay_var.get(),
+                "per_track_settings": self.per_track_settings_var.get(),
                 "focus_guard": self.focus_guard_var.get(),
                 "target_window": self.target_window_entry.get(),
                 "global_hotkeys": self.global_hotkeys_var.get(),
@@ -1126,6 +1437,8 @@ class App(ctk.CTk):
             self.grouping_mode_var.set(grouping)
         self.autosplit_var.set(bool(prefs.get("autosplit", False)))
         self.autoplay_var.set(bool(prefs.get("autoplay", False)))
+        self.per_track_settings_var.set(bool(
+            prefs.get("per_track_settings", False)))
         self.focus_guard_var.set(bool(prefs.get("focus_guard", True)))
         self.global_hotkeys_var.set(bool(prefs.get("global_hotkeys", True)))
         _set_entry(
@@ -1309,6 +1622,9 @@ class App(ctk.CTk):
                                    auto=(settings.auto_split and not is_drum),
                                    parts=settings.auto_split_parts,
                                    grouping_mode=settings.grouping_mode)
+        song = self._current_song()
+        if self.per_track_settings_var.get() and song is not None:
+            self._apply_song_channel_selection(song)
         selected_channels = [
             channel for channel, variable in self.channel_vars
             if variable.get()]
@@ -1327,6 +1643,11 @@ class App(ctk.CTk):
             text=f"{self.orig_bpm:.0f} BPM · {self.beats_per_measure}/4 · "
                  f"{output_notes}/{raw_notes} notes · {duration:.1f}s"
                  f"{profile_suffix}")
+
+        if not using_host_profile:
+            self._remember_current_track_profile(
+                self._current_conversion_profile)
+        self._schedule_next_preparation()
 
         if self.network.room_code and self.network.is_host:
             if broadcast_profile and self._current_conversion_profile:
@@ -1474,11 +1795,13 @@ class App(ctk.CTk):
             cb.pack(side="left", padx=6)
             self.channel_vars.append((ch, var))
 
-    def update_solo_channels(self):
+    def update_solo_channels(self, remember=True):
         active = [ch for ch, var in self.channel_vars if var.get()]
         self.player.set_active_channels(active)
+        if remember:
+            self._remember_current_track_profile()
 
-    def play_solo(self):
+    def play_solo(self, autoplay=False):
         self.update_solo_channels()
         if not self.events:
             self.settings_error_label.configure(
@@ -1491,16 +1814,21 @@ class App(ctk.CTk):
                 text_color="#ff6b6b")
             return
 
-        text = self.solo_delay_entry.get().strip().replace(",", ".")
-        try:
-            delay = float(text)
-        except ValueError:
-            delay = -1
-        if not math.isfinite(delay) or not 0 <= delay <= 10:
-            self.settings_error_label.configure(
-                text="Start delay must be between 0 and 10 seconds.",
-                text_color="#ff6b6b")
-            return
+        if autoplay:
+            # The user already armed the first track; don't insert the manual
+            # start countdown between prepared playlist items.
+            delay = 0.0
+        else:
+            text = self.solo_delay_entry.get().strip().replace(",", ".")
+            try:
+                delay = float(text)
+            except ValueError:
+                delay = -1
+            if not math.isfinite(delay) or not 0 <= delay <= 10:
+                self.settings_error_label.configure(
+                    text="Start delay must be between 0 and 10 seconds.",
+                    text_color="#ff6b6b")
+                return
 
         simulator = self.player.simulator
         target_focused = bool(simulator and simulator.is_target_focused())
@@ -1520,6 +1848,26 @@ class App(ctk.CTk):
                     text="", text_color="#ff6b6b")
                 self._play_wait_message_active = False
 
+    def _on_autoplay_track_loaded(self):
+        if self.network.room_code:
+            if not self.network.is_host:
+                return
+            if not self.autoplay_var.get():
+                self.status_label.configure(
+                    text=("Next track shared. Review assignments and use "
+                          "SYNC PLAY when everyone is Ready."),
+                    text_color="orange")
+                return
+            revision = self.network.room_state.get("revision", 0)
+            self._multiplayer_autoplay_pending_revision = revision
+            self.status_label.configure(
+                text=("Next track prepared. Waiting for everyone to convert "
+                      "and become Ready…"),
+                text_color="orange")
+            self._maybe_start_multiplayer_autoplay()
+            return
+        self.play_solo(autoplay=True)
+
     # --- Networking ---
 
     def copy_room_credential(self):
@@ -1533,6 +1881,9 @@ class App(ctk.CTk):
 
     def host_room(self):
         nick = self.nick_entry.get() or "Host"
+        self._multiplayer_autoplay_pending_revision = None
+        self._multiplayer_auto_ready_revision = None
+        self._network_track_profiles.clear()
         # This credential doubles as the room's message-signing secret. Keep it
         # high entropy; only a hash appears in the public MQTT topic.
         room = self.room_entry.get().strip() or secrets.token_urlsafe(24)
@@ -1599,6 +1950,9 @@ class App(ctk.CTk):
         self._accepted_network_revision = None
         self._loading_network_revision = None
         self._known_room_players = set()
+        self._multiplayer_autoplay_pending_revision = None
+        self._multiplayer_auto_ready_revision = None
+        self._network_track_profiles.clear()
 
     def leave_room(self):
         self.network.leave_room()
@@ -1638,6 +1992,9 @@ class App(ctk.CTk):
         self._network_conversion_profile = None
         self._accepted_network_revision = None
         self._loading_network_revision = None
+        self._multiplayer_autoplay_pending_revision = None
+        self._multiplayer_auto_ready_revision = None
+        self._network_track_profiles.clear()
         self.status_label.configure(text=status, text_color="gray")
         self.sync_label.configure(text="")
         self.host_btn.configure(state="normal")
@@ -1719,6 +2076,7 @@ class App(ctk.CTk):
         if self.my_ready_status:
             self.network.send_ready_status(False)
         self.my_ready_status = False
+        self._multiplayer_auto_ready_revision = None
         self.ready_btn.configure(
             state="disabled", text=text,
             fg_color=["#3a7ebf", "#1f538d"],
@@ -1764,6 +2122,7 @@ class App(ctk.CTk):
     def sync_play(self):
         if not self.network.is_host:
             return
+        self._multiplayer_autoplay_pending_revision = None
         issue = self._host_start_issue()
         if issue:
             self.status_label.configure(text=issue, text_color="red")
@@ -1783,6 +2142,7 @@ class App(ctk.CTk):
         return None
             
     def sync_stop(self):
+        self._multiplayer_autoplay_pending_revision = None
         if self.network.is_host:
             if not self.network.send_stop():
                 self.status_label.configure(
@@ -1822,6 +2182,68 @@ class App(ctk.CTk):
                     or bool(me and me.get("local_conversion")) != using_local):
                 self._publish_part_manifest()
         self._update_lobby_ui(state)
+        self._maybe_auto_ready_multiplayer(state)
+        self._maybe_start_multiplayer_autoplay()
+
+    def _maybe_auto_ready_multiplayer(self, state=None):
+        """Opt-in client readiness for an authenticated autoplay handoff."""
+        if (not self.autoplay_var.get() or not self.network.room_code
+                or self.network.is_host or not self.events):
+            return False
+        state = state or self.network.room_state
+        revision = state.get("revision", 0)
+        if self._accepted_network_revision != revision:
+            return False
+        me = next((
+            player for player in state.get("players", [])
+            if player.get("client_id") == self.network.client_id), None)
+        if (not me or me.get("ready")
+                or me.get("parts_revision") != revision):
+            return False
+        advertised = {
+            part.get("channel") for part in me.get("available_parts", [])
+            if isinstance(part, dict)
+        }
+        assigned = set(me.get("channels", []))
+        if not assigned or not assigned.issubset(advertised):
+            return False
+        if self._client_ready_issue() is not None:
+            return False
+        if self._multiplayer_auto_ready_revision == revision:
+            return False
+        if not self.network.send_ready_status(True):
+            return False
+        self._multiplayer_auto_ready_revision = revision
+        self.my_ready_status = True
+        self.ready_btn.configure(
+            state="normal", text="✅ Ready!", fg_color="green",
+            hover_color="darkgreen")
+        self.status_label.configure(
+            text="Autoplay prepared this track and marked you Ready.",
+            text_color="green")
+        return True
+
+    def _maybe_start_multiplayer_autoplay(self):
+        """Start the prepared revision once the whole room is safely ready."""
+        revision = self._multiplayer_autoplay_pending_revision
+        if (revision is None or not self.autoplay_var.get()
+                or not self.network.is_host
+                or revision != self.network.room_state.get("revision")):
+            return False
+        if self._host_start_issue() is not None:
+            return False
+        self._multiplayer_autoplay_pending_revision = None
+        self.player.stop()
+        if not self.network.send_play(delay_seconds=1.5):
+            self._multiplayer_autoplay_pending_revision = revision
+            self.status_label.configure(
+                text="The autoplay synchronized start could not be delivered.",
+                text_color="red")
+            return False
+        self.status_label.configure(
+            text="Everyone is ready — starting the next track together.",
+            text_color="green")
+        return True
 
     def on_network_play(self, global_start_time, my_channels):
         self.after(0, self._trigger_play, global_start_time, my_channels)
@@ -1882,6 +2304,7 @@ class App(ctk.CTk):
                 self.status_label.configure(text="Connection lost - reconnecting…", text_color="orange")
                 if not self.network.is_host:
                     self.my_ready_status = False
+                    self._multiplayer_auto_ready_revision = None
                     self.ready_btn.configure(
                         state="disabled", text="Syncing clock…",
                         fg_color=["#3a7ebf", "#1f538d"],
@@ -2105,15 +2528,22 @@ class App(ctk.CTk):
         self._accepted_network_revision = None
         self._loading_network_revision = revision
         self._mark_client_unready("Waiting for current MIDI…")
-        if not messagebox.askyesno(
+        auto_accept = bool(
+            self.autoplay_var.get() and self.network.room_code
+            and not self.network.is_host)
+        if (not auto_accept and not messagebox.askyesno(
                 "Accept shared MIDI?",
                 f"The authenticated host shared “{filename}” "
-                f"({len(data) / 1024:.1f} KiB).\n\nLoad it now?"):
+                f"({len(data) / 1024:.1f} KiB).\n\nLoad it now?")):
             self.status_label.configure(
                 text="Shared MIDI declined.", text_color="gray")
             self._loading_network_revision = None
             self._refresh_client_ready_button()
             return
+        if auto_accept:
+            self.status_label.configure(
+                text=f"Autoplay accepted authenticated host track “{filename}”.",
+                text_color="orange")
         self._network_conversion_profile = conversion_profile
         temp_file = tempfile.NamedTemporaryFile(
             mode="wb", prefix="bpsr_received_", suffix=ext, delete=False)
@@ -2121,6 +2551,35 @@ class App(ctk.CTk):
         with temp_file as f:
             f.write(data)
         self._received_temp_files.add(file_path)
+
+        # Multiplayer autoplay can run for a long set.  A client only needs the
+        # current received file, so remove superseded temporary copies instead
+        # of accumulating the whole performance on disk.
+        for old_path in list(self._received_temp_files):
+            if old_path == file_path:
+                continue
+            try:
+                os.remove(old_path)
+            except FileNotFoundError:
+                self._received_temp_files.discard(old_path)
+            except OSError:
+                continue
+            else:
+                self._received_temp_files.discard(old_path)
+
+        song_id = self.network.room_state.get("song_id")
+        saved_local_profile = (
+            self._network_track_profiles.get(song_id)
+            if (song_id and self.per_track_settings_var.get()
+                and self.client_conversion_override_var.get())
+            else None)
+        if saved_local_profile:
+            try:
+                self._apply_conversion_profile_to_ui(saved_local_profile)
+                self._current_conversion_profile = deepcopy(saved_local_profile)
+            except ValueError:
+                self._network_track_profiles.pop(song_id, None)
+                saved_local_profile = None
         
         # In client mode, we just override current song view (or add to playlist)
         # We will clear playlist and set this as the only song for the client
@@ -2128,6 +2587,9 @@ class App(ctk.CTk):
             "name": f"{filename} (Received)",
             "filename": filename,
             "path": file_path,
+            "temporary": True,
+            **({"conversion_profile": deepcopy(saved_local_profile)}
+               if saved_local_profile else {}),
         }]
         self.current_song_idx = 0
         self._update_playlist_ui()

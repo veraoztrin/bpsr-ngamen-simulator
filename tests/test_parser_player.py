@@ -3,8 +3,9 @@
 # Run from the repo root:  python -m tests.test_parser_player
 # Uses a stub 'mido' module so no dependencies are needed.
 
-import sys
+import importlib.util
 import os
+import sys
 import time
 import types
 
@@ -41,9 +42,25 @@ class StubMidiFile:
 
 stub_mido = types.ModuleType("mido")
 stub_mido.MidiFile = StubMidiFile
-sys.modules['mido'] = stub_mido
 
-import midi_parser  # noqa: E402  (must come after the stub)
+# Load an isolated copy instead of replacing the process-wide ``mido`` module.
+# That keeps this deliberately dependency-free parser test from contaminating
+# other tests which prepare real MIDI files during the same pytest session.
+_parser_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "midi_parser.py")
+_parser_spec = importlib.util.spec_from_file_location(
+    "midi_parser_stubbed_test", _parser_path)
+midi_parser = importlib.util.module_from_spec(_parser_spec)
+_previous_mido = sys.modules.get("mido")
+sys.modules["mido"] = stub_mido
+try:
+    _parser_spec.loader.exec_module(midi_parser)
+finally:
+    if _previous_mido is None:
+        sys.modules.pop("mido", None)
+    else:
+        sys.modules["mido"] = _previous_mido
 
 
 def test_parser():
@@ -119,8 +136,8 @@ class MockSimulator:
 
 
 def test_playback():
-    from player import MidiPlayer
     from arranger import ConversionSettings, convert
+    from player import MidiPlayer
 
     raw = [
         {'time': 0.00, 'type': 'note_on', 'note': 86, 'velocity': 64, 'channel': 0},
