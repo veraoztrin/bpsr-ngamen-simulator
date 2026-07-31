@@ -253,7 +253,7 @@ def _client_manager():
     host_public = host_private.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     credential = (
-        "bpsr3.correct-horse-battery-staple."
+        "bpsr4.correct-horse-battery-staple."
         + manager._b64url(host_public))
     manager._configure_room(credential)
     manager.is_host = False
@@ -298,7 +298,7 @@ def _signed_message(manager, payload):
     payload["_sender"] = manager.host_id
     payload["_msg_id"] = os.urandom(16).hex()
     payload["_sender_pub"] = manager._b64url(manager._test_host_public)
-    payload["_proto"] = 3
+    payload["_proto"] = _network_module().PROTOCOL_VERSION
     payload["_sig"] = manager._sign(payload)
     unsigned = json.dumps(
         payload, sort_keys=True, separators=(",", ":"),

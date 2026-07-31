@@ -11,7 +11,8 @@ from conversion_profile import (
 
 def test_conversion_profile_round_trip():
     original = ConversionSettings(
-        speed=1.25, prioritize_melody=True, auto_split=True,
+        speed=1.25, prioritize_melody=True, double_melody_octave=True,
+        auto_split=True,
         auto_split_parts=3, range_low=36, range_high=95)
     profile = make_conversion_profile(original, "Piano")
     restored, instrument = load_conversion_profile(profile)
@@ -26,6 +27,7 @@ def test_conversion_profile_round_trip():
     lambda profile: profile["settings"].update(speed=float("nan")),
     lambda profile: profile["settings"].update(reach_low=0),
     lambda profile: profile["settings"].update(grouping_mode="guess"),
+    lambda profile: profile["settings"].update(double_melody_octave=1),
     lambda profile: profile["settings"].update(extra=True),
 ])
 def test_conversion_profile_rejects_malformed_values(mutation):
@@ -46,11 +48,15 @@ def test_host_profile_produces_identical_client_arrangement():
     ]
     host_settings = ConversionSettings(
         auto_split=True, auto_split_parts=2,
-        prioritize_melody=True, range_low=36, range_high=95)
+        prioritize_melody=True, double_melody_octave=True,
+        range_low=36, range_high=95)
     profile = make_conversion_profile(host_settings, "Piano")
     client_settings, _instrument = load_conversion_profile(profile)
 
-    assert convert(events, host_settings) == convert(events, client_settings)
+    host_output = convert(events, host_settings)
+
+    assert host_output == convert(events, client_settings)
+    assert client_settings.double_melody_octave
 
 
 def test_client_conversion_defaults_to_host_but_allows_local_override():

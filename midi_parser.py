@@ -3,8 +3,11 @@ import os
 import mido
 
 from midi_metadata import (
-    GM_DRUM_CHANNEL, GM_FAMILIES, classify_midi_source, gm_family_name,
-    guess_channel_instrument,
+    GM_DRUM_CHANNEL as GM_DRUM_CHANNEL,
+    GM_FAMILIES as GM_FAMILIES,
+    classify_midi_source,
+    gm_family_name as gm_family_name,
+    guess_channel_instrument as guess_channel_instrument,
 )
 
 DEFAULT_BPM = 120.0

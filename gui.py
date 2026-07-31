@@ -367,7 +367,7 @@ class App(ctk.CTk):
         ctk.CTkLabel(self.maxchord_frame, text="Max chord notes:").pack(side="left")
         self.max_chord_seg = ctk.CTkSegmentedButton(
             self.maxchord_frame, values=["1", "2", "3", "4", "5"],
-            command=lambda _: self.reconvert())
+            command=self._on_max_chord_change)
         self.max_chord_seg.set("5")
         self.max_chord_seg.pack(side="left", padx=(4, 0))
 
@@ -384,20 +384,24 @@ class App(ctk.CTk):
             ("melody_lock", "Melody priority (octaves)"),
             ("disable_sustain", "Disable sustain pedal"),
             ("duet_mode", "Duet mode"),
+            ("double_melody_octave", "Double single-note melody (octave)"),
         ]
-        # 3 rows instead of 2 - 5-per-row was clipping the last label or two
-        # against the window edge.
+        # Keep long labels on comfortably sized rows so the conversion panel
+        # remains usable at its compact minimum width.
         self.checkbox_row_frames = []
-        for row_checks in (checks[:4], checks[4:7], checks[7:]):
+        for row_checks in (checks[:4], checks[4:7], checks[7:10], checks[10:]):
             row = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
             row.pack(fill="x", padx=10, pady=(8, 0))
             self.checkbox_row_frames.append(row)
             for key, label in row_checks:
                 var = ctk.BooleanVar(value=False)
                 self.conv_vars[key] = var
-                ctk.CTkCheckBox(row, text=label, variable=var,
-                                command=lambda k=key: self._on_conversion_toggle(k)
-                                ).pack(side="left", padx=(0, 14))
+                checkbox = ctk.CTkCheckBox(
+                    row, text=label, variable=var,
+                    command=lambda k=key: self._on_conversion_toggle(k))
+                checkbox.pack(side="left", padx=(0, 14))
+                if key == "double_melody_octave":
+                    self.double_melody_octave_cb = checkbox
 
         # Row 3: range + timing
         self.row3 = row3 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
@@ -585,6 +589,17 @@ class App(ctk.CTk):
             self.conv_vars["melody_lock"].set(False)
         self.reconvert()
 
+    def _refresh_double_melody_control(self):
+        enabled = bool(
+            self.instrument_var.get() == "Piano"
+            and self.max_chord_seg.get() != "1")
+        self.double_melody_octave_cb.configure(
+            state="normal" if enabled else "disabled")
+
+    def _on_max_chord_change(self, _choice=None):
+        self._refresh_double_melody_control()
+        self.reconvert()
+
     def on_instrument_change(self, choice):
         """Apply an instrument's playable range to the Range fields, then
         re-fit the loaded MIDI into it. Drum is a different beast - it has
@@ -592,6 +607,7 @@ class App(ctk.CTk):
         every conversion control that doesn't apply to a generated beat."""
         rng = INSTRUMENTS.get(choice)
         is_drum = bool(rng and rng.get("is_drum"))
+        self._refresh_double_melody_control()
 
         for widget, pack_kwargs in self._drum_hidden_widgets:
             if is_drum:
@@ -657,6 +673,7 @@ class App(ctk.CTk):
         for var in self.conv_vars.values():
             var.set(False)
         self.max_chord_seg.set("5")
+        self._refresh_double_melody_control()
         self.autosplit_var.set(False)
         self.autosplit_seg.set("2")
         self.grouping_mode_var.set("Musical roles")
@@ -1183,6 +1200,7 @@ class App(ctk.CTk):
                 else self._number_text(settings.bpm_override))
             self._set_entry(self.speed_entry, self._number_text(settings.speed))
             self.max_chord_seg.set(str(settings.max_chord_notes))
+            self._refresh_double_melody_control()
             self._set_entry(
                 self.range_low_entry, midi_to_note_name(settings.range_low))
             self._set_entry(
@@ -1430,6 +1448,7 @@ class App(ctk.CTk):
 
         if prefs.get("max_chord_notes"):
             self.max_chord_seg.set(prefs["max_chord_notes"])
+        self._refresh_double_melody_control()
         if prefs.get("autosplit_parts"):
             self.autosplit_seg.set(prefs["autosplit_parts"])
         grouping = prefs.get("grouping_mode", "Musical roles")
@@ -1519,6 +1538,9 @@ class App(ctk.CTk):
             note_thinning=self.conv_vars["note_thinning"].get(),
             cull_low_priority=self.conv_vars["cull_low_priority"].get(),
             prioritize_melody=self.conv_vars["prioritize_melody"].get(),
+            double_melody_octave=(
+                self.instrument_var.get() == "Piano"
+                and self.conv_vars["double_melody_octave"].get()),
             proportional_remap=self.conv_vars["proportional_remap"].get(),
             consistent_windows=self.conv_vars["consistent_windows"].get(),
             voice_aware=self.conv_vars["voice_aware"].get(),

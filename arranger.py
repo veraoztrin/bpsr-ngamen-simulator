@@ -47,6 +47,7 @@ class ConversionSettings:
     note_thinning: bool = False     # merge machine-gun repeats / drop micro-notes
     cull_low_priority: bool = False # drop quiet notes inside dense chords
     prioritize_melody: bool = False # always keep the highest voice when trimming
+    double_melody_octave: bool = False # thicken single Piano melody notes by 1 octave
     proportional_remap: bool = False# compress full pitch span into allowed range
     consistent_windows: bool = False# fixed-grid chord windows instead of greedy
     voice_aware: bool = False       # octave-fold toward each channel's register
@@ -356,7 +357,7 @@ def enforce_retrigger_gaps(notes, min_gap):
 def group_chords(notes, window, consistent):
     """Group notes whose starts fall in the same chord window."""
     groups = []
-    if consistent:
+    if consistent and window > 0:
         # Fixed grid anchored at t=0: same input timing -> same grouping,
         # regardless of which notes got culled earlier.
         by_slot = {}
@@ -415,6 +416,85 @@ def limit_chords(notes, settings):
 
     keep.sort(key=lambda n: (n['start'], n['note']))
     return keep
+
+
+def double_single_note_melody(notes, settings, lo, hi):
+    """Add one octave copy to eligible single-note Piano melody attacks.
+
+    With Musical roles grouping, a single Melody attack may be doubled while
+    accompaniment plays alongside it.  Otherwise the complete onset must be a
+    single note, which avoids guessing that a source track/channel is melody.
+    The lower octave is preferred for body; the upper octave is the fallback
+    near the bottom of the selected range.  Existing octaves and full chords
+    are left alone.
+    """
+    if (not settings.double_melody_octave
+            or settings.max_chord_notes < 2
+            or settings.instrument_offset != 0
+            or settings.reach_low != ABS_LOW
+            or settings.reach_high != ABS_HIGH
+            or not notes):
+        return notes
+
+    result = list(notes)
+    role_grouping = bool(
+        settings.auto_split and settings.grouping_mode == 'roles')
+    groups = group_chords(
+        notes, settings.chord_window, settings.consistent_windows)
+    for group in groups:
+        if len(group) >= settings.max_chord_notes:
+            continue
+        if role_grouping:
+            melody = [note for note in group
+                      if note.get('group_name') == 'Melody']
+            if len(melody) != 1:
+                continue
+            source = melody[0]
+        else:
+            if len(group) != 1:
+                continue
+            source = group[0]
+
+        existing = {note['note'] for note in group}
+        if (source['note'] - 12 in existing
+                or source['note'] + 12 in existing):
+            continue
+        doubled_pitch = next((
+            pitch for pitch in (source['note'] - 12, source['note'] + 12)
+            if lo <= pitch <= hi and pitch not in existing
+            and any(zone_lo <= source['note'] <= zone_hi
+                    and zone_lo <= pitch <= zone_hi
+                    for zone_lo, zone_hi in ZONE_RANGES.values())
+        ), None)
+        if doubled_pitch is None:
+            continue
+        doubled = dict(source)
+        doubled['note'] = doubled_pitch
+        doubled['_octave_double_source'] = source
+        result.append(doubled)
+
+    result.sort(key=lambda note: (note['start'], note['note']))
+    return result
+
+
+def finalize_octave_doubles(notes, settings):
+    """Drop synthetic copies invalidated by later octave-zone placement."""
+    present = {id(note) for note in notes}
+    result = []
+    for note in notes:
+        source = note.pop('_octave_double_source', None)
+        if source is None:
+            result.append(note)
+            continue
+        # Phrase or melody-lock placement can fold a copy onto its source, or
+        # omit the source. Keeping such a copy would create a duplicate key or
+        # a detached harmony note rather than a true one-octave doubling.
+        if id(source) not in present or abs(note['note'] - source['note']) != 12:
+            continue
+        if settings.duet_mode and not settings.auto_split:
+            note['_duet_octave_source'] = source
+        result.append(note)
+    return result
 
 
 def apply_phrase_zones(notes, phrase_gap):
@@ -703,8 +783,18 @@ def assign_source_groups(notes, sustains, mode):
 
 def split_duet(notes, sustains, split_note):
     """Split into Low (channel 0) / High (channel 1) parts."""
+    linked_copies = []
     for n in notes:
-        n['channel'] = 0 if n['note'] < split_note else 1
+        source = n.pop('_duet_octave_source', None)
+        if source is None:
+            n['channel'] = 0 if n['note'] < split_note else 1
+        else:
+            linked_copies.append((n, source))
+    # An octave copy belongs to the same musical line as its source even if
+    # the added pitch falls on the other side of the fixed duet split.
+    for copy, source in linked_copies:
+        copy['channel'] = source.get(
+            'channel', 0 if source['note'] < split_note else 1)
     # Sustain pedal is global in-game; give both parts a copy so whichever
     # part is active still gets pedal events (simulator dedupes state).
     doubled = []
@@ -1816,7 +1906,13 @@ def convert(events, settings, orig_bpm=120.0):
             or settings.consistent_windows or settings.prioritize_melody):
         pitched_notes = limit_chords(pitched_notes, settings)
 
-    # 5. Octave-zone planning (melody-lock takes precedence over phrase-gap).
+    # 5. Optional Piano octave doubling. It runs after chord limiting so the
+    # final onset count can be checked against Max chord notes, but before zone
+    # planning so both simultaneous keys always share a valid modifier zone.
+    pitched_notes = double_single_note_melody(
+        pitched_notes, settings, lo, hi)
+
+    # 6. Octave-zone planning (melody-lock takes precedence over phrase-gap).
     # These model the PIANO's 3 shift zones, so they only apply to instruments
     # that use the piano pitch mapping (offset 0); a transposed keyboard like
     # Bass fits in one zone and needs no shifting.
@@ -1832,15 +1928,16 @@ def convert(events, settings, orig_bpm=120.0):
 
     notes = pitched_notes + percussion_notes
 
-    # 6. Final safety: everything must be inside the instrument's reach
+    # 7. Final safety: everything must be inside the instrument's reach
     fold_into_range(notes, reach_lo, reach_hi)
+    notes = finalize_octave_doubles(notes, settings)
 
-    # 7. A fixed duet remains a post-arrangement pitch split. Source-aware
+    # 8. A fixed duet remains a post-arrangement pitch split. Source-aware
     # grouping was already performed before folding and supersedes it.
     if not settings.auto_split and settings.duet_mode:
         sustains = split_duet(notes, sustains, settings.duet_split_note)
 
-    # 8. Retrigger gaps. Must be LAST: it works on the final pitch of each note
+    # 9. Retrigger gaps. Must be LAST: it works on the final pitch of each note
     # (after folding/melody-lock) and its final channel (after the duet /
     # grouping assignment above), since together those decide which physical
     # key a note lands on and who plays it.

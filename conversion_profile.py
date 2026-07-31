@@ -7,10 +7,11 @@ from arranger import ConversionSettings
 from config import INSTRUMENTS
 
 
-PROFILE_VERSION = 2
+PROFILE_VERSION = 3
 _SETTING_NAMES = {field.name for field in fields(ConversionSettings)}
 _BOOL_FIELDS = {
     "note_thinning", "cull_low_priority", "prioritize_melody",
+    "double_melody_octave",
     "proportional_remap", "consistent_windows", "voice_aware",
     "phrase_gap_shifting", "melody_lock", "duet_mode", "auto_split",
     "disable_sustain",
