@@ -14,7 +14,9 @@ A plug-and-play desktop application designed to read standard MIDI (`.mid`) file
 - **Smart Octave Shifting:** Automatically maps notes to the optimal octave shift (`L Shift` or `L Ctrl`) and minimizes unnecessary toggle presses to ensure smooth chord playback.
 - **Sustain Support:** Fully supports MIDI Sustain Pedal events (CC64), toggling the in-game `[Space]` bar.
 - **Modern GUI:** Built with `customtkinter` for a beautiful dark-mode interface.
-- **Channel Selector:** Mute or solo specific tracks inside a MIDI file (e.g., mute the drum track).
+- **Source-aware Part Selector:** Group and select the MIDI by musical role,
+  original track, 1-based MIDI channel, or detected General MIDI instrument
+  family. Track names, programs, banks and percussion evidence are preserved.
 - **Global Hotkeys:** `F9` = play / resume, `F10` = pause, `F11` = stop — they work even while the game window is focused, so no more alt-tab dance. Held keys do not auto-repeat; if a game or overlay already registered any of them, the app automatically switches to rising-edge Windows key polling.
 - **Autoplay toggle:** When on, playback advances to the next loaded MIDI when a track finishes; when off (the default), it stops and releases all keys at the end of each track. Found next to the play controls in the Solo tab.
 - **Leave / Disband room:** Clients can **Leave Room** at any time (they drop off the host's roster and can join another room); the host can **Disband Lobby** to close the room, which returns every connected player to the disconnected state.
@@ -44,7 +46,16 @@ The Solo tab includes a conversion panel that re-transcribes the loaded MIDI on 
 - **Melody priority (octaves):** The game keyboard is a single 3-octave window that L-Shift / L-Ctrl slide up or down — so when the melody and a lower part are more than 3 octaves apart, they can't both sound and the app used to flip the shift back and forth, cutting the melody. This locks the octave shift to follow the melody (the top voice) so it's never interrupted, and silences the conflicting lower notes only in the spots where they physically can't coexist. It and Phrase gap shifting are mutually exclusive because both control the same modifier.
 - **Duet mode:** Splits the song at the **Duet split** note into a Low part (channel 0) and High part (channel 1). Use the channel checkboxes to play one half, or assign each half to a different player in the Multiplayer Lobby.
 - **Disable sustain pedal:** Strips every sustain (CC64) event from the piece, so the app never taps the in-game `[Space]`. Hold the sustain pedal manually in-game instead — this smooths out very fast passages where the rapid key re-triggering otherwise sounds glitchy and unnatural.
-- **Auto-split parts:** Re-categorizes the loaded MIDI into channels by musical role instead of whatever channels the file happened to use — channel 0 = melody (the top voice), channel 1 = accompaniment, and with the 3-part option, channel 2 = bass (the lowest line). Uses a skyline split (highest/lowest sounding pitch at each moment), so a sustained melody keeps its role. Great for handing each part to a different player in multiplayer. The **Solo Active Channels** list shows each channel's note range and role name.
+- **Group parts:** Choose **Musical roles**, **Original tracks**, **MIDI
+  channels**, or **Instrument families**. Musical roles uses the authored pitch
+  before range folding, so a bass or melody does not change identity when its
+  octave is remapped. GM channel 10 percussion is excluded from melody/bass
+  analysis and shown as a separate, initially unchecked part on pitch
+  instruments. Instrument-family names are conservative hints based on program,
+  bank and track metadata; the UI reports confidence instead of claiming an
+  uncertain source is definitely a piano. MIDI channel labels are shown in the
+  familiar 1–16 form. This is useful both for solo filtering and assigning
+  performers in multiplayer.
 - **Range:** Allowed output range (note names like `C2`–`B7`, or raw MIDI numbers). Notes outside are octave-shifted to fit.
 - **Shift delay / hold (ms):** Timing for the octave modifier keys — delay after toggling before the next note fires, and minimum hold before re-toggling. Raise the delay if high/low notes play at the wrong octave in-game.
 - **Retrigger gap (ms):** How long a key is held *up* before the same note sounds again. Most MIDI is quantized edge-to-edge, so a repeated note's release lands on the exact timestamp of the next note's press — and because the game samples the keyboard once per frame, it never sees the key come up and plays `C4 C4 C4 C4` as one long `C4`. The gap pulls each release back far enough for the repeat to register; only the release moves, never the onset. Raise it if repeated notes still slur together, lower it if fast repeated passages sound too clipped. Applies to every instrument, Drum included.

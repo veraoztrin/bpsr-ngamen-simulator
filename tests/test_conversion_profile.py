@@ -25,6 +25,7 @@ def test_conversion_profile_round_trip():
     lambda profile: profile.update(instrument=[]),
     lambda profile: profile["settings"].update(speed=float("nan")),
     lambda profile: profile["settings"].update(reach_low=0),
+    lambda profile: profile["settings"].update(grouping_mode="guess"),
     lambda profile: profile["settings"].update(extra=True),
 ])
 def test_conversion_profile_rejects_malformed_values(mutation):

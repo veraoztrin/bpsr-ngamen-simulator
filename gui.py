@@ -30,6 +30,12 @@ ctk.set_default_color_theme("blue")
 
 # Same folder network_sync.py logs to - one place for this app's local state.
 PREFS_PATH = os.path.join(os.path.expanduser("~"), ".bpsr_midi_player", "prefs.json")
+GROUPING_LABELS = {
+    "Musical roles": "roles",
+    "Original tracks": "tracks",
+    "MIDI channels": "channels",
+    "Instrument families": "families",
+}
 
 class App(ctk.CTk):
     def __init__(self):
@@ -392,18 +398,24 @@ class App(ctk.CTk):
         self.shift_hold_entry.insert(0, "10")
         self.shift_hold_entry.pack(side="left", padx=(4, 0))
 
-        # Row 4: automatic part categorization
+        # Row 4: source-aware part grouping
         self.row4 = row4 = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
         row4.pack(fill="x", padx=10, pady=(0, 8))
         self.autosplit_var = ctk.BooleanVar(value=False)
-        ctk.CTkCheckBox(row4, text="Auto-split parts", variable=self.autosplit_var,
+        ctk.CTkCheckBox(row4, text="Group parts", variable=self.autosplit_var,
                         command=self.reconvert).pack(side="left", padx=(0, 8))
-        ctk.CTkLabel(row4, text="into").pack(side="left")
+        self.grouping_mode_var = ctk.StringVar(value="Musical roles")
+        ctk.CTkOptionMenu(
+            row4, values=list(GROUPING_LABELS),
+            variable=self.grouping_mode_var, width=150,
+            command=lambda _value: self.reconvert()
+        ).pack(side="left", padx=(0, 10))
+        ctk.CTkLabel(row4, text="Role parts:").pack(side="left")
         self.autosplit_seg = ctk.CTkSegmentedButton(row4, values=["2", "3"],
                                                     command=lambda _: self.reconvert())
         self.autosplit_seg.set("2")
         self.autosplit_seg.pack(side="left", padx=6)
-        ctk.CTkLabel(row4, text="channels by role (melody / accomp / bass)",
+        ctk.CTkLabel(row4, text="(used by Musical roles)",
                      text_color="gray").pack(side="left", padx=4)
 
         # Drum-specific controls. They replace the pitch/chord controls when
@@ -614,6 +626,7 @@ class App(ctk.CTk):
         self.max_chord_seg.set("5")
         self.autosplit_var.set(False)
         self.autosplit_seg.set("2")
+        self.grouping_mode_var.set("Musical roles")
         self.drum_source_var.set("Auto")
         self.drum_style_var.set("Auto")
         self.drum_hat_var.set("Eighth")
@@ -1035,6 +1048,7 @@ class App(ctk.CTk):
                 "drum_spacing": self.drum_spacing_entry.get(),
                 "autosplit": self.autosplit_var.get(),
                 "autosplit_parts": self.autosplit_seg.get(),
+                "grouping_mode": self.grouping_mode_var.get(),
                 "instrument": self.instrument_var.get(),
                 "autoplay": self.autoplay_var.get(),
                 "focus_guard": self.focus_guard_var.get(),
@@ -1102,6 +1116,9 @@ class App(ctk.CTk):
             self.max_chord_seg.set(prefs["max_chord_notes"])
         if prefs.get("autosplit_parts"):
             self.autosplit_seg.set(prefs["autosplit_parts"])
+        grouping = prefs.get("grouping_mode", "Musical roles")
+        if grouping in GROUPING_LABELS:
+            self.grouping_mode_var.set(grouping)
         self.autosplit_var.set(bool(prefs.get("autosplit", False)))
         self.autoplay_var.set(bool(prefs.get("autoplay", False)))
         self.focus_guard_var.set(bool(prefs.get("focus_guard", True)))
@@ -1194,6 +1211,8 @@ class App(ctk.CTk):
             duet_split_note=duet_split,
             auto_split=self.autosplit_var.get(),
             auto_split_parts=int(self.autosplit_seg.get()),
+            grouping_mode=GROUPING_LABELS.get(
+                self.grouping_mode_var.get(), "roles"),
             disable_sustain=self.conv_vars["disable_sustain"].get(),
             reach_low=self._inst()["low"],
             reach_high=self._inst()["high"],
@@ -1283,8 +1302,12 @@ class App(ctk.CTk):
         # the Solo panel doesn't show stale "Duet Low/High" style labels.
         self.build_solo_channel_ui(duet=(settings.duet_mode and not is_drum),
                                    auto=(settings.auto_split and not is_drum),
-                                   parts=settings.auto_split_parts)
-        self.player.load_events(self.events, self.channels)
+                                   parts=settings.auto_split_parts,
+                                   grouping_mode=settings.grouping_mode)
+        selected_channels = [
+            channel for channel, variable in self.channel_vars
+            if variable.get()]
+        self.player.load_events(self.events, selected_channels)
         raw_notes = sum(
             ev.get("type") == "note_on" for ev in self.raw_events)
         output_notes = sum(
@@ -1326,19 +1349,64 @@ class App(ctk.CTk):
                 ranges[ev['channel']] = (min(lo, ev['note']), max(hi, ev['note']))
         return ranges
 
-    def build_solo_channel_ui(self, duet=False, auto=False, parts=2):
+    def _channel_labels(self):
+        """User-facing converted part names, shared by Solo and lobby UI."""
+        labels = {}
+        for event in self.events:
+            if event.get('type') != 'note_on':
+                continue
+            channel = event.get('channel', 0)
+            if event.get('group_name'):
+                labels.setdefault(channel, event['group_name'])
+        for channel in self.channels:
+            if channel in labels:
+                continue
+            guess = guess_channel_instrument(channel, self.channel_programs)
+            labels[channel] = (
+                f"MIDI Ch. {channel + 1} - likely {guess}"
+                if guess else f"MIDI Ch. {channel + 1}")
+        return labels
+
+    def build_solo_channel_ui(self, duet=False, auto=False, parts=2,
+                              grouping_mode='roles'):
         for widget in self.channel_frame.winfo_children():
             widget.destroy()
         self.channel_vars = []
         ranges = self._channel_ranges()
+        group_metadata = {}
+        confidence_rank = {
+            'unknown': 0, 'low': 1, 'medium': 2, 'inferred': 2, 'high': 3}
+        for event in self.events:
+            if event.get('type') != 'note_on':
+                continue
+            channel = event.get('channel', 0)
+            info = group_metadata.setdefault(channel, {
+                'name': event.get('group_name'),
+                'is_drum': bool(event.get('group_is_drum', False)),
+                'confidence': event.get('group_confidence', 'unknown'),
+            })
+            confidence = event.get('group_confidence', 'unknown')
+            if confidence_rank.get(confidence, 0) < confidence_rank.get(
+                    info['confidence'], 0):
+                info['confidence'] = confidence
 
         def name_for(ch):
             if auto:
-                if parts >= 3:
-                    return {0: "Melody", 1: "Harmony", 2: "Bass"}.get(ch, f"Part {ch}")
-                return {0: "Melody", 1: "Accompaniment"}.get(ch, f"Part {ch}")
+                info = group_metadata.get(ch, {})
+                name = info.get('name')
+                if not name and grouping_mode == 'roles':
+                    if parts >= 3:
+                        name = {0: "Melody", 1: "Harmony", 2: "Bass"}.get(ch)
+                    else:
+                        name = {0: "Melody", 1: "Accompaniment"}.get(ch)
+                name = name or f"Part {ch + 1}"
+                if (grouping_mode == 'families'
+                        and info.get('confidence') not in (None, 'unknown')):
+                    name += f" ({info['confidence']} confidence)"
+                return name
             if duet:
-                return {0: "Duet Low (bass)", 1: "Duet High (melody)"}.get(ch, f"Channel {ch}")
+                return {0: "Duet Low (bass)", 1: "Duet High (melody)"}.get(
+                    ch, f"Part {ch + 1}")
             # Plain (no auto-split/duet) mode: keep the raw channel number,
             # but tack on an educated instrument guess when we have one -
             # from the channel's GM Program Change, or "Drums" for the
@@ -1347,8 +1415,8 @@ class App(ctk.CTk):
             # aren't confident in.
             guess = guess_channel_instrument(ch, self.channel_programs)
             if guess:
-                return f"Channel {ch} - {guess}"
-            return f"Channel {ch}"
+                return f"MIDI Ch. {ch + 1} - likely {guess}"
+            return f"MIDI Ch. {ch + 1}"
 
         for ch in self.channels:
             row = ctk.CTkFrame(self.channel_frame, fg_color="transparent")
@@ -1360,7 +1428,9 @@ class App(ctk.CTk):
                 rng = "—"
             ctk.CTkLabel(row, text=rng, width=95, anchor="w",
                          text_color="gray").pack(side="left")
-            var = ctk.BooleanVar(value=True)
+            default_selected = not (
+                auto and group_metadata.get(ch, {}).get('is_drum', False))
+            var = ctk.BooleanVar(value=default_selected)
             cb = ctk.CTkCheckBox(row, text=name_for(ch), variable=var,
                                  command=self.update_solo_channels)
             cb.pack(side="left", padx=6)
@@ -1823,6 +1893,7 @@ class App(ctk.CTk):
             ctk.CTkLabel(self.lobby_frame, text=f"🎵 Shared Song: {fn}", font=ctk.CTkFont(weight="bold")).pack(pady=5)
 
         self.host_checkbox_vars = {}
+        channel_labels = self._channel_labels()
 
         if not self.network.is_host:
             me = next((p for p in state.get("players", [])
@@ -1881,11 +1952,20 @@ class App(ctk.CTk):
                             chs = [c for c, v in self.host_checkbox_vars[cid].items() if v.get()]
                             self.network.assign_channels(cid, chs)
                             
-                        cb = ctk.CTkCheckBox(ch_frame, text=f"Ch {ch}", variable=var, command=on_toggle)
+                        cb = ctk.CTkCheckBox(
+                            ch_frame, text=channel_labels.get(
+                                ch, f"MIDI Ch. {ch + 1}"),
+                            variable=var, command=on_toggle)
                         cb.pack(side="left", padx=10, pady=5)
             else:
-                assigned_text = ", ".join(map(str, p['channels'])) if p['channels'] else "None"
-                lbl2 = ctk.CTkLabel(frame, text=f"Assigned Channels: {assigned_text}", text_color="cyan")
+                assigned_text = (
+                    ", ".join(channel_labels.get(
+                        channel, f"MIDI Ch. {channel + 1}")
+                        for channel in p['channels'])
+                    if p['channels'] else "None")
+                lbl2 = ctk.CTkLabel(
+                    frame, text=f"Assigned Parts: {assigned_text}",
+                    text_color="cyan")
                 lbl2.pack(side="left", padx=10, pady=10)
                 
         if self.network.is_host:

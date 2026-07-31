@@ -7,7 +7,7 @@ from arranger import ConversionSettings
 from config import INSTRUMENTS
 
 
-PROFILE_VERSION = 1
+PROFILE_VERSION = 2
 _SETTING_NAMES = {field.name for field in fields(ConversionSettings)}
 _BOOL_FIELDS = {
     "note_thinning", "cull_low_priority", "prioritize_melody",
@@ -41,6 +41,7 @@ _FLOAT_RANGES = {
 }
 _CHOICES = {
     "melody_lock_mode": {"drop", "fold", "hybrid"},
+    "grouping_mode": {"roles", "tracks", "channels", "families"},
     "drum_source_mode": {"auto", "preserve", "augment", "generate"},
     "drum_style": {"auto", "rock", "pop", "ballad", "dance"},
     "drum_hat_density": {"quarter", "eighth", "sixteenth"},

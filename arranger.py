@@ -23,6 +23,9 @@ from config import (
     DRUM_TOM_1, DRUM_TOM_2, DRUM_CRASH_1, DRUM_HH_OPEN, DRUM_CRASH_2,
     DRUM_NOTES as _DRUM_NOTES,
 )
+from midi_metadata import (
+    GM_DRUM_CHANNEL, classify_midi_source, is_gm_percussion_note,
+)
 
 # Kept as a public compatibility export for tests and external callers.
 DRUM_NOTES = _DRUM_NOTES
@@ -54,6 +57,7 @@ class ConversionSettings:
     duet_split_note: int = 60       # notes below this go to the Low part
     auto_split: bool = False        # auto-assign channels by musical role
     auto_split_parts: int = 2       # 2 = melody+accomp, 3 = melody+harmony+bass
+    grouping_mode: str = 'roles'    # roles | tracks | channels | families
     disable_sustain: bool = False   # strip all pedal events (hold Space manually)
     range_low: int = ABS_LOW        # allowed output range (folded into)
     range_high: int = ABS_HIGH
@@ -84,7 +88,7 @@ def events_to_notes(events):
     """Pair note_on/note_off events into note dicts; collect sustain events."""
     notes = []
     sustains = []
-    open_notes = {}  # (channel, note) -> [note dicts awaiting note_off]
+    open_notes = {}  # source identity + pitch -> notes awaiting note_off
     last_time = events[-1]['time'] if events else 0.0
 
     for ev in events:
@@ -98,17 +102,46 @@ def events_to_notes(events):
                 'start_beat': ev.get('beat'),
                 'end_beat': None,
             }
-            open_notes.setdefault((n['channel'], n['note']), []).append(n)
+            for field in (
+                    'source_track', 'source_track_name',
+                    'source_instrument_name', 'source_port',
+                    'source_channel', 'program', 'bank_msb', 'bank_lsb',
+                    'source_family', 'source_confidence', 'source_is_drum',
+                    'classification_reason', 'group_name', 'group_is_drum'):
+                if field in ev:
+                    n[field] = ev[field]
+            n.setdefault('source_port', 0)
+            n.setdefault('source_track', 0)
+            n.setdefault('source_channel', n['channel'])
+            n['original_note'] = ev.get('original_note', n['note'])
+            source_key = (n['source_port'], n['source_track'],
+                          n['source_channel'], n['note'])
+            open_notes.setdefault(source_key, []).append(n)
             notes.append(n)
         elif ev['type'] == 'note_off':
-            stack = open_notes.get((ev.get('channel', 0), ev['note']))
+            source_key = (ev.get('source_port', 0),
+                          ev.get('source_track', 0),
+                          ev.get('source_channel', ev.get('channel', 0)),
+                          ev['note'])
+            stack = open_notes.get(source_key)
             if stack:
                 matched = stack.pop(0)
                 matched['end'] = t
                 matched['end_beat'] = ev.get('beat')
         elif ev['type'] == 'sustain':
-            sustains.append({'time': t, 'value': ev['value'],
-                             'channel': ev.get('channel', 0)})
+            sustain = {'time': t, 'value': ev['value'],
+                       'channel': ev.get('channel', 0)}
+            for field in (
+                    'source_track', 'source_track_name',
+                    'source_instrument_name', 'source_port',
+                    'source_channel', 'program', 'bank_msb', 'bank_lsb',
+                    'source_family', 'source_confidence', 'source_is_drum'):
+                if field in ev:
+                    sustain[field] = ev[field]
+            sustain.setdefault('source_port', 0)
+            sustain.setdefault('source_track', 0)
+            sustain.setdefault('source_channel', sustain['channel'])
+            sustains.append(sustain)
 
     for stack in open_notes.values():
         for n in stack:
@@ -125,13 +158,30 @@ def notes_to_events(notes, sustains, zone_hints=None):
     """Re-emit an event list the player understands."""
     evs = []
     for n in notes:
-        evs.append({'time': n['start'], 'type': 'note_on', 'note': n['note'],
-                    'velocity': n['velocity'], 'channel': n['channel']})
-        evs.append({'time': n['end'], 'type': 'note_off', 'note': n['note'],
-                    'channel': n['channel']})
+        metadata = {
+            field: n[field] for field in (
+                'source_track', 'source_track_name',
+                'source_instrument_name', 'source_port', 'source_channel',
+                'program', 'bank_msb', 'bank_lsb', 'source_family',
+                'source_confidence', 'source_is_drum',
+                'classification_reason', 'group_name', 'group_is_drum',
+                'group_confidence', 'original_note')
+            if field in n
+        }
+        note_on = {'time': n['start'], 'type': 'note_on', 'note': n['note'],
+                   'velocity': n['velocity'], 'channel': n['channel']}
+        note_off = {'time': n['end'], 'type': 'note_off', 'note': n['note'],
+                    'channel': n['channel']}
+        note_on.update(metadata)
+        note_off.update(metadata)
+        evs.extend((note_on, note_off))
     for s in sustains:
-        evs.append({'time': s['time'], 'type': 'sustain', 'value': s['value'],
-                    'channel': s['channel']})
+        event = {'time': s['time'], 'type': 'sustain', 'value': s['value'],
+                 'channel': s['channel']}
+        for field in ('group_name', 'group_is_drum'):
+            if field in s:
+                event[field] = s[field]
+        evs.append(event)
     for z in (zone_hints or []):
         evs.append({'time': z['time'], 'type': 'zone', 'value': z['value']})
 
@@ -512,47 +562,143 @@ def apply_melody_lock(notes, chord_window, mode='drop'):
     return zone_hints, kept
 
 
+def _note_is_drum(note):
+    """Use parser evidence, with a safe fallback for legacy/manual events."""
+    if note.get('source_is_drum') is not None:
+        return bool(note['source_is_drum'])
+    channel = note.get('source_channel', note.get('channel', 0))
+    original_note = note.get('original_note', note.get('note'))
+    return (channel == GM_DRUM_CHANNEL
+            and is_gm_percussion_note(original_note))
+
+
+def _copy_sustain(sustain, channel, name, is_drum=False):
+    return {
+        'time': sustain['time'], 'value': sustain['value'],
+        'channel': channel, 'group_name': name,
+        'group_is_drum': bool(is_drum),
+    }
+
+
 def assign_auto_parts(notes, sustains, n_parts=2, chord_window=0.030):
-    """Auto-categorize notes into channels by musical role (skyline split).
-
-        channel 0 = melody       (highest voice)
-        channel 1 = accompaniment / harmony
-        channel 2 = bass         (lowest voice) — only when n_parts >= 3
-
-    A note's role is decided at its onset by whether it is the highest / lowest
-    pitch *sounding* at that instant (counting notes still ringing from before),
-    so a sustained melody line keeps its role while lower notes come and go.
-
-    Returns the (possibly duplicated) sustain list; note channels are set
-    in place.
-    """
+    """Assign musical roles from original pitches, excluding percussion."""
     if not notes:
         return sustains
 
-    ordered = sorted(notes, key=lambda n: n['start'])
+    melodic = [note for note in notes if not _note_is_drum(note)]
     active = []
-    for grp in group_chords(ordered, max(0.0, chord_window), False):
-        t = min(n['start'] for n in grp)
-        active = [a for a in active if a['end'] > t]
-        active.extend(grp)
-        hi = max(a['note'] for a in active)
-        lo = min(a['note'] for a in active)
-        for n in grp:
-            if n['note'] == hi:
-                n['channel'] = 0                       # melody (top voice wins)
-            elif n_parts >= 3 and n['note'] == lo:
-                n['channel'] = 2                       # bass
+    for group in group_chords(
+            sorted(melodic, key=lambda note: note['start']),
+            max(0.0, chord_window), False):
+        start = min(note['start'] for note in group)
+        active = [note for note in active if note['end'] > start]
+        active.extend(group)
+        high = max(note.get('original_note', note['note']) for note in active)
+        low = min(note.get('original_note', note['note']) for note in active)
+        for note in group:
+            pitch = note.get('original_note', note['note'])
+            if pitch == high:
+                channel, name = 0, 'Melody'
+            elif n_parts >= 3 and pitch == low:
+                channel, name = 2, 'Bass'
             else:
-                n['channel'] = 1                       # accompaniment / harmony
+                channel = 1
+                name = 'Harmony' if n_parts >= 3 else 'Accompaniment'
+            note['channel'] = channel
+            note['group_name'] = name
+            note['group_is_drum'] = False
+            note['group_confidence'] = 'inferred'
 
-    # Sustain pedal is global in-game: give every part a copy so whichever
-    # part a player selects still receives pedal events.
-    parts = sorted(set(n['channel'] for n in notes))
-    doubled = []
-    for s in sustains:
-        for ch in parts:
-            doubled.append({'time': s['time'], 'value': s['value'], 'channel': ch})
-    return doubled
+    used_melodic = sorted({note['channel'] for note in melodic})
+    drum_channel = (max(used_melodic) + 1) if used_melodic else 0
+    for note in notes:
+        if _note_is_drum(note):
+            note['channel'] = drum_channel
+            note['group_name'] = 'Drums (not selected for pitch playback)'
+            note['group_is_drum'] = True
+            note['group_confidence'] = note.get('source_confidence', 'medium')
+
+    names = {note['channel']: note['group_name'] for note in melodic}
+    return [_copy_sustain(sustain, channel, names[channel])
+            for sustain in sustains for channel in used_melodic]
+
+
+def _source_group(note, mode):
+    port = note.get('source_port', 0)
+    source_channel = note.get('source_channel', note.get('channel', 0))
+    if mode == 'tracks':
+        track = note.get('source_track', 0)
+        name = (note.get('source_track_name')
+                or note.get('source_instrument_name')
+                or f'Track {track + 1}')
+        return (port, track), name
+    if mode == 'channels':
+        label = f'MIDI Ch. {source_channel + 1}'
+        if port:
+            label = f'Port {port + 1} · {label}'
+        return (port, source_channel), label
+
+    family = note.get('source_family')
+    if not family:
+        classified = classify_midi_source(
+            channel=source_channel, program=note.get('program'),
+            bank_msb=note.get('bank_msb'), bank_lsb=note.get('bank_lsb'),
+            track_name=note.get('source_track_name', ''),
+            instrument_name=note.get('source_instrument_name', ''),
+            note=note.get('original_note', note.get('note')))
+        family = classified['family']
+        note.setdefault('source_confidence', classified['confidence'])
+        note.setdefault('source_is_drum', classified['is_drum'])
+    return family, family
+
+
+def assign_source_groups(notes, sustains, mode):
+    """Group by preserved track, MIDI channel, or instrument family."""
+    if mode not in ('tracks', 'channels', 'families'):
+        raise ValueError(f'Unsupported grouping mode: {mode}')
+    if not notes:
+        return sustains
+
+    groups = {}
+    for note in sorted(notes, key=lambda item: item['start']):
+        key, name = _source_group(note, mode)
+        groups.setdefault(key, {'name': name, 'notes': []})['notes'].append(note)
+
+    entries = list(groups.items())
+    channel_for = {}
+    group_info = {}
+    overflow = len(entries) > 16
+    for index, (key, info) in enumerate(entries):
+        channel = index if not overflow or index < 15 else 15
+        channel_for[key] = channel
+        target = group_info.setdefault(channel, {
+            'name': (info['name'] if not overflow or index < 15
+                     else 'Other sources'),
+            'is_drum': True,
+        })
+        target['is_drum'] = target['is_drum'] and all(
+            _note_is_drum(note) for note in info['notes'])
+
+    for note in notes:
+        key, _name = _source_group(note, mode)
+        channel = channel_for[key]
+        info = group_info[channel]
+        note['channel'] = channel
+        note['group_name'] = info['name']
+        note['group_is_drum'] = info['is_drum']
+        note['group_confidence'] = note.get('source_confidence', 'unknown')
+
+    result = []
+    for sustain in sustains:
+        probe = dict(sustain)
+        probe.setdefault('note', 60)
+        key, _name = _source_group(probe, mode)
+        channel = channel_for.get(key)
+        if channel is not None and not group_info[channel]['is_drum']:
+            info = group_info[channel]
+            result.append(_copy_sustain(
+                sustain, channel, info['name'], info['is_drum']))
+    return result
 
 
 def split_duet(notes, sustains, split_note):
@@ -1539,8 +1685,8 @@ def convert_drum(events, settings, orig_bpm=120.0, beats_per_measure=4,
     end_beat = max(float(note['end_beat']) for note in notes)
     bars = _drum_bars(end_beat, time_signature_map, beats_per_measure)
 
-    drum_notes = [note for note in notes if note['channel'] == 9]
-    melodic_notes = [note for note in notes if note['channel'] != 9]
+    drum_notes = [note for note in notes if _note_is_drum(note)]
+    melodic_notes = [note for note in notes if not _note_is_drum(note)]
     original_hits = _map_gm_hits(drum_notes, timeline, settings)
     # Auto should preserve only when the source produced usable mapped hits.
     # A channel-10 track containing unsupported GM percussion is otherwise
@@ -1617,6 +1763,25 @@ def convert(events, settings, orig_bpm=120.0):
         factor /= settings.speed
     scale_times(notes, sustains, factor)
 
+    # Group while pitches still reflect the authored MIDI.  Range folding can
+    # collapse distant registers onto one octave; doing this later made bass,
+    # harmony and melody indistinguishable and caused the stiff part changes
+    # reported by users.
+    if settings.auto_split:
+        if settings.grouping_mode == 'roles':
+            sustains = assign_auto_parts(
+                notes, sustains, settings.auto_split_parts,
+                settings.chord_window)
+        else:
+            sustains = assign_source_groups(
+                notes, sustains, settings.grouping_mode)
+    percussion_notes = (
+        [note for note in notes if note.get('group_is_drum')]
+        if settings.auto_split else [])
+    pitched_notes = (
+        [note for note in notes if not note.get('group_is_drum')]
+        if settings.auto_split else notes)
+
     # 2. Pitch range mapping (clamped to the instrument's physical reach)
     reach_lo, reach_hi = settings.reach_low, settings.reach_high
     lo = max(reach_lo, min(settings.range_low, settings.range_high))
@@ -1629,18 +1794,27 @@ def convert(events, settings, orig_bpm=120.0):
         else:
             lo = hi = reach_hi
     if settings.proportional_remap:
-        proportional_remap(notes, lo, hi)
+        proportional_remap(pitched_notes, lo, hi)
+        # Percussion is a selectable reference part, not pitch material that
+        # should stretch the melody's range calculation.
+        fold_into_range(percussion_notes, lo, hi)
     else:
-        fold_into_range(notes, lo, hi, voice_aware=settings.voice_aware)
+        fold_into_range(
+            pitched_notes, lo, hi, voice_aware=settings.voice_aware)
+        fold_into_range(percussion_notes, lo, hi)
 
     # 3. Note thinning
     if settings.note_thinning:
-        notes = thin_notes(notes, settings.thinning_gap, settings.thinning_min_len)
+        pitched_notes = thin_notes(
+            pitched_notes, settings.thinning_gap, settings.thinning_min_len)
+        percussion_notes = thin_notes(
+            percussion_notes, settings.thinning_gap,
+            settings.thinning_min_len)
 
     # 4. Chord limiting / culling / melody priority
     if (settings.max_chord_notes < 5 or settings.cull_low_priority
             or settings.consistent_windows or settings.prioritize_melody):
-        notes = limit_chords(notes, settings)
+        pitched_notes = limit_chords(pitched_notes, settings)
 
     # 5. Octave-zone planning (melody-lock takes precedence over phrase-gap).
     # These model the PIANO's 3 shift zones, so they only apply to instruments
@@ -1649,24 +1823,26 @@ def convert(events, settings, orig_bpm=120.0):
     zone_hints = []
     if settings.instrument_offset == 0:
         if settings.melody_lock:
-            zone_hints, notes = apply_melody_lock(notes, settings.chord_window,
-                                                  settings.melody_lock_mode)
+            zone_hints, pitched_notes = apply_melody_lock(
+                pitched_notes, settings.chord_window,
+                settings.melody_lock_mode)
         elif settings.phrase_gap_shifting:
-            zone_hints = apply_phrase_zones(notes, settings.phrase_gap)
+            zone_hints = apply_phrase_zones(
+                pitched_notes, settings.phrase_gap)
+
+    notes = pitched_notes + percussion_notes
 
     # 6. Final safety: everything must be inside the instrument's reach
     fold_into_range(notes, reach_lo, reach_hi)
 
-    # 7. Channel assignment (auto-split by role supersedes the fixed duet split)
-    if settings.auto_split:
-        sustains = assign_auto_parts(
-            notes, sustains, settings.auto_split_parts, settings.chord_window)
-    elif settings.duet_mode:
+    # 7. A fixed duet remains a post-arrangement pitch split. Source-aware
+    # grouping was already performed before folding and supersedes it.
+    if not settings.auto_split and settings.duet_mode:
         sustains = split_duet(notes, sustains, settings.duet_split_note)
 
     # 8. Retrigger gaps. Must be LAST: it works on the final pitch of each note
     # (after folding/melody-lock) and its final channel (after the duet /
-    # auto-split assignment above), since together those decide which physical
+    # grouping assignment above), since together those decide which physical
     # key a note lands on and who plays it.
     enforce_retrigger_gaps(notes, settings.retrigger_gap)
 
