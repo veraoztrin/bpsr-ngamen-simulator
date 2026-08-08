@@ -20,6 +20,7 @@ from live_midi import LiveMidiListener
 from midi_parser import get_channels_info, guess_channel_instrument, parse_midi_full
 from network_sync import (
     MAX_MIDI_BYTES,
+    MAX_PART_START_SECONDS,
     MAX_READY_SYNC_RTT,
     MIN_ROOM_CREDENTIAL_LENGTH,
     MIN_SYNC_SAMPLES,
@@ -83,6 +84,7 @@ class App(ctk.CTk):
         self.channels = []
         self.channel_vars = []
         self.host_checkbox_vars = {}
+        self.host_start_time_vars = {}
         self.my_ready_status = False
         self._known_room_players = set()
         self._received_temp_files = set()
@@ -1820,6 +1822,9 @@ class App(ctk.CTk):
     def update_solo_channels(self, remember=True):
         active = [ch for ch, var in self.channel_vars if var.get()]
         self.player.set_active_channels(active)
+        # Entrance gates are a multiplayer assignment feature. A later Solo
+        # play must always use the MIDI's authored timing with no stale gates.
+        self.player.set_channel_start_times({})
         if remember:
             self._remember_current_track_profile()
 
@@ -2267,8 +2272,11 @@ class App(ctk.CTk):
             text_color="green")
         return True
 
-    def on_network_play(self, global_start_time, my_channels):
-        self.after(0, self._trigger_play, global_start_time, my_channels)
+    def on_network_play(self, global_start_time, my_channels,
+                        part_start_times=None):
+        self.after(
+            0, self._trigger_play, global_start_time, my_channels,
+            part_start_times or {})
 
     def on_network_stop(self):
         self.after(0, self.player.stop)
@@ -2388,6 +2396,7 @@ class App(ctk.CTk):
             ctk.CTkLabel(self.lobby_frame, text=f"🎵 Shared Song: {fn}", font=ctk.CTkFont(weight="bold")).pack(pady=5)
 
         self.host_checkbox_vars = {}
+        self.host_start_time_vars = {}
 
         if not self.network.is_host:
             me = next((p for p in state.get("players", [])
@@ -2446,6 +2455,8 @@ class App(ctk.CTk):
                         text_color="gray").pack(side="left")
                 else:
                     self.host_checkbox_vars[p['client_id']] = {}
+                    self.host_start_time_vars[p['client_id']] = {}
+                    start_times = self.network.player_part_start_times(p) or {}
                     for ch, part_label in part_options:
                         var = ctk.BooleanVar(value=(ch in p["channels"]))
                         self.host_checkbox_vars[p['client_id']][ch] = var
@@ -2454,17 +2465,48 @@ class App(ctk.CTk):
                             chs = [c for c, v in self.host_checkbox_vars[cid].items() if v.get()]
                             self.network.assign_channels(cid, chs)
                             
+                        part_frame = ctk.CTkFrame(
+                            ch_frame, fg_color="transparent")
+                        part_frame.pack(side="left", padx=10, pady=3)
                         cb = ctk.CTkCheckBox(
-                            ch_frame,
+                            part_frame,
                             text=(f"{part_label} (local conversion)"
                                   if p.get("local_conversion")
                                   else part_label),
                             variable=var, command=on_toggle)
-                        cb.pack(side="left", padx=10, pady=5)
+                        cb.pack(side="left", pady=5)
+
+                        start_var = ctk.StringVar(
+                            value=f"{start_times.get(ch, 0.0):g}")
+                        self.host_start_time_vars[p['client_id']][ch] = start_var
+                        ctk.CTkLabel(
+                            part_frame, text="Start at", text_color="gray"
+                        ).pack(side="left", padx=(8, 3))
+                        start_entry = ctk.CTkEntry(
+                            part_frame, width=58, textvariable=start_var,
+                            placeholder_text="0")
+                        start_entry.pack(side="left")
+                        ctk.CTkLabel(
+                            part_frame, text="s", text_color="gray"
+                        ).pack(side="left", padx=(3, 0))
+                        if ch not in p["channels"]:
+                            start_entry.configure(state="disabled")
+
+                        def commit_start(_event=None, cid=p['client_id'],
+                                         channel=ch, value_var=start_var):
+                            self._commit_part_start_time(
+                                cid, channel, value_var)
+
+                        start_entry.bind("<Return>", commit_start)
+                        start_entry.bind("<FocusOut>", commit_start)
             else:
+                start_times = self.network.player_part_start_times(p) or {}
                 assigned_text = (
-                    ", ".join(player_labels.get(
-                        channel, f"MIDI Ch. {channel + 1}")
+                    ", ".join(
+                        player_labels.get(
+                            channel, f"MIDI Ch. {channel + 1}")
+                        + (f" (starts at {start_times[channel]:g}s)"
+                           if start_times.get(channel, 0.0) > 0 else "")
                         for channel in p['channels'])
                     if p['channels'] else "None")
                 lbl2 = ctk.CTkLabel(
@@ -2479,7 +2521,41 @@ class App(ctk.CTk):
             else:
                 self.sync_play_btn.configure(state="disabled", text="SYNC PLAY (Waiting for Ready...)")
 
-    def _trigger_play(self, global_start_time, my_channels):
+    def _commit_part_start_time(self, client_id, channel, value_var):
+        text = value_var.get().strip().replace(",", ".")
+        try:
+            start_time = float(text)
+        except ValueError:
+            start_time = -1.0
+        if (not math.isfinite(start_time) or start_time < 0.0
+                or start_time > MAX_PART_START_SECONDS):
+            player = next((
+                item for item in self.network.room_state.get("players", [])
+                if item.get("client_id") == client_id), {})
+            previous = (
+                self.network.player_part_start_times(player) or {}).get(
+                    channel, 0.0)
+            value_var.set(f"{previous:g}")
+            self.status_label.configure(
+                text=("Part entrance must be a number from 0 to "
+                      f"{MAX_PART_START_SECONDS:g} seconds."),
+                text_color="red")
+            return False
+        if not self.network.assign_part_start_time(
+                client_id, channel, start_time):
+            self.status_label.configure(
+                text="Select the part before setting its entrance time.",
+                text_color="red")
+            return False
+        value_var.set(f"{start_time:g}")
+        self.status_label.configure(
+            text=(f"Part entrance set to {start_time:g}s."
+                  if start_time else "Part will play from the beginning."),
+            text_color="green")
+        return True
+
+    def _trigger_play(self, global_start_time, my_channels,
+                      part_start_times=None):
         if not self.events:
             self.status_label.configure(
                 text="Play was rejected because no converted MIDI is loaded.",
@@ -2507,6 +2583,13 @@ class App(ctk.CTk):
         # afterwards keeps that variable latency out of the start moment.
         self.player.stop()
         self.player.set_active_channels(my_channels)
+        try:
+            self.player.set_channel_start_times(part_start_times or {})
+        except (TypeError, ValueError):
+            self.status_label.configure(
+                text="Play was rejected because a part entrance time is invalid.",
+                text_color="red")
+            return
 
         delay = global_start_time - self.network.get_global_time()
         if delay < -0.25:
@@ -2521,7 +2604,8 @@ class App(ctk.CTk):
         if delay < 0:
             delay = 0.0  # start immediately if the target moment already passed
         print(f"Network Play Triggered! Delaying start by {delay:.3f}s "
-              f"(nudge {nudge*1000:.0f}ms) for Channels {my_channels}")
+              f"(nudge {nudge*1000:.0f}ms) for Channels {my_channels}, "
+              f"entrances {part_start_times or {}}")
         if not self.player.play(delay_seconds=delay, strict_timing=True):
             self.status_label.configure(
                 text="Synchronized playback could not be armed.",

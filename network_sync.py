@@ -29,9 +29,10 @@ MAX_PLAYERS = 16
 MAX_NICKNAME_LENGTH = 32
 MAX_FILENAME_LENGTH = 180
 MAX_PART_LABEL_LENGTH = 80
+MAX_PART_START_SECONDS = 24 * 60 * 60
 MIN_ROOM_CREDENTIAL_LENGTH = 16
-ROOM_CREDENTIAL_PREFIX = "bpsr4"
-PROTOCOL_VERSION = 4
+ROOM_CREDENTIAL_PREFIX = "bpsr5"
+PROTOCOL_VERSION = 5
 MIN_SYNC_SAMPLES = 5
 MAX_READY_SYNC_RTT = 0.5
 MAX_ROOM_REVISION = 2**31 - 1
@@ -316,6 +317,7 @@ class NetworkManager:
         self.room_state = {
             "players": [{"client_id": self.client_id,
                          "nickname": self.nickname, "channels": [],
+                         "part_start_times": [],
                          "available_parts": [], "parts_revision": 0,
                          "local_conversion": False,
                          "connected": True, "last_seen": time.time(),
@@ -360,12 +362,54 @@ class NetworkManager:
                 if p["channels"] == channels:
                     return True
                 p["channels"] = channels
+                # Entrance settings belong to an assignment. Removing and
+                # later re-adding a part intentionally gives it the safe 0s
+                # default instead of reviving a stale entrance time.
+                p["part_start_times"] = [
+                    item for item in p.get("part_start_times", [])
+                    if item.get("channel") in channels
+                ]
                 # A remote player must explicitly approve every new part.
                 # The host has already loaded its own conversion, so a valid
                 # non-empty assignment is enough to arm its local part.
                 p["ready"] = bool(channels) if target_client_id == self.client_id else False
                 self._broadcast_state()
                 return True
+        return False
+
+    def assign_part_start_time(self, target_client_id, channel, start_time):
+        """Set when one assigned part becomes audible on the song clock."""
+        if not self.is_host:
+            return False
+        if (isinstance(channel, bool) or not isinstance(channel, int)
+                or not 0 <= channel <= 15):
+            return False
+        start_time = self._finite_number(
+            start_time, 0.0, MAX_PART_START_SECONDS)
+        if start_time is None:
+            return False
+        for player in self.room_state.get("players", []):
+            if player.get("client_id") != target_client_id:
+                continue
+            if channel not in player.get("channels", []):
+                return False
+            starts = self.player_part_start_times(player)
+            if starts is None:
+                return False
+            if start_time > 0.0:
+                starts[channel] = start_time
+            else:
+                starts.pop(channel, None)
+            updated = self._serialize_part_start_times(starts)
+            if updated == player.get("part_start_times", []):
+                return True
+            player["part_start_times"] = updated
+            # This changes audible output, so remote performers must approve
+            # the updated assignment before synchronized playback can begin.
+            player["ready"] = bool(
+                target_client_id == self.client_id and player.get("channels"))
+            self._broadcast_state()
+            return True
         return False
 
     def send_part_manifest(self, parts, local_conversion=False,
@@ -414,6 +458,11 @@ class NetworkManager:
                         if channel in available]
             assignment_changed = filtered != player.get("channels", [])
             player["channels"] = filtered
+            starts = self.player_part_start_times(player) or {}
+            player["part_start_times"] = self._serialize_part_start_times({
+                channel: value for channel, value in starts.items()
+                if channel in filtered
+            })
             manifest_changed = old != (parts, revision, local_conversion)
             if assignment_changed or manifest_changed:
                 # Remote participants approve the resulting assignment again.
@@ -431,6 +480,14 @@ class NetworkManager:
         if parts is None:
             return None
         return {part["channel"] for part in parts}
+
+    def player_part_start_times(self, player):
+        """Return a validated channel -> entrance-time mapping."""
+        cleaned = self._validate_part_start_times(
+            player.get("part_start_times", []), player.get("channels", []))
+        if cleaned is None:
+            return None
+        return {item["channel"]: item["time"] for item in cleaned}
 
     def kick_player(self, target_client_id):
         """Host removes a player from the room. Mirrors leave/disband:
@@ -467,6 +524,7 @@ class NetworkManager:
             player["available_parts"] = []
             player["parts_revision"] = 0
             player["local_conversion"] = False
+            player["part_start_times"] = []
 
     def share_midi(self, file_path, filename, conversion_profile=None,
                    target_client_id=None):
@@ -614,7 +672,9 @@ class NetworkManager:
         if host and self.on_play_cmd:
             # Start locally without depending on the MQTT broker echoing the
             # host's own packet back through its subscription.
-            self.on_play_cmd(start_time, list(host["channels"]))
+            self.on_play_cmd(
+                start_time, list(host["channels"]),
+                self.player_part_start_times(host) or {})
         return True
 
     def send_stop(self):
@@ -805,6 +865,42 @@ class NetworkManager:
         return sorted(set(channels))
 
     @staticmethod
+    def _serialize_part_start_times(start_times):
+        return [
+            {"channel": channel, "time": float(start_times[channel])}
+            for channel in sorted(start_times)
+            if float(start_times[channel]) > 0.0
+        ]
+
+    @classmethod
+    def _validate_part_start_times(cls, start_times, channels=None):
+        if not isinstance(start_times, list) or len(start_times) > 16:
+            return None
+        allowed = None if channels is None else cls._validate_channels(channels)
+        if channels is not None and allowed is None:
+            return None
+        allowed = None if allowed is None else set(allowed)
+        cleaned = []
+        seen = set()
+        for item in start_times:
+            if not isinstance(item, dict) or set(item) != {"channel", "time"}:
+                return None
+            channel = item.get("channel")
+            if (isinstance(channel, bool) or not isinstance(channel, int)
+                    or not 0 <= channel <= 15 or channel in seen
+                    or (allowed is not None and channel not in allowed)):
+                return None
+            start_time = cls._finite_number(
+                item.get("time"), 0.0, MAX_PART_START_SECONDS)
+            if start_time is None:
+                return None
+            seen.add(channel)
+            # Zero is represented by omission to keep room state compact.
+            if start_time > 0.0:
+                cleaned.append({"channel": channel, "time": start_time})
+        return sorted(cleaned, key=lambda item: item["channel"])
+
+    @staticmethod
     def _validate_parts(parts):
         if not isinstance(parts, list) or len(parts) > 16:
             return None
@@ -863,6 +959,8 @@ class NetworkManager:
             client_id = player.get("client_id")
             nickname = player.get("nickname")
             channels = self._validate_channels(player.get("channels"))
+            part_start_times = self._validate_part_start_times(
+                player.get("part_start_times", []), channels)
             available_parts = self._validate_parts(
                 player.get("available_parts", []))
             parts_revision = self._validate_revision(
@@ -873,6 +971,7 @@ class NetworkManager:
                     or not nickname.strip()
                     or len(nickname) > MAX_NICKNAME_LENGTH
                     or channels is None
+                    or part_start_times is None
                     or available_parts is None or parts_revision is None
                     or not isinstance(local_conversion, bool)
                     or not isinstance(player.get("ready"), bool)):
@@ -886,6 +985,7 @@ class NetworkManager:
                 "client_id": client_id,
                 "nickname": nickname.strip(),
                 "channels": channels,
+                "part_start_times": part_start_times,
                 "available_parts": available_parts,
                 "parts_revision": parts_revision,
                 "local_conversion": local_conversion,
@@ -1138,6 +1238,7 @@ class NetworkManager:
                             "client_id": payload["client_id"],
                             "nickname": nickname.strip(),
                             "channels": [],
+                            "part_start_times": [],
                             "available_parts": [],
                             "parts_revision": 0,
                             "local_conversion": False,
@@ -1264,7 +1365,9 @@ class NetworkManager:
                         or not me.get("channels")):
                     return
                 if self.on_play_cmd:
-                    self.on_play_cmd(start_time, list(me["channels"]))
+                    self.on_play_cmd(
+                        start_time, list(me["channels"]),
+                        self.player_part_start_times(me) or {})
             
             elif msg_type == "stop":
                 if self.is_host and sender == self.client_id:

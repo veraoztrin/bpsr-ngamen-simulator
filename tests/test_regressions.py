@@ -113,6 +113,44 @@ def test_seek_replays_sustain_only_from_active_channels():
     player.stop()
 
 
+def test_part_entrance_suppresses_early_notes_without_shifting_later_notes():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.01, "type": "note_on", "note": 60, "channel": 0},
+        {"time": 0.03, "type": "note_off", "note": 60, "channel": 0},
+        {"time": 0.06, "type": "note_on", "note": 62, "channel": 0},
+        {"time": 0.08, "type": "note_off", "note": 62, "channel": 0},
+    ], [0], {0: 0.05})
+
+    assert player.play()
+    player.thread.join(timeout=1.0)
+
+    output = [item[:2] for item in player.simulator.log]
+    assert ("press", 60) not in output
+    assert ("release", 60) not in output
+    assert ("press", 62) in output
+    assert ("release", 62) in output
+
+
+def test_part_entrance_is_respected_when_seeking_and_restoring_sustain():
+    player = MidiPlayer()
+    player.simulator = MockSimulator()
+    player.load_events([
+        {"time": 0.1, "type": "sustain", "value": True, "channel": 0},
+        {"time": 2.0, "type": "note_on", "note": 60, "channel": 0},
+    ], [0], {0: 1.0})
+
+    player.seek(0.5)
+    assert player._sustain_by_channel == {0}
+    assert ("sustain", True) not in player.simulator.log
+
+    player.simulator.log.clear()
+    player.seek(1.5)
+    assert ("sustain", True) in player.simulator.log
+    player.stop()
+
+
 def test_transpose_and_channel_changes_release_the_pressed_note():
     player = MidiPlayer()
     player.simulator = MockSimulator()
@@ -253,7 +291,7 @@ def _client_manager():
     host_public = host_private.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     credential = (
-        "bpsr4.correct-horse-battery-staple."
+        "bpsr5.correct-horse-battery-staple."
         + manager._b64url(host_public))
     manager._configure_room(credential)
     manager.is_host = False
@@ -476,10 +514,43 @@ def test_channel_assignment_invalidates_remote_ready():
     assert broadcasts == [True]
 
 
+def test_part_entrance_assignment_is_validated_and_invalidates_ready():
+    network_sync = _network_module()
+    manager = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
+    manager.is_host = True
+    manager.client_id = "host"
+    manager.room_state = {
+        "players": [
+            {"client_id": "host", "channels": [0], "ready": True,
+             "part_start_times": []},
+            {"client_id": "client", "channels": [2], "ready": True,
+             "part_start_times": []},
+        ],
+        "filename": "song.mid", "song_id": "a" * 64, "revision": 1,
+    }
+    broadcasts = []
+    manager._broadcast_state = lambda: broadcasts.append(True)
+
+    assert manager.assign_part_start_time("client", 2, 10.0)
+    assert manager.room_state["players"][1]["part_start_times"] == [
+        {"channel": 2, "time": 10.0}]
+    assert manager.room_state["players"][1]["ready"] is False
+    assert broadcasts == [True]
+
+    assert not manager.assign_part_start_time("client", 3, 5.0)
+    assert not manager.assign_part_start_time("client", 2, float("nan"))
+
+    manager.room_state["players"][1]["ready"] = True
+    assert manager.assign_part_start_time("client", 2, 0.0)
+    assert manager.room_state["players"][1]["part_start_times"] == []
+    assert manager.room_state["players"][1]["ready"] is False
+
+
 def test_play_requires_sync_ready_and_assigned_channels():
     _network_sync, manager = _client_manager()
     calls = []
-    manager.on_play_cmd = lambda start, channels: calls.append(channels)
+    manager.on_play_cmd = (
+        lambda start, channels, starts: calls.append((channels, starts)))
 
     def send_play():
         manager._on_message(None, None, _signed_message(manager, {
@@ -503,8 +574,10 @@ def test_play_requires_sync_ready_and_assigned_channels():
     assert calls == []
 
     manager.room_state["players"][0]["channels"] = [0]
+    manager.room_state["players"][0]["part_start_times"] = [
+        {"channel": 0, "time": 3.5}]
     send_play()
-    assert calls == [[0]]
+    assert calls == [([0], {0: 3.5})]
 
 
 def test_clock_needs_five_good_samples_before_ready():
@@ -558,6 +631,7 @@ def test_host_play_starts_locally_without_waiting_for_broker_echo():
     manager.room_state = {
         "players": [{
             "client_id": "host", "nickname": "Host", "channels": [0],
+            "part_start_times": [{"channel": 0, "time": 10.0}],
             "connected": True, "ready": True,
         }],
         "filename": "song.mid", "song_id": "a" * 64, "revision": 1,
@@ -565,13 +639,14 @@ def test_host_play_starts_locally_without_waiting_for_broker_echo():
     published = []
     played = []
     manager._publish = lambda payload: published.append(payload) or True
-    manager.on_play_cmd = lambda start, channels: played.append(channels)
+    manager.on_play_cmd = (
+        lambda start, channels, starts: played.append((channels, starts)))
     manager.get_global_time = lambda: 100.0
 
     assert manager.send_play(2.0) is True
     assert published == [{"type": "play", "start_time": 102.0,
                           "revision": 1}]
-    assert played == [[0]]
+    assert played == [([0], {0: 10.0})]
 
 
 def test_client_ready_requires_the_current_revision_and_valid_assignment():
@@ -667,6 +742,15 @@ def test_part_manifest_is_revision_bound_validated_and_state_safe():
     validated = client_manager._validate_state(state)
     assert validated["players"][0]["available_parts"] == cleaned
     assert validated["players"][0]["local_conversion"] is True
+
+    state["players"][0]["part_start_times"] = [
+        {"channel": 0, "time": 10.0}]
+    validated = client_manager._validate_state(state)
+    assert validated["players"][0]["part_start_times"] == [
+        {"channel": 0, "time": 10.0}]
+    state["players"][0]["part_start_times"] = [
+        {"channel": 0, "time": float("nan")}]
+    assert client_manager._validate_state(state) is None
 
     host = network_sync.NetworkManager.__new__(network_sync.NetworkManager)
     host.is_host = True

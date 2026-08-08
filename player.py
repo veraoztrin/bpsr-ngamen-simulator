@@ -13,6 +13,10 @@ class MidiPlayer:
         self.on_output_error = on_output_error
         self.events = []
         self.active_channels = set()
+        # Optional song-time gates for multiplayer parts.  A channel with a
+        # 10.0 entry remains silent until the shared playhead reaches 10s;
+        # its events are not shifted, so it joins in at the authored position.
+        self.channel_start_times = {}
         self._transpose = 0
         
         self.is_playing = False
@@ -63,8 +67,20 @@ class MidiPlayer:
                 if self.is_playing:
                     if value == 0:
                         self.simulator.set_octave_shift(self._current_zone)
-                    self.simulator.set_sustain(bool(
-                        self._sustain_by_channel & self.active_channels))
+                    self.simulator.set_sustain(
+                        self._sustain_output_active())
+
+    def _channel_gate_open(self, channel, song_time=None):
+        if song_time is None:
+            song_time = self.get_current_time()
+        return song_time + 1e-9 >= self.channel_start_times.get(channel, 0.0)
+
+    def _sustain_output_active(self, song_time=None):
+        return any(
+            channel in self.active_channels
+            and self._channel_gate_open(channel, song_time)
+            for channel in self._sustain_by_channel
+        )
 
     @property
     def is_syncing(self):
@@ -88,24 +104,51 @@ class MidiPlayer:
             position = time.perf_counter() - self.start_time
         return max(0.0, min(self.get_total_time(), position))
 
-    def load_events(self, events, active_channels=None):
+    def load_events(self, events, active_channels=None,
+                    channel_start_times=None):
         self.stop()
         with self._state_lock:
             self.events = events
             if active_channels is not None:
                 self.active_channels = set(active_channels)
+            self.channel_start_times = {}
+            if channel_start_times is not None:
+                self._set_channel_start_times_locked(channel_start_times)
             self.current_event_idx = 0
+
+    def _set_channel_start_times_locked(self, start_times):
+        cleaned = {}
+        for channel, value in dict(start_times).items():
+            if (isinstance(channel, bool) or not isinstance(channel, int)
+                    or not 0 <= channel <= 15
+                    or isinstance(value, bool)):
+                raise ValueError("Invalid channel start time.")
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                raise ValueError("Invalid channel start time.") from None
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError("Invalid channel start time.")
+            if value > 0.0:
+                cleaned[channel] = value
+        self.channel_start_times = cleaned
+
+    def set_channel_start_times(self, start_times):
+        """Set per-channel song positions before which output stays muted."""
+        with self._state_lock:
+            self._set_channel_start_times_locked(start_times)
+            sustain = self._sustain_output_active()
+        if self.simulator:
+            self.simulator.set_sustain(sustain)
 
     def set_active_channels(self, channels):
         channels = set(channels)
         releases = []
         with self._state_lock:
-            sustain_before = bool(
-                self._sustain_by_channel & self.active_channels)
+            sustain_before = self._sustain_output_active()
             removed = self.active_channels - channels
             self.active_channels = channels
-            sustain_after = bool(
-                self._sustain_by_channel & self.active_channels)
+            sustain_after = self._sustain_output_active()
             for key in list(self._active_notes):
                 if key[0] in removed:
                     releases.extend(self._active_notes.pop(key))
@@ -122,13 +165,13 @@ class MidiPlayer:
         if self.simulator:
             self.simulator.release_all()
 
-    def restore_output_state(self):
+    def restore_output_state(self, song_time=None):
         """Restore global MIDI state after pause or temporary focus loss."""
         if not self.simulator:
             return
         with self._state_lock:
             zone = self._current_zone
-            sustain = bool(self._sustain_by_channel & self.active_channels)
+            sustain = self._sustain_output_active(song_time)
             transpose = self.transpose
         if transpose == 0:
             self.simulator.set_octave_shift(zone)
@@ -265,7 +308,7 @@ class MidiPlayer:
             self._sustain_by_channel = sustain_by_channel
             self._current_zone = last_zone
 
-        self.restore_output_state()
+        self.restore_output_state(target_time)
 
         self.stop_requested = False
         now = time.perf_counter()
@@ -364,7 +407,15 @@ class MidiPlayer:
                 elif 'channel' in ev:
                     key = (ev['channel'], ev.get('note'))
                     if ev['type'] == 'note_on':
-                        if ev['channel'] in self.active_channels and self.simulator:
+                        gate_open = self._channel_gate_open(
+                            ev['channel'], ev['time'])
+                        if (ev['channel'] in self.active_channels
+                                and gate_open and self.simulator):
+                            # Pedal-down may have occurred before this part's
+                            # entrance. Restore it immediately before the first
+                            # audible note after the gate.
+                            self.simulator.set_sustain(
+                                self._sustain_output_active(ev['time']))
                             played_note = ev['note'] + self.transpose
                             accepted = self.simulator.press_note(played_note)
                             # Only an explicit False means focus/range safety
@@ -386,8 +437,8 @@ class MidiPlayer:
                         else:
                             self._sustain_by_channel.discard(channel)
                         if self.simulator:
-                            self.simulator.set_sustain(bool(
-                                self._sustain_by_channel & self.active_channels))
+                            self.simulator.set_sustain(
+                                self._sustain_output_active(ev['time']))
 
             self.current_event_idx += 1
 
