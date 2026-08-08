@@ -659,15 +659,21 @@ class App(ctk.CTk):
         self.solo_delay_entry = ctk.CTkEntry(safety_row, width=40)
         self.solo_delay_entry.insert(0, "2")
         self.solo_delay_entry.pack(side="left", padx=4)
-        ctk.CTkButton(
-            safety_row, text="Reset settings", width=100,
-            command=self.reset_settings).pack(side="right")
-
+        # safety_row's left-packed widgets already request ~154px more than the
+        # 712px available at the default window width, so anything packed to
+        # the right of them is squeezed off the edge and cannot be clicked.
+        # These two get their own row instead.
+        display_row = ctk.CTkFrame(self.conv_frame, fg_color="transparent")
+        display_row.pack(fill="x", padx=10, pady=(0, 8))
         self.low_graphics_var = ctk.BooleanVar(value=LOW_GRAPHICS)
         ctk.CTkCheckBox(
-            safety_row, text="Fast rendering",
+            display_row,
+            text="Fast rendering (flat corners - much smoother window dragging)",
             variable=self.low_graphics_var,
-            command=self._on_low_graphics_toggle).pack(side="right", padx=8)
+            command=self._on_low_graphics_toggle).pack(side="left")
+        ctk.CTkButton(
+            display_row, text="Reset settings", width=100,
+            command=self.reset_settings).pack(side="right")
 
         self.settings_error_label = ctk.CTkLabel(
             self.conv_frame, text="", text_color="#ff6b6b")
