@@ -4,6 +4,7 @@ import os
 import secrets
 import tempfile
 import threading
+import time
 from copy import deepcopy
 from tkinter import filedialog, messagebox
 
@@ -39,6 +40,11 @@ except Exception:
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
+
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 # Same folder network_sync.py logs to - one place for this app's local state.
 PREFS_PATH = os.path.join(os.path.expanduser("~"), ".bpsr_midi_player", "prefs.json")
 GROUPING_LABELS = {
@@ -47,6 +53,58 @@ GROUPING_LABELS = {
     "MIDI channels": "channels",
     "Instrument families": "families",
 }
+
+
+# --- Rendering performance switches -----------------------------------------
+# CustomTkinter draws every widget as a Tk canvas, and Windows repaints the
+# whole client area synchronously while a window is being dragged.  Flattening
+# the corners cuts the work per repaint by roughly two thirds: a rounded CTk
+# widget draws four corner glyphs plus filler rectangles, a square one draws a
+# single rectangle.  Toggled from the Solo tab ("Fast rendering"), overridable
+# with BPSR_LOW_GFX=1, and applied at import because CustomTkinter bakes the
+# theme into each widget as it is constructed - hence the restart prompt.
+#
+# BPSR_NO_DPI_SCALING=1 additionally stops CustomTkinter's 100 ms DPI polling
+# loop; the UI then renders smaller and softer on HiDPI screens, so it stays
+# env-var-only rather than a visible setting.
+
+def _saved_pref(key, default=False):
+    try:
+        with open(PREFS_PATH, "r", encoding="utf-8") as prefs_file:
+            return bool(json.load(prefs_file).get(key, default))
+    except Exception:
+        return default
+
+
+LOW_GRAPHICS = _env_flag("BPSR_LOW_GFX") or _saved_pref("low_graphics")
+
+if _env_flag("BPSR_NO_DPI_SCALING"):
+    try:
+        ctk.deactivate_automatic_dpi_awareness()
+    except Exception:
+        pass
+
+if LOW_GRAPHICS:
+    _FLAT_THEME = {
+        "CTkFrame": {"corner_radius": 0},
+        "CTkButton": {"corner_radius": 0},
+        "CTkLabel": {"corner_radius": 0},
+        "CTkEntry": {"corner_radius": 0, "border_width": 1},
+        "CTkCheckBox": {"corner_radius": 0, "border_width": 2},
+        "CTkProgressBar": {"corner_radius": 0},
+        "CTkSlider": {"corner_radius": 0, "button_corner_radius": 0},
+        "CTkOptionMenu": {"corner_radius": 0},
+        "CTkComboBox": {"corner_radius": 0, "border_width": 1},
+        "CTkScrollbar": {"corner_radius": 0},
+        "CTkSegmentedButton": {"corner_radius": 0, "border_width": 1},
+        "CTkTextbox": {"corner_radius": 0},
+    }
+    for _widget_name, _overrides in _FLAT_THEME.items():
+        _theme_entry = ctk.ThemeManager.theme.get(_widget_name)
+        if isinstance(_theme_entry, dict):
+            for _key, _value in _overrides.items():
+                if _key in _theme_entry:
+                    _theme_entry[_key] = _value
 
 class App(ctk.CTk):
     def __init__(self):
@@ -90,7 +148,22 @@ class App(ctk.CTk):
         self._received_temp_files = set()
         self._parse_generation = 0
         self._closing = False
-        
+
+        # --- Repaint damping -------------------------------------------------
+        # The status LED and the progress readout used to be reconfigured five
+        # times a second whether or not anything had changed, and passing
+        # text_color to a CTkLabel forces a full canvas redraw.  Cache what is
+        # currently on screen so configure() only runs on a real change, and
+        # hold cosmetic repaints back entirely while the window is being moved
+        # or resized (Windows repaints the client area synchronously inside its
+        # drag loop, so anything redrawn there lands on the critical path).
+        # Playback logic in the tick is never skipped - only painting.
+        self._led_state = None
+        self._progress_state = None
+        self._time_text = None
+        self._paint_hold_until = 0.0
+        self._last_window_geometry = None
+
         self.playlist = [] # list of dicts: {"name": str, "path": str}
         self.current_song_idx = -1
         self.was_playing = False
@@ -175,7 +248,54 @@ class App(ctk.CTk):
         if GlobalHotkeys and self.global_hotkeys_var.get():
             self._start_global_hotkeys()
 
+        # add="+" matters: CTk binds <Configure> on the root itself for its own
+        # dimension tracking, and a plain bind() would silently replace it.
+        self.bind("<Configure>", self._on_window_configure, add="+")
+
         self.update_led_loop()
+
+    # --- Repaint damping ----------------------------------------------------
+
+    def _on_window_configure(self, event):
+        """Note that the window just moved or resized, and pause repaints."""
+        # <Configure> from any child bubbles up to the toplevel's binding, so
+        # filter by widget path (str() is safer here than identity - Tk hands
+        # back a name string if the widget lookup misses).
+        if str(event.widget) != str(self):
+            return
+        geometry = (event.x, event.y, event.width, event.height)
+        if geometry == self._last_window_geometry:
+            return
+        self._last_window_geometry = geometry
+        # Configure fires continuously while the mouse drags the titlebar, so
+        # keep pushing the release point out; it lapses shortly after the drag
+        # stops and the next tick repaints whatever changed meanwhile.
+        self._paint_hold_until = time.monotonic() + 0.25
+
+    def _painting_held(self):
+        return time.monotonic() < self._paint_hold_until
+
+    def _set_led(self, text, color):
+        """Repaint the status LED only when it actually says something new."""
+        if self._led_state == (text, color):
+            return
+        if self._painting_held():
+            return  # leave the cache stale so the next tick applies it
+        self._led_state = (text, color)
+        self.led_label.configure(text=text, text_color=color)
+
+    def _on_low_graphics_toggle(self):
+        """Fast rendering squares off every widget for a cheaper repaint.
+
+        CustomTkinter reads corner radii out of the theme when each widget is
+        built, so this can only take effect on the next launch.
+        """
+        self.save_prefs()
+        self.settings_error_label.configure(
+            text="Fast rendering "
+                 + ("on" if self.low_graphics_var.get() else "off")
+                 + " - restart the app to apply.",
+            text_color="gray")
 
     def _start_global_hotkeys(self):
         if GlobalHotkeys and self.hotkeys is None:
@@ -543,6 +663,12 @@ class App(ctk.CTk):
             safety_row, text="Reset settings", width=100,
             command=self.reset_settings).pack(side="right")
 
+        self.low_graphics_var = ctk.BooleanVar(value=LOW_GRAPHICS)
+        ctk.CTkCheckBox(
+            safety_row, text="Fast rendering",
+            variable=self.low_graphics_var,
+            command=self._on_low_graphics_toggle).pack(side="right", padx=8)
+
         self.settings_error_label = ctk.CTkLabel(
             self.conv_frame, text="", text_color="#ff6b6b")
         self.settings_error_label.pack(fill="x", padx=10, pady=(0, 6))
@@ -788,22 +914,34 @@ class App(ctk.CTk):
 
     # --- Actions ---
 
-    def _refresh_progress_bar(self):
+    def _refresh_progress_bar(self, force=False):
         current = self.player.get_current_time()
         total = self.player.get_total_time()
 
         if total > 0:
             progress = max(0.0, min(1.0, current / total))
-            self.progress_bar.set(progress)
-
             curr_m = int(current // 60)
             curr_s = int(current % 60)
             tot_m = int(total // 60)
             tot_s = int(total % 60)
-            self.time_label.configure(text=f"{curr_m:02d}:{curr_s:02d} / {tot_m:02d}:{tot_s:02d}")
+            text = f"{curr_m:02d}:{curr_s:02d} / {tot_m:02d}:{tot_s:02d}"
         else:
-            self.progress_bar.set(0)
-            self.time_label.configure(text="00:00 / 00:00")
+            progress = 0.0
+            text = "00:00 / 00:00"
+
+        if not force and self._painting_held():
+            return  # caches stay stale, so the next tick redraws the real value
+
+        # CTkProgressBar.set() redraws its canvas unconditionally and the clock
+        # only changes once a second - both were repainting at 5 Hz even with
+        # the player stopped.  Round the bar so sub-pixel drift is not a change.
+        rounded = round(progress, 3)
+        if force or rounded != self._progress_state:
+            self._progress_state = rounded
+            self.progress_bar.set(progress)
+        if force or text != self._time_text:
+            self._time_text = text
+            self.time_label.configure(text=text)
 
     def on_progress_click(self, event):
         """Click-to-seek: jump playback to wherever on the bar was clicked."""
@@ -817,7 +955,9 @@ class App(ctk.CTk):
             return
         frac = max(0.0, min(1.0, event.x / width))
         self.player.seek(frac * total)
-        self._refresh_progress_bar()  # instant feedback, don't wait for the next 200ms tick
+        # Instant feedback, don't wait for the next tick - force past the
+        # change cache and the drag hold, since this is a direct interaction.
+        self._refresh_progress_bar(force=True)
 
     def update_led_loop(self):
         simulator = self.player.simulator
@@ -825,27 +965,25 @@ class App(ctk.CTk):
             self.player.is_playing and simulator
             and simulator.focus_guard_enabled and not simulator.is_target_focused())
         if self.player.is_syncing:
-            self.led_label.configure(
-                text="🟡 Starting — switch to game", text_color="yellow")
+            self._set_led("🟡 Starting — switch to game", "yellow")
         elif focus_blocked:
             if (simulator.key_refs or simulator.sustain_active
                     or simulator.current_octave_shift):
                 self.player.release_output_state()
-            self.led_label.configure(
-                text="🟠 Waiting for game focus", text_color="orange")
+            self._set_led("🟠 Waiting for game focus", "orange")
         elif self._focus_was_blocked and self.player.is_playing:
             # Focus safety released the pedal/modifier state. Reapply it once
             # the game regains focus; in-progress notes stay released.
             self.player.restore_output_state()
-            self.led_label.configure(text="🟢 Playing", text_color="green")
+            self._set_led("🟢 Playing", "green")
             if self._play_wait_message_active:
                 self.settings_error_label.configure(
                     text="", text_color="#ff6b6b")
                 self._play_wait_message_active = False
         elif self.player.is_playing:
-            self.led_label.configure(text="🟢 Playing", text_color="green")
+            self._set_led("🟢 Playing", "green")
         else:
-            self.led_label.configure(text="🔴 Stopped", text_color="gray")
+            self._set_led("🔴 Stopped", "gray")
 
         if simulator and not self.player.is_playing:
             # Apply any pedal-off deferred by focus safety, but only once the
@@ -1391,6 +1529,7 @@ class App(ctk.CTk):
                 "target_window": self.target_window_entry.get(),
                 "global_hotkeys": self.global_hotkeys_var.get(),
                 "solo_delay": self.solo_delay_entry.get(),
+                "low_graphics": self.low_graphics_var.get(),
             }
             os.makedirs(os.path.dirname(PREFS_PATH), exist_ok=True)
             with open(PREFS_PATH, "w", encoding="utf-8") as f:
@@ -1462,6 +1601,8 @@ class App(ctk.CTk):
             prefs.get("per_track_settings", False)))
         self.focus_guard_var.set(bool(prefs.get("focus_guard", True)))
         self.global_hotkeys_var.set(bool(prefs.get("global_hotkeys", True)))
+        # Rendering mode is applied at import; only mirror it into the checkbox.
+        self.low_graphics_var.set(bool(prefs.get("low_graphics", LOW_GRAPHICS)))
         _set_entry(
             self.target_window_entry,
             prefs.get("target_window", "Blue Protocol"))

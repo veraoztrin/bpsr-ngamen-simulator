@@ -1,3 +1,4 @@
+import atexit
 import time
 import threading
 import math
@@ -6,6 +7,47 @@ try:
 except Exception:
     # Non-Windows platform (no ctypes.windll): run without input simulation.
     BPSRInputSimulator = None
+
+
+def _request_high_resolution_timer():
+    """Ask Windows for a 1 ms scheduler tick.
+
+    Without this the default timer granularity is ~15.6 ms, so every
+    Event.wait()/sleep() in the playback loop can overshoot badly.  The old
+    code compensated by busy-spinning the last stretch of every gap, which
+    pinned a core and held the GIL away from the Tk main loop - that is what
+    made the window feel sluggish while a song was playing.  With a 1 ms tick
+    we can sleep almost the whole gap and spin only for the final ~2 ms.
+    """
+    try:
+        import ctypes
+        winmm = ctypes.windll.winmm
+    except Exception:
+        return  # not Windows, or winmm unavailable - sleeps are fine as-is
+    if winmm.timeBeginPeriod(1) == 0:  # TIMERR_NOERROR
+        atexit.register(lambda: winmm.timeEndPeriod(1))
+
+
+def _measure_sleep_margin(samples=5, floor=0.002, ceiling=0.020):
+    """How early we must stop sleeping to never overshoot a note.
+
+    Don't assume the 1 ms request above was honoured - a locked-down policy or
+    an older Windows build can leave the tick at 15.6 ms, and sleeping too
+    close to the target would then land the note *late*, which is far worse
+    than a slightly longer spin.  Measure what this machine actually delivers
+    and keep a 50% safety margin on top.
+    """
+    event = threading.Event()
+    worst = 0.0
+    for _ in range(samples):
+        started = time.perf_counter()
+        event.wait(0.001)
+        worst = max(worst, time.perf_counter() - started - 0.001)
+    return min(max(worst * 1.5, floor), ceiling)
+
+
+_request_high_resolution_timer()
+SLEEP_MARGIN = _measure_sleep_margin()
 
 class MidiPlayer:
     def __init__(self, on_output_error=None):
@@ -43,7 +85,9 @@ class MidiPlayer:
         self.pause_time = 0.0
         self.time_offset = 0.0
         
-        self.sleep_threshold = 0.002 
+        # How much of each gap is spun rather than slept.  Calibrated to this
+        # machine's real timer granularity at import (2 ms on anything modern).
+        self.sleep_threshold = SLEEP_MARGIN
         self.strict_timing = False
 
     @property
@@ -366,11 +410,17 @@ class MidiPlayer:
             if diff <= 0:
                 break
             if diff > self.sleep_threshold:
-                # Event.wait makes even a long sync countdown immediately
-                # interruptible; the old half-gap sleep could outlive stop().
-                cancel.wait(min(diff / 2.0, 0.05))
+                # Sleep all but the last sleep_threshold of the gap, capped at
+                # 50 ms per slice so stop() stays immediately interruptible
+                # even during a long sync countdown.  The calibrated margin
+                # keeps the wakeup safely on the early side of the target.
+                cancel.wait(min(diff - self.sleep_threshold, 0.05))
             else:
-                pass
+                # Final sub-threshold stretch: still a spin, because no OS
+                # sleep is accurate here, but sleep(0) hands the GIL to the
+                # Tk main loop on every pass instead of holding it for a full
+                # 5 ms interpreter switch interval.
+                time.sleep(0)
 
     def _playback_loop(self, cancel):
         focus_error = None
